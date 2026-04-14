@@ -1,0 +1,17 @@
+[package]
+name = "strede-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "JSON format backend for strede"
+readme = "../README.md"
+
+[dependencies]
+strede = { path = "../strede", version = "=0.1.0" }
+
+[dev-dependencies]
+strede-derive = { path = "../strede-derive", version = "=0.1.0" }

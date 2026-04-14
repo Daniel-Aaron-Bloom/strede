@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "strede",
+    "strede-derive",
+    "strede-json",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Daniel-Aaron-Bloom/strede"
+authors = ["Daniel Bloom"]
+categories = ["encoding", "asynchronous", "no-std"]
+keywords = ["serde", "async", "deserialize", "streaming", "zero-alloc"]
+rust-version = "1.88"

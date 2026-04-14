@@ -1,0 +1,2503 @@
+//! Chunked JSON deserializer for async streaming input.
+//!
+//! Uses [`strede::SharedBuf`]/[`strede::Handle`] to coordinate access to a
+//! buffer that is refilled asynchronously by a user-supplied loader closure.
+//! The deserializer holds either a `&mut SharedBuf` (top-level) or an
+//! `Option<Handle>` (sub-deserializer for option/map values/seq elements).
+//!
+//! # Capabilities vs. [`crate::JsonDeserializer`]
+//!
+//! - Implements the **owned** trait family only ([`DeserializerOwned`],
+//!   [`EntryOwned`], etc.). Zero-copy `&'de str` / `&'de [u8]` borrowing is
+//!   unsupported by design — buffer-chunk lifetimes are shorter than the
+//!   caller-facing deserialization session, so there is no `'de` to borrow
+//!   for. Use [`EntryOwned::deserialize_str_chunks`] /
+//!   [`EntryOwned::deserialize_bytes_chunks`] for string and byte data.
+//! - `#[derive(Deserialize)]` today emits a borrow-family impl; types meant
+//!   for use with this deserializer must hand-roll a [`DeserializeOwned`]
+//!   impl (typically using `deserialize_str_chunks` for keys).
+//! - Sub-deserializer Miss recovery is best-effort: if a sub-probe partially
+//!   consumed the buffer (advanced past chunk boundaries) and then missed,
+//!   the parent's replay state may be inconsistent. Common cases (sync probes
+//!   that don't advance) work correctly.
+//! - Loader errors must be communicated via the `Buffer` value (e.g. an empty
+//!   slice signals EOF). The `F: AsyncFnMut(&mut B)` signature does not
+//!   support `Result`.
+
+use core::future::Future;
+use strede::{
+    Buffer, BytesAccessOwned, Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, Handle,
+    MapAccessOwned, MapKeyEntryOwned, MapValueEntryOwned, Probe, SeqAccessOwned, SeqEntryOwned,
+    SharedBuf, StrAccessOwned, hit,
+};
+
+use crate::JsonError;
+use crate::token::{self, SimpleToken, StrChunk, Token, Tokenizer};
+
+// ---------------------------------------------------------------------------
+// Claim
+// ---------------------------------------------------------------------------
+
+/// Proof-of-consumption returned by every probe and threaded back to
+/// [`Deserializer::next`] / [`MapAccess::next`] / [`SeqAccess::next`].
+///
+/// For chunked input, this carries the post-token tokenizer, the chunk
+/// offset, and (transferred via the [`Handle`] inside) ownership of buffer
+/// access. The handle inside is `None` when the probe was synchronous and
+/// dropped its handle naturally; in that case the parent re-forks from its
+/// `SharedBuf`.
+pub struct ChunkedJsonClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    tokenizer: Tokenizer,
+    offset: usize,
+    handle: Handle<'s, B, F>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — pointer arithmetic to recover offset after tokenizer advances `src`
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn new_offset(buf: &[u8], src: &[u8]) -> usize {
+    let base = buf.as_ptr() as usize;
+    let cur = src.as_ptr() as usize;
+    debug_assert!(cur >= base);
+    let off = cur - base;
+    debug_assert!(off <= buf.len());
+    off
+}
+
+// ---------------------------------------------------------------------------
+// Deserializer
+// ---------------------------------------------------------------------------
+
+/// Top-level deserializer. Holds a `&mut SharedBuf` and forks fresh handles
+/// per `next()`. Claim is `()` — the top-level is consumed and produces
+/// nothing the caller needs to thread back.
+pub struct ChunkedJsonDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    shared: &'s mut SharedBuf<B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+    pending_tok: Option<Token>,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonDeserializer<'s, B, F> {
+    pub fn new(shared: &'s mut SharedBuf<B, F>) -> Self {
+        Self {
+            shared,
+            tokenizer: Tokenizer::new(),
+            offset: 0,
+            pending_tok: None,
+        }
+    }
+}
+
+/// Sub-deserializer for option / map value / seq element use where the inner
+/// type calls `next()` once. Claim is `Self` — the sub-deserializer is
+/// returned to the caller so it can extract handle/tokenizer/offset.
+pub struct ChunkedJsonSubDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+    pending_tok: Option<Token>,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonSubDeserializer<'s, B, F> {
+    fn new(handle: Handle<'s, B, F>, tokenizer: Tokenizer, offset: usize, tok: Token) -> Self {
+        Self {
+            handle,
+            tokenizer,
+            offset,
+            pending_tok: Some(tok),
+        }
+    }
+}
+
+/// Advance `handle` to the next chunk via `Handle::next`, resetting `offset`
+/// and verifying that the new chunk is non-empty (else `UnexpectedEnd`).
+async fn refill<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    handle: Handle<'s, B, F>,
+    offset: &mut usize,
+) -> Result<Handle<'s, B, F>, JsonError> {
+    let new_h = handle.next().await;
+    let empty = new_h.buf().is_empty();
+    *offset = 0;
+    if empty {
+        return Err(JsonError::UnexpectedEnd);
+    }
+    Ok(new_h)
+}
+
+/// Read the next token from `handle`, advancing chunks as needed.
+/// On return, `*tokenizer` and `*offset` reflect the post-token state.
+async fn next_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    mut handle: Handle<'s, B, F>,
+    tokenizer: &mut Tokenizer,
+    offset: &mut usize,
+    pending_tok: &mut Option<Token>,
+) -> Result<(Handle<'s, B, F>, Token), JsonError> {
+    if let Some(tok) = pending_tok.take() {
+        return Ok((handle, tok));
+    }
+    loop {
+        let result = {
+            let buf = handle.buf();
+            if *offset > buf.len() {
+                // Defensive — shouldn't happen.
+                *offset = buf.len();
+            }
+            let mut src: &[u8] = &buf[*offset..];
+            let old = core::mem::replace(tokenizer, Tokenizer::new());
+            let r = old.next_token(&mut src);
+            *offset = new_offset(buf, src);
+            r
+        };
+        match result {
+            Ok(Token::Simple(SimpleToken::PartialLiteral, t)) | Ok(Token::NoTokens(t)) => {
+                *tokenizer = t;
+                handle = refill(handle, offset).await?;
+            }
+            Ok(t) => return Ok((handle, t)),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Build N entries by forking the main handle N-1 times.
+fn build_entries<'s, B: Buffer, F: AsyncFnMut(&mut B), const N: usize>(
+    mut main: Handle<'s, B, F>,
+    token: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+) -> [ChunkedJsonEntry<'s, B, F>; N] {
+    core::array::from_fn(|_| ChunkedJsonEntry {
+        handle: main.fork(),
+        token: token.clone(),
+        tokenizer: tokenizer.clone(),
+        offset,
+    })
+}
+
+/// Top-level `next`: forks a handle from SharedBuf, runs the closure, does
+/// trailing-garbage check, returns `((), R)`.
+async fn run_next_top<'s, B, F, const N: usize, Fn_, Fut, R>(
+    de: ChunkedJsonDeserializer<'s, B, F>,
+    f: Fn_,
+) -> Result<Probe<((), R)>, JsonError>
+where
+    B: Buffer,
+    F: AsyncFnMut(&mut B),
+    Fn_: FnOnce([ChunkedJsonEntry<'s, B, F>; N]) -> Fut,
+    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'s, B, F>, R)>, JsonError>>,
+{
+    let main = de.shared.fork();
+    let mut tokenizer = de.tokenizer;
+    let mut offset = de.offset;
+    let mut pending_tok = de.pending_tok;
+
+    let (main, token) = next_dispatch(main, &mut tokenizer, &mut offset, &mut pending_tok).await?;
+
+    let snap_tokenizer = tokenizer.clone();
+    let snap_offset = offset;
+
+    let entries = build_entries::<B, F, N>(main, token.clone(), snap_tokenizer, snap_offset);
+
+    match f(entries).await? {
+        Probe::Hit((claim, r)) => {
+            // Trailing-garbage check.
+            let mut h = claim.handle;
+            let mut off = claim.offset;
+            loop {
+                let buf = h.buf();
+                let mut i = off;
+                while i < buf.len() && matches!(buf[i], b' ' | b'\t' | b'\n' | b'\r') {
+                    i += 1;
+                }
+                if i < buf.len() {
+                    return Err(JsonError::TrailingGarbage);
+                }
+                // Buffer exhausted; refill once and accept EOF.
+                let new_h = h.next().await;
+                if new_h.buf().is_empty() {
+                    break;
+                }
+                h = new_h;
+                off = 0;
+            }
+            Ok(Probe::Hit(((), r)))
+        }
+        Probe::Miss => Ok(Probe::Miss),
+    }
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
+    for ChunkedJsonDeserializer<'s, B, F>
+{
+    type Error = JsonError;
+    type Claim = ();
+    type Entry = ChunkedJsonEntry<'s, B, F>;
+
+    async fn next<const N: usize, Fn_, Fut, R>(
+        self,
+        f: Fn_,
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
+    where
+        Fn_: FnOnce([Self::Entry; N]) -> Fut,
+        Fut: Future<
+            Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
+        >,
+    {
+        run_next_top(self, f).await
+    }
+}
+
+/// Sub-deserializer `next`: uses its owned handle, returns
+/// `(ChunkedJsonSubDeserializer, R)` as claim.
+async fn run_next_sub<'s, B, F, const N: usize, Fn_, Fut, R>(
+    de: ChunkedJsonSubDeserializer<'s, B, F>,
+    f: Fn_,
+) -> Result<Probe<(ChunkedJsonSubDeserializer<'s, B, F>, R)>, JsonError>
+where
+    B: Buffer,
+    F: AsyncFnMut(&mut B),
+    Fn_: FnOnce([ChunkedJsonEntry<'s, B, F>; N]) -> Fut,
+    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'s, B, F>, R)>, JsonError>>,
+{
+    let main = de.handle;
+    let mut tokenizer = de.tokenizer;
+    let mut offset = de.offset;
+    let mut pending_tok = de.pending_tok;
+
+    let (main, token) = next_dispatch(main, &mut tokenizer, &mut offset, &mut pending_tok).await?;
+
+    let snap_tokenizer = tokenizer.clone();
+    let snap_offset = offset;
+
+    let entries = build_entries::<B, F, N>(main, token.clone(), snap_tokenizer, snap_offset);
+
+    match f(entries).await? {
+        Probe::Hit((claim, r)) => Ok(Probe::Hit((
+            ChunkedJsonSubDeserializer {
+                handle: claim.handle,
+                tokenizer: claim.tokenizer,
+                offset: claim.offset,
+                pending_tok: None,
+            },
+            r,
+        ))),
+        Probe::Miss => Ok(Probe::Miss),
+    }
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
+    for ChunkedJsonSubDeserializer<'s, B, F>
+{
+    type Error = JsonError;
+    type Claim = ChunkedJsonSubDeserializer<'s, B, F>;
+    type Entry = ChunkedJsonEntry<'s, B, F>;
+
+    async fn next<const N: usize, Fn_, Fut, R>(
+        self,
+        f: Fn_,
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
+    where
+        Fn_: FnOnce([Self::Entry; N]) -> Fut,
+        Fut: Future<
+            Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
+        >,
+    {
+        run_next_sub(self, f).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'a, B, F>,
+    token: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'a, B, F> {
+    fn into_claim_with_tok(
+        handle: Handle<'a, B, F>,
+        offset: usize,
+        tokenizer: Tokenizer,
+    ) -> ChunkedJsonClaim<'a, B, F> {
+        ChunkedJsonClaim {
+            tokenizer,
+            offset,
+            handle,
+        }
+    }
+
+    /// Stack-buffer based number parsing for chunked input.
+    /// Accumulates digit chunks across chunk boundaries.
+    async fn parse_num<T: ParseNum>(
+        mut self,
+    ) -> Result<Probe<(ChunkedJsonClaim<'a, B, F>, T)>, JsonError> {
+        let Token::Number(mut access) = self.token else {
+            return Ok(Probe::Miss);
+        };
+        let mut scratch = [0u8; 64];
+        let mut len = 0usize;
+        loop {
+            let result = {
+                let buf = self.handle.buf();
+                let mut src: &[u8] = &buf[self.offset..];
+                let r = access.next_chunk(&mut src);
+                self.offset = new_offset(buf, src);
+                r
+            };
+            match result {
+                Ok(Some(chunk)) => {
+                    let bytes = chunk.as_bytes();
+                    if len + bytes.len() > scratch.len() {
+                        return Err(JsonError::InvalidNumber);
+                    }
+                    scratch[len..len + bytes.len()].copy_from_slice(bytes);
+                    len += bytes.len();
+                }
+                Ok(None) => break,
+                Err(JsonError::UnexpectedEnd) => {
+                    self.handle = refill(self.handle, &mut self.offset).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let s = core::str::from_utf8(&scratch[..len]).map_err(|_| JsonError::InvalidNumber)?;
+        let value = T::parse(s)?;
+        let claim = ChunkedJsonClaim {
+            tokenizer: Tokenizer::new(),
+            offset: self.offset,
+            handle: self.handle,
+        };
+        Ok(Probe::Hit((claim, value)))
+    }
+}
+
+trait ParseNum: Sized {
+    fn parse(s: &str) -> Result<Self, JsonError>;
+}
+
+macro_rules! impl_parse_num {
+    ($($t:ty),*) => {
+        $(impl ParseNum for $t {
+            fn parse(s: &str) -> Result<Self, JsonError> {
+                s.parse().map_err(|_| JsonError::InvalidNumber)
+            }
+        })*
+    };
+}
+impl_parse_num!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'a, B, F> {
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type StrChunks = ChunkedJsonStrAccess<'a, B, F>;
+    type BytesChunks = ChunkedJsonBytesAccess<'a, B, F>;
+    type Map = ChunkedJsonMapAccess<'a, B, F>;
+    type Seq = ChunkedJsonSeqAccess<'a, B, F>;
+
+    async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
+        match self.token {
+            Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
+                Self::into_claim_with_tok(self.handle, self.offset, tok),
+                b,
+            ))),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<u64>().await);
+        Ok(Probe::Hit((c, n as u8)))
+    }
+    async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<u64>().await);
+        Ok(Probe::Hit((c, n as u16)))
+    }
+    async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<u64>().await);
+        Ok(Probe::Hit((c, n as u32)))
+    }
+    async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
+        self.parse_num::<u64>().await
+    }
+    async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
+        self.parse_num::<u128>().await
+    }
+    async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<i64>().await);
+        Ok(Probe::Hit((c, n as i8)))
+    }
+    async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<i64>().await);
+        Ok(Probe::Hit((c, n as i16)))
+    }
+    async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
+        let (c, n) = hit!(self.parse_num::<i64>().await);
+        Ok(Probe::Hit((c, n as i32)))
+    }
+    async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
+        self.parse_num::<i64>().await
+    }
+    async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
+        self.parse_num::<i128>().await
+    }
+    async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
+        self.parse_num::<f32>().await
+    }
+    async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
+        self.parse_num::<f64>().await
+    }
+
+    async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
+        let mut chunks = hit!(self.deserialize_str_chunks().await);
+        // Collect chunks until we have at least one char.
+        let mut buf = [0u8; 4];
+        let mut len = 0usize;
+        let claim = loop {
+            match chunks
+                .next(|s| {
+                    let n = s.len().min(buf.len() - len);
+                    buf[len..len + n].copy_from_slice(&s.as_bytes()[..n]);
+                    len += n;
+                    n
+                })
+                .await?
+            {
+                Chunk::Data((c, _)) => {
+                    // Check if we have a complete char yet.
+                    if let Ok(s) = core::str::from_utf8(&buf[..len])
+                        && let Some(ch) = s.chars().next()
+                        && s.len() == ch.len_utf8()
+                    {
+                        // Exactly one char and nothing leftover — drain remaining chunks.
+                        chunks = c;
+                        let claim = loop {
+                            match chunks.next(|_| ()).await? {
+                                Chunk::Data((c, ())) => chunks = c,
+                                Chunk::Done(claim) => break claim,
+                            }
+                        };
+                        return Ok(Probe::Hit((claim, ch)));
+                    }
+                    chunks = c;
+                }
+                Chunk::Done(claim) => break claim,
+            }
+        };
+        // Ended — should have exactly one char.
+        let s = core::str::from_utf8(&buf[..len]).map_err(|_| JsonError::InvalidUtf8)?;
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => Ok(Probe::Hit((claim, ch))),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
+        match self.token {
+            Token::Str(access) => Ok(Probe::Hit(ChunkedJsonStrAccess {
+                handle: self.handle,
+                access,
+                offset: self.offset,
+                char_buf: [0; 4],
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+        match self.token {
+            Token::Str(access) => Ok(Probe::Hit(ChunkedJsonBytesAccess {
+                handle: self.handle,
+                access,
+                offset: self.offset,
+                char_buf: [0; 4],
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
+        match self.token {
+            Token::Simple(SimpleToken::ObjectStart, tok) => Ok(Probe::Hit(ChunkedJsonMapAccess {
+                handle: self.handle,
+                tokenizer: tok,
+                offset: self.offset,
+                first: true,
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
+        match self.token {
+            Token::Simple(SimpleToken::ArrayStart, tok) => Ok(Probe::Hit(ChunkedJsonSeqAccess {
+                handle: self.handle,
+                tokenizer: tok,
+                offset: self.offset,
+                first: true,
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_option<T: DeserializeOwned<'a>>(
+        self,
+    ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
+        match self.token {
+            Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
+                Self::into_claim_with_tok(self.handle, self.offset, tok),
+                None,
+            ))),
+            other => {
+                let h = self.handle;
+                let sub =
+                    ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, other);
+                let (sub, v) = hit!(T::deserialize(sub).await);
+                let claim = ChunkedJsonClaim {
+                    tokenizer: sub.tokenizer,
+                    offset: sub.offset,
+                    handle: sub.handle,
+                };
+                Ok(Probe::Hit((claim, Some(v))))
+            }
+        }
+    }
+
+    async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
+        match self.token {
+            Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit(Self::into_claim_with_tok(
+                self.handle,
+                self.offset,
+                tok,
+            ))),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_value<T: DeserializeOwned<'a>>(
+        self,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        let h = self.handle;
+        let sub =
+            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.token);
+        let (sub, v) = hit!(T::deserialize(sub).await);
+        let claim = ChunkedJsonClaim {
+            tokenizer: sub.tokenizer,
+            offset: sub.offset,
+            handle: sub.handle,
+        };
+        Ok(Probe::Hit((claim, v)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StrAccess / BytesAccess
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonStrAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'a, B, F>,
+    access: token::StrAccess,
+    offset: usize,
+    char_buf: [u8; 4],
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned<'a> for ChunkedJsonStrAccess<'a, B, F> {
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type Error = JsonError;
+
+    async fn next<R>(
+        mut self,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        enum Step {
+            Slice { start: usize, end: usize },
+            Char(char),
+            Done,
+            NeedRefill,
+        }
+        loop {
+            let pre_offset = self.offset;
+            let step = {
+                let buf = self.handle.buf();
+                let mut src: &[u8] = &buf[pre_offset..];
+                let r = self.access.next_chunk(&mut src);
+                self.offset = new_offset(buf, src);
+                match r {
+                    Ok(Some(StrChunk::Slice(""))) => Step::NeedRefill,
+                    Ok(Some(StrChunk::Slice(_))) => Step::Slice {
+                        start: pre_offset,
+                        end: self.offset,
+                    },
+                    Ok(Some(StrChunk::Char(c))) => Step::Char(c),
+                    Ok(None) => Step::Done,
+                    Err(JsonError::UnexpectedEnd) => Step::NeedRefill,
+                    Err(e) => return Err(e),
+                }
+            };
+            match step {
+                Step::Slice { start, end } => {
+                    let buf = self.handle.buf();
+                    let s = core::str::from_utf8(&buf[start..end])
+                        .map_err(|_| JsonError::InvalidUtf8)?;
+                    let r = f(s);
+                    return Ok(Chunk::Data((self, r)));
+                }
+                Step::Char(c) => {
+                    let r = f(c.encode_utf8(&mut self.char_buf));
+                    return Ok(Chunk::Data((self, r)));
+                }
+                Step::Done => {
+                    return Ok(Chunk::Done(ChunkedJsonClaim {
+                        tokenizer: Tokenizer::new(),
+                        offset: self.offset,
+                        handle: self.handle,
+                    }));
+                }
+                Step::NeedRefill => {
+                    if self.offset > pre_offset {
+                        // StrAccess consumed bytes but needs another call
+                        // (e.g., high surrogate waiting for low surrogate).
+                        continue;
+                    }
+                    self.handle = refill(self.handle, &mut self.offset).await?;
+                }
+            }
+        }
+    }
+}
+
+pub struct ChunkedJsonBytesAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'a, B, F>,
+    access: token::StrAccess,
+    offset: usize,
+    char_buf: [u8; 4],
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned<'a>
+    for ChunkedJsonBytesAccess<'a, B, F>
+{
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type Error = JsonError;
+
+    async fn next<R>(
+        mut self,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        enum Step {
+            Slice { start: usize, end: usize },
+            Char(char),
+            Done,
+            NeedRefill,
+        }
+        loop {
+            let pre_offset = self.offset;
+            let step = {
+                let buf = self.handle.buf();
+                let mut src: &[u8] = &buf[pre_offset..];
+                let r = self.access.next_chunk(&mut src);
+                self.offset = new_offset(buf, src);
+                match r {
+                    Ok(Some(StrChunk::Slice(""))) => Step::NeedRefill,
+                    Ok(Some(StrChunk::Slice(_))) => Step::Slice {
+                        start: pre_offset,
+                        end: self.offset,
+                    },
+                    Ok(Some(StrChunk::Char(c))) => Step::Char(c),
+                    Ok(None) => Step::Done,
+                    Err(JsonError::UnexpectedEnd) => Step::NeedRefill,
+                    Err(e) => return Err(e),
+                }
+            };
+            match step {
+                Step::Slice { start, end } => {
+                    let buf = self.handle.buf();
+                    let r = f(&buf[start..end]);
+                    return Ok(Chunk::Data((self, r)));
+                }
+                Step::Char(c) => {
+                    let r = f(c.encode_utf8(&mut self.char_buf).as_bytes());
+                    return Ok(Chunk::Data((self, r)));
+                }
+                Step::Done => {
+                    return Ok(Chunk::Done(ChunkedJsonClaim {
+                        tokenizer: Tokenizer::new(),
+                        offset: self.offset,
+                        handle: self.handle,
+                    }));
+                }
+                Step::NeedRefill => {
+                    if self.offset > pre_offset {
+                        continue;
+                    }
+                    self.handle = refill(self.handle, &mut self.offset).await?;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MapAccess
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonMapAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'a, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+    first: bool,
+}
+
+async fn map_next<'a, B, F, const N: usize, Fn_, Fut, R>(
+    mut map: ChunkedJsonMapAccess<'a, B, F>,
+    f: Fn_,
+) -> Result<Probe<Chunk<(ChunkedJsonMapAccess<'a, B, F>, R), ChunkedJsonClaim<'a, B, F>>>, JsonError>
+where
+    B: Buffer,
+    F: AsyncFnMut(&mut B),
+    Fn_: FnOnce([ChunkedJsonMapKeyEntry<'a, B, F>; N]) -> Fut,
+    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'a, B, F>, R)>, JsonError>>,
+{
+    // After first pair: expect comma or }.
+    if !map.first {
+        let mut pending: Option<Token> = None;
+        let h = map.handle;
+        let (h, tok) = next_dispatch(h, &mut map.tokenizer, &mut map.offset, &mut pending).await?;
+        match tok {
+            Token::Simple(SimpleToken::Comma, t) => {
+                map.handle = h;
+                map.tokenizer = t;
+            }
+            Token::Simple(SimpleToken::ObjectEnd, t) => {
+                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: map.offset,
+                    handle: h,
+                })));
+            }
+            _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+        }
+    }
+    map.first = false;
+
+    // Read key start (or closing brace for empty map).
+    let key_tok = {
+        let mut pending: Option<Token> = None;
+        let h = map.handle;
+        let (h, tok) = next_dispatch(h, &mut map.tokenizer, &mut map.offset, &mut pending).await?;
+        match tok {
+            Token::Simple(SimpleToken::ObjectEnd, t) => {
+                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: map.offset,
+                    handle: h,
+                })));
+            }
+            t => {
+                map.handle = h;
+                t
+            }
+        }
+    };
+
+    // Build N key entries (forking siblings).
+    let main = map.handle;
+    let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
+    handles[0] = Some(main);
+    for i in 1..N {
+        let h0 = handles[0].as_mut().expect("h0 present");
+        handles[i] = Some(h0.fork());
+    }
+    let snap_tok = map.tokenizer.clone();
+    let snap_off = map.offset;
+    let entries: [ChunkedJsonMapKeyEntry<'a, B, F>; N] =
+        core::array::from_fn(|i| ChunkedJsonMapKeyEntry {
+            handle: handles[i].take(),
+            key_tok: key_tok.clone(),
+            tokenizer: snap_tok.clone(),
+            offset: snap_off,
+        });
+
+    let (claim, r) = hit!(f(entries).await);
+    map.tokenizer = claim.tokenizer;
+    map.offset = claim.offset;
+    map.handle = claim.handle;
+    Ok(Probe::Hit(Chunk::Data((map, r))))
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned<'a> for ChunkedJsonMapAccess<'a, B, F> {
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type KeyEntry = ChunkedJsonMapKeyEntry<'a, B, F>;
+
+    async fn next<const N: usize, Fn_, Fut, R>(
+        self,
+        f: Fn_,
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    where
+        Fn_: FnOnce([Self::KeyEntry; N]) -> Fut,
+        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+    {
+        map_next(self, f).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MapKeyEntry / MapValueEntry
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonMapKeyEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'a, B, F>>,
+    key_tok: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyEntryOwned<'a>
+    for ChunkedJsonMapKeyEntry<'a, B, F>
+{
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type ValueEntry = ChunkedJsonMapValueEntry<'a, B, F>;
+
+    async fn key<K, const N: usize, Fn_, Fut, R>(
+        mut self,
+        f: Fn_,
+    ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
+    where
+        K: DeserializeOwned<'a>,
+        Fn_: FnOnce(&K, [Self::ValueEntry; N]) -> Fut,
+        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+    {
+        let h = self.handle.take().expect("key entry handle missing");
+        let sub =
+            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.key_tok);
+        let (mut sub, k) = hit!(K::deserialize(sub).await);
+
+        // Eat the colon.
+        let (h, colon_tok) = next_dispatch(
+            sub.handle,
+            &mut sub.tokenizer,
+            &mut sub.offset,
+            &mut sub.pending_tok,
+        )
+        .await?;
+        match colon_tok {
+            Token::Simple(SimpleToken::Colon, t) => sub.tokenizer = t,
+            _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+        }
+
+        // Read the value start token.
+        let (h, value_tok) =
+            next_dispatch(h, &mut sub.tokenizer, &mut sub.offset, &mut sub.pending_tok).await?;
+
+        // Build N value entries by forking from the sub's handle.
+        let main = h;
+        let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
+        handles[0] = Some(main);
+        for i in 1..N {
+            let h0 = handles[0].as_mut().expect("h0 present");
+            handles[i] = Some(h0.fork());
+        }
+        let snap_tok = sub.tokenizer.clone();
+        let snap_off = sub.offset;
+        let value_entries: [ChunkedJsonMapValueEntry<'a, B, F>; N] =
+            core::array::from_fn(|i| ChunkedJsonMapValueEntry {
+                handle: handles[i].take(),
+                value_tok: value_tok.clone(),
+                tokenizer: snap_tok.clone(),
+                offset: snap_off,
+            });
+
+        let (claim, r) = hit!(f(&k, value_entries).await);
+        Ok(Probe::Hit((claim, k, r)))
+    }
+}
+
+pub struct ChunkedJsonMapValueEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'a, B, F>>,
+    value_tok: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapValueEntryOwned<'a>
+    for ChunkedJsonMapValueEntry<'a, B, F>
+{
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+
+    async fn value<V: DeserializeOwned<'a>>(
+        mut self,
+    ) -> Result<Probe<(Self::Claim, V)>, Self::Error> {
+        let h = self.handle.take().expect("value entry handle missing");
+        let sub =
+            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.value_tok);
+        let (sub, v) = hit!(V::deserialize(sub).await);
+        let claim = ChunkedJsonClaim {
+            tokenizer: sub.tokenizer,
+            offset: sub.offset,
+            handle: sub.handle,
+        };
+        Ok(Probe::Hit((claim, v)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SeqAccess / SeqEntry
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonSeqAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'a, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+    first: bool,
+}
+
+async fn seq_next<'a, B, F, const N: usize, Fn_, Fut, R>(
+    mut seq: ChunkedJsonSeqAccess<'a, B, F>,
+    f: Fn_,
+) -> Result<Probe<Chunk<(ChunkedJsonSeqAccess<'a, B, F>, R), ChunkedJsonClaim<'a, B, F>>>, JsonError>
+where
+    B: Buffer,
+    F: AsyncFnMut(&mut B),
+    Fn_: FnOnce([ChunkedJsonSeqEntry<'a, B, F>; N]) -> Fut,
+    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'a, B, F>, R)>, JsonError>>,
+{
+    if !seq.first {
+        let mut pending: Option<Token> = None;
+        let h = seq.handle;
+        let (h, tok) = next_dispatch(h, &mut seq.tokenizer, &mut seq.offset, &mut pending).await?;
+        match tok {
+            Token::Simple(SimpleToken::Comma, t) => {
+                seq.handle = h;
+                seq.tokenizer = t;
+            }
+            Token::Simple(SimpleToken::ArrayEnd, t) => {
+                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: seq.offset,
+                    handle: h,
+                })));
+            }
+            _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+        }
+    }
+    seq.first = false;
+
+    let elem_tok = {
+        let mut pending: Option<Token> = None;
+        let h = seq.handle;
+        let (h, tok) = next_dispatch(h, &mut seq.tokenizer, &mut seq.offset, &mut pending).await?;
+        match tok {
+            Token::Simple(SimpleToken::ArrayEnd, t) => {
+                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: seq.offset,
+                    handle: h,
+                })));
+            }
+            t => {
+                seq.handle = h;
+                t
+            }
+        }
+    };
+
+    let main = seq.handle;
+    let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
+    handles[0] = Some(main);
+    for i in 1..N {
+        let h0 = handles[0].as_mut().expect("h0 present");
+        handles[i] = Some(h0.fork());
+    }
+    let snap_tok = seq.tokenizer.clone();
+    let snap_off = seq.offset;
+    let entries: [ChunkedJsonSeqEntry<'a, B, F>; N] =
+        core::array::from_fn(|i| ChunkedJsonSeqEntry {
+            handle: handles[i].take(),
+            elem_tok: elem_tok.clone(),
+            tokenizer: snap_tok.clone(),
+            offset: snap_off,
+        });
+
+    let (claim, r) = hit!(f(entries).await);
+    seq.tokenizer = claim.tokenizer;
+    seq.offset = claim.offset;
+    seq.handle = claim.handle;
+    Ok(Probe::Hit(Chunk::Data((seq, r))))
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned<'a> for ChunkedJsonSeqAccess<'a, B, F> {
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type Elem = ChunkedJsonSeqEntry<'a, B, F>;
+
+    async fn next<const N: usize, Fn_, Fut, R>(
+        self,
+        f: Fn_,
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    where
+        Fn_: FnOnce([Self::Elem; N]) -> Fut,
+        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+    {
+        seq_next(self, f).await
+    }
+}
+
+pub struct ChunkedJsonSeqEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'a, B, F>>,
+    elem_tok: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqEntry<'a, B, F> {
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'a, B, F>;
+
+    async fn get<T: DeserializeOwned<'a>>(
+        mut self,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        let h = self.handle.take().expect("seq entry handle missing");
+        let sub =
+            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.elem_tok);
+        let (sub, v) = hit!(T::deserialize(sub).await);
+        let claim = ChunkedJsonClaim {
+            tokenizer: sub.tokenizer,
+            offset: sub.offset,
+            handle: sub.handle,
+        };
+        Ok(Probe::Hit((claim, v)))
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use super::*;
+    use alloc::string::String;
+    use strede::{
+        DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
+        MapValueEntryOwned, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
+    };
+
+    // Minimal single-poll executor — in-memory input never yields `Pending`.
+    fn block_on<F: core::future::Future>(f: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(f);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future pending — unexpected for in-memory input"),
+        }
+    }
+
+    /// Run a chunked deserialization with `input` loaded as a single chunk.
+    /// The loader returns an empty slice on the second call (EOF).
+    fn with_chunked<L: AsyncFnMut(&mut &[u8]), R>(
+        input: &[u8],
+        loader: L,
+        f: impl AsyncFnOnce(&mut SharedBuf<&[u8], L>) -> R,
+    ) -> R {
+        block_on(SharedBuf::with_async(input, loader, f))
+    }
+
+    fn eof_loader() -> impl AsyncFnMut(&mut &[u8]) {
+        async move |buf: &mut &[u8]| {
+            *buf = &[];
+        }
+    }
+
+    // ----- DeserializeOwned newtypes -----------------------------------------
+
+    struct U32(u32);
+    impl<'s> DeserializeOwned<'s> for U32 {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let (c, v) = hit!(e.deserialize_u32().await);
+                Ok(Probe::Hit((c, U32(v))))
+            })
+            .await
+        }
+    }
+
+    struct I64(i64);
+    impl<'s> DeserializeOwned<'s> for I64 {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let (c, v) = hit!(e.deserialize_i64().await);
+                Ok(Probe::Hit((c, I64(v))))
+            })
+            .await
+        }
+    }
+
+    struct F64(f64);
+    impl<'s> DeserializeOwned<'s> for F64 {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let (c, v) = hit!(e.deserialize_f64().await);
+                Ok(Probe::Hit((c, F64(v))))
+            })
+            .await
+        }
+    }
+
+    struct Bool(bool);
+    impl<'s> DeserializeOwned<'s> for Bool {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let (c, v) = hit!(e.deserialize_bool().await);
+                Ok(Probe::Hit((c, Bool(v))))
+            })
+            .await
+        }
+    }
+
+    /// Str type that just measures byte length (no allocation needed).
+    struct StrLen(usize);
+    impl<'s> DeserializeOwned<'s> for StrLen {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let mut chunks = match e.deserialize_str_chunks().await? {
+                    Probe::Hit(c) => c,
+                    Probe::Miss => return Ok(Probe::Miss),
+                };
+                let mut len = 0usize;
+                loop {
+                    match chunks.next(|s| s.len()).await? {
+                        Chunk::Data((c, n)) => {
+                            len += n;
+                            chunks = c;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, StrLen(len)))),
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    // ---- bool ---------------------------------------------------------------
+
+    #[test]
+    fn bool_true() {
+        let v = with_chunked(b"true", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = Bool::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert!(v);
+    }
+
+    #[test]
+    fn bool_false() {
+        let v = with_chunked(b"false", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = Bool::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert!(!v);
+    }
+
+    // ---- integers -----------------------------------------------------------
+
+    #[test]
+    fn u32_positive() {
+        let v = with_chunked(b"42", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = U32::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn i64_negative() {
+        let v = with_chunked(b"-7", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = I64::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(v, -7);
+    }
+
+    // ---- floats -------------------------------------------------------------
+
+    #[test]
+    fn f64_decimal() {
+        let v = with_chunked(b"3.14", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = F64::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert!((v - 3.14f64).abs() < 1e-10);
+    }
+
+    // ---- char ---------------------------------------------------------------
+
+    #[test]
+    fn char_single() {
+        let (_, v) = with_chunked(b"\"A\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move { e.deserialize_char().await })
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, 'A');
+    }
+
+    // ---- str_chunks ---------------------------------------------------------
+
+    #[test]
+    fn str_chunks_plain() {
+        let len = with_chunked(b"\"hello\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrLen::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn str_chunks_empty() {
+        let len = with_chunked(b"\"\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrLen::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn str_chunks_escape_newline() {
+        // "hello\nworld": "hello"(5) + '\n'(1) + "world"(5) = 11 bytes
+        let len = with_chunked(b"\"hello\\nworld\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrLen::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(len, 11);
+    }
+
+    #[test]
+    fn str_chunks_unicode_escape() {
+        // "\u0041" decodes to 'A' (1 byte in UTF-8)
+        let len = with_chunked(b"\"\\u0041\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrLen::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(len, 1);
+    }
+
+    // ---- surrogate pairs (str_chunks) ----------------------------------------
+
+    /// Str type that collects chunks into a String (for content verification).
+    struct StrCollect(String);
+    impl<'s> DeserializeOwned<'s> for StrCollect {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.next(|[e]| async move {
+                let mut chunks = match e.deserialize_str_chunks().await? {
+                    Probe::Hit(c) => c,
+                    Probe::Miss => return Ok(Probe::Miss),
+                };
+                let mut out = String::new();
+                loop {
+                    match chunks.next(|s| String::from(s)).await? {
+                        Chunk::Data((c, s)) => {
+                            out.push_str(&s);
+                            chunks = c;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, StrCollect(out)))),
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    #[test]
+    fn str_chunks_surrogate_pair() {
+        // \uD834\uDD1E = U+1D11E = 𝄞 (musical symbol G clef)
+        let s = with_chunked(b"\"\\uD834\\uDD1E\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrCollect::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(s, "\u{1D11E}");
+    }
+
+    #[test]
+    fn str_chunks_surrogate_pair_min() {
+        let s = with_chunked(b"\"\\uD800\\uDC00\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrCollect::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(s, "\u{10000}");
+    }
+
+    #[test]
+    fn str_chunks_surrogate_pair_max() {
+        let s = with_chunked(b"\"\\uDBFF\\uDFFF\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrCollect::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(s, "\u{10FFFF}");
+    }
+
+    #[test]
+    fn str_chunks_surrogate_pair_with_text() {
+        let s = with_chunked(b"\"abc\\uD834\\uDD1Exyz\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let (_, v) = StrCollect::deserialize(de).await.unwrap().unwrap();
+            v.0
+        });
+        assert_eq!(s, "abc\u{1D11E}xyz");
+    }
+
+    #[test]
+    fn str_chunks_lone_high_surrogate_err() {
+        let result = with_chunked(b"\"\\uD834\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            StrCollect::deserialize(de).await
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn str_chunks_lone_low_surrogate_err() {
+        let result = with_chunked(b"\"\\uDD1E\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            StrCollect::deserialize(de).await
+        });
+        assert!(result.is_err());
+    }
+
+    // ---- seq ----------------------------------------------------------------
+
+    #[test]
+    fn seq_sum_of_numbers() {
+        let (_, sum) = with_chunked(b"[1, 2, 3]", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move {
+                let mut seq = match e.deserialize_seq().await? {
+                    Probe::Hit(s) => s,
+                    Probe::Miss => panic!("expected seq"),
+                };
+                let mut sum = 0u32;
+                loop {
+                    match seq
+                        .next(|[se]| async move {
+                            let (claim, v) = hit!(se.get::<U32>().await);
+                            Ok(Probe::Hit((claim, v.0)))
+                        })
+                        .await?
+                        .unwrap()
+                    {
+                        Chunk::Data((s, v)) => {
+                            sum += v;
+                            seq = s;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, sum))),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(sum, 6);
+    }
+
+    #[test]
+    fn seq_empty() {
+        let (_, count) = with_chunked(b"[]", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move {
+                let mut seq = match e.deserialize_seq().await? {
+                    Probe::Hit(s) => s,
+                    Probe::Miss => panic!("expected seq"),
+                };
+                let mut count = 0usize;
+                loop {
+                    match seq
+                        .next(|[se]| async move {
+                            let (claim, v) = hit!(se.get::<U32>().await);
+                            Ok(Probe::Hit((claim, v.0)))
+                        })
+                        .await?
+                        .unwrap()
+                    {
+                        Chunk::Data((s, _)) => {
+                            count += 1;
+                            seq = s;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, count))),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(count, 0);
+    }
+
+    // ---- map ----------------------------------------------------------------
+
+    #[test]
+    fn map_single_pair() {
+        let (_, (key_len, val)) = with_chunked(b"{\"x\": 10}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move {
+                let mut map = match e.deserialize_map().await? {
+                    Probe::Hit(m) => m,
+                    Probe::Miss => panic!("expected map"),
+                };
+                let mut result = (0usize, 0u32);
+                loop {
+                    match map
+                        .next(|[ke]| async move {
+                            let (claim, k, v) = hit!(
+                                ke.key::<StrLen, 1, _, _, _>(|_k, [ve]| async move {
+                                    let (claim, v) = hit!(ve.value::<U32>().await);
+                                    Ok(Probe::Hit((claim, v.0)))
+                                })
+                                .await
+                            );
+                            Ok(Probe::Hit((claim, (k.0, v))))
+                        })
+                        .await?
+                        .unwrap()
+                    {
+                        Chunk::Data((m, kv)) => {
+                            result = kv;
+                            map = m;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, result))),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(key_len, 1); // "x"
+        assert_eq!(val, 10);
+    }
+
+    #[test]
+    fn map_empty() {
+        let (_, count) = with_chunked(b"{}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move {
+                let mut map = match e.deserialize_map().await? {
+                    Probe::Hit(m) => m,
+                    Probe::Miss => panic!("expected map"),
+                };
+                let mut count = 0usize;
+                loop {
+                    match map
+                        .next(|[ke]| async move {
+                            let (claim, _k, v) = hit!(
+                                ke.key::<StrLen, 1, _, _, _>(|_k, [ve]| async move {
+                                    let (claim, v) = hit!(ve.value::<U32>().await);
+                                    Ok(Probe::Hit((claim, v.0)))
+                                })
+                                .await
+                            );
+                            Ok(Probe::Hit((claim, v)))
+                        })
+                        .await?
+                        .unwrap()
+                    {
+                        Chunk::Data((m, _)) => {
+                            count += 1;
+                            map = m;
+                        }
+                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, count))),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn map_multiple_pairs() {
+        let (_, sum) = with_chunked(
+            b"{\"a\": 1, \"b\": 2, \"c\": 3}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                de.next(|[e]| async move {
+                    let mut map = match e.deserialize_map().await? {
+                        Probe::Hit(m) => m,
+                        Probe::Miss => panic!("expected map"),
+                    };
+                    let mut total = 0u32;
+                    loop {
+                        match map
+                            .next(|[ke]| async move {
+                                let (claim, _k, v) = hit!(
+                                    ke.key::<StrLen, 1, _, _, _>(|_k, [ve]| async move {
+                                        let (claim, v) = hit!(ve.value::<U32>().await);
+                                        Ok(Probe::Hit((claim, v.0)))
+                                    })
+                                    .await
+                                );
+                                Ok(Probe::Hit((claim, v)))
+                            })
+                            .await?
+                            .unwrap()
+                        {
+                            Chunk::Data((m, v)) => {
+                                total += v;
+                                map = m;
+                            }
+                            Chunk::Done(claim) => return Ok(Probe::Hit((claim, total))),
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            },
+        );
+        assert_eq!(sum, 6);
+    }
+
+    // ---- option -------------------------------------------------------------
+
+    #[test]
+    fn option_null_is_none() {
+        let (_, v) = with_chunked(b"null", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move { e.deserialize_option::<Bool>().await })
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn option_bool_is_some() {
+        let (_, v) = with_chunked(b"true", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move { e.deserialize_option::<Bool>().await })
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(v.unwrap().0);
+    }
+
+    // ---- error handling -----------------------------------------------------
+
+    #[test]
+    fn error_truncated_literal() {
+        let result = with_chunked(b"tru", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move { e.deserialize_bool().await })
+                .await
+        });
+        assert!(matches!(result, Err(JsonError::UnexpectedEnd)));
+    }
+
+    #[test]
+    fn error_invalid_number() {
+        let result = with_chunked(b"1.}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            de.next(|[e]| async move { e.deserialize_f64().await })
+                .await
+        });
+        assert!(matches!(result, Err(JsonError::InvalidNumber)));
+    }
+
+    // ---- derive(DeserializeOwned) -------------------------------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct Point {
+        x: i64,
+        y: i64,
+    }
+
+    #[test]
+    fn derive_owned_basic() {
+        let (_, v) = with_chunked(b"{\"x\": 1, \"y\": -2}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Point::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Point { x: 1, y: -2 });
+    }
+
+    #[test]
+    fn derive_owned_fields_out_of_order() {
+        let (_, v) = with_chunked(b"{\"y\": 7, \"x\": 3}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Point::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Point { x: 3, y: 7 });
+    }
+
+    #[test]
+    fn derive_owned_duplicate_field() {
+        let result = with_chunked(
+            b"{\"x\": 1, \"x\": 2, \"y\": 3}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Point::deserialize(de).await
+            },
+        );
+        assert_eq!(result, Err(JsonError::DuplicateField("x")));
+    }
+
+    #[test]
+    fn derive_owned_unknown_field_is_miss() {
+        let result = with_chunked(
+            b"{\"x\": 1, \"z\": 99, \"y\": 2}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Point::deserialize(de).await
+            },
+        );
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn derive_owned_missing_field_is_miss() {
+        let result = with_chunked(b"{\"x\": 5}", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Point::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn derive_owned_non_object_is_miss() {
+        let result = with_chunked(b"42", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Point::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn derive_owned_array_is_miss() {
+        let result = with_chunked(b"[1, 2]", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Point::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct MixedOwned {
+        score: f64,
+        count: u32,
+        active: bool,
+    }
+
+    #[test]
+    fn derive_owned_mixed_types() {
+        let (_, v) = with_chunked(
+            br#"{"score": 3.14, "count": 7, "active": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MixedOwned::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            MixedOwned {
+                score: 3.14,
+                count: 7,
+                active: true
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_mixed_types_reordered() {
+        let (_, v) = with_chunked(
+            br#"{"active": false, "score": 0.0, "count": 0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MixedOwned::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            MixedOwned {
+                score: 0.0,
+                count: 0,
+                active: false
+            }
+        );
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct Wrapper {
+        value: i64,
+    }
+
+    #[test]
+    fn derive_owned_single_field() {
+        let (_, v) = with_chunked(br#"{"value": -99}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Wrapper::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Wrapper { value: -99 });
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct Rect {
+        origin: Point,
+        size: Point,
+    }
+
+    #[test]
+    fn derive_owned_nested_struct() {
+        let (_, v) = with_chunked(
+            br#"{"origin": {"x": 1, "y": 2}, "size": {"x": 10, "y": 20}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Rect::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            Rect {
+                origin: Point { x: 1, y: 2 },
+                size: Point { x: 10, y: 20 },
+            }
+        );
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct OptFields {
+        required: i64,
+        maybe: Option<i64>,
+    }
+
+    #[test]
+    fn derive_owned_option_present() {
+        let (_, v) = with_chunked(
+            br#"{"required": 1, "maybe": 42}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                OptFields::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            OptFields {
+                required: 1,
+                maybe: Some(42)
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_option_null() {
+        let (_, v) = with_chunked(
+            br#"{"required": 1, "maybe": null}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                OptFields::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            OptFields {
+                required: 1,
+                maybe: None
+            }
+        );
+    }
+
+    // ---- derive(DeserializeOwned): generic type parameters ------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct GenPair<A, B> {
+        first: A,
+        second: B,
+    }
+
+    #[test]
+    fn derive_owned_generic_two_type_params() {
+        let (_, v) = with_chunked(
+            br#"{"first": 10, "second": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                <GenPair<i64, bool>>::deserialize(de)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            GenPair {
+                first: 10,
+                second: true
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_generic_different_instantiation() {
+        let (_, v) = with_chunked(
+            br#"{"first": false, "second": 42}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                <GenPair<bool, u32>>::deserialize(de)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            GenPair {
+                first: false,
+                second: 42
+            }
+        );
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct GenWrapper<T> {
+        inner: T,
+    }
+
+    #[test]
+    fn derive_owned_generic_single_param() {
+        let (_, v) = with_chunked(br#"{"inner": 99}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <GenWrapper<i64>>::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, GenWrapper { inner: 99 });
+    }
+
+    #[test]
+    fn derive_owned_generic_nested() {
+        let (_, v) = with_chunked(
+            br#"{"inner": {"x": 5, "y": 6}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                <GenWrapper<Point>>::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            GenWrapper {
+                inner: Point { x: 5, y: 6 }
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_generic_nested_generic() {
+        let (_, v) = with_chunked(
+            br#"{"inner": {"inner": true}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                <GenWrapper<GenWrapper<bool>>>::deserialize(de)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            GenWrapper {
+                inner: GenWrapper { inner: true }
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_generic_with_option() {
+        let (_, v) = with_chunked(br#"{"inner": null}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <GenWrapper<Option<i64>>>::deserialize(de)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, GenWrapper { inner: None });
+
+        let (_, v) = with_chunked(br#"{"inner": 7}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <GenWrapper<Option<i64>>>::deserialize(de)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, GenWrapper { inner: Some(7) });
+    }
+
+    // ---- derive(DeserializeOwned): enum — unit-only -------------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum Color {
+        Red,
+        Green,
+        Blue,
+    }
+
+    #[test]
+    fn derive_owned_enum_unit_variant() {
+        let (_, v) = with_chunked(br#""Red""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Color::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Color::Red);
+    }
+
+    #[test]
+    fn derive_owned_enum_unit_variant_other() {
+        let (_, v) = with_chunked(br#""Blue""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Color::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Color::Blue);
+    }
+
+    #[test]
+    fn derive_owned_enum_unit_unknown_is_miss() {
+        let result = with_chunked(br#""Yellow""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Color::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn derive_owned_enum_unit_non_string_is_miss() {
+        let result = with_chunked(b"42", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Color::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): enum — mixed -----------------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum Shape {
+        Circle,
+        Square(Point),
+        Rect { origin: Point, size: Point },
+    }
+
+    #[test]
+    fn derive_owned_enum_mixed_unit_variant() {
+        let (_, v) = with_chunked(br#""Circle""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Shape::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Shape::Circle);
+    }
+
+    #[test]
+    fn derive_owned_enum_newtype_variant() {
+        let (_, v) = with_chunked(
+            br#"{"Square": {"x": 1, "y": 2}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Shape::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(v, Shape::Square(Point { x: 1, y: 2 }));
+    }
+
+    #[test]
+    fn derive_owned_enum_struct_variant() {
+        let (_, v) = with_chunked(
+            br#"{"Rect": {"origin": {"x": 0, "y": 0}, "size": {"x": 10, "y": 20}}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Shape::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            Shape::Rect {
+                origin: Point { x: 0, y: 0 },
+                size: Point { x: 10, y: 20 },
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_enum_unknown_variant_map_is_miss() {
+        let result = with_chunked(br#"{"Triangle": {"x": 1}}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Shape::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn derive_owned_enum_empty_map_is_miss() {
+        let result = with_chunked(br#"{}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Shape::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): enum — tuple variants ---------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum Geom {
+        Point(i64, i64),
+        Color(u8, u8, u8),
+        Single(bool),
+        Unit,
+    }
+
+    #[test]
+    fn derive_owned_enum_tuple_variant_two_fields() {
+        let (_, v) = with_chunked(br#"{"Point": [3, 4]}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Geom::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Geom::Point(3, 4));
+    }
+
+    #[test]
+    fn derive_owned_enum_tuple_variant_three_fields() {
+        let (_, v) = with_chunked(
+            br#"{"Color": [255, 128, 0]}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                Geom::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(v, Geom::Color(255, 128, 0));
+    }
+
+    #[test]
+    fn derive_owned_enum_tuple_variant_mixed_with_unit() {
+        let (_, v) = with_chunked(br#""Unit""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Geom::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Geom::Unit);
+    }
+
+    #[test]
+    fn derive_owned_enum_tuple_variant_mixed_with_newtype() {
+        let (_, v) = with_chunked(br#"{"Single": true}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Geom::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Geom::Single(true));
+    }
+
+    #[test]
+    fn derive_owned_enum_tuple_variant_wrong_length_is_miss() {
+        let result = with_chunked(br#"{"Point": [1, 2, 3]}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Geom::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): enum — newtype-only ----------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum Value {
+        Int(i64),
+        Bool(bool),
+    }
+
+    #[test]
+    fn derive_owned_enum_newtype_only() {
+        let (_, v) = with_chunked(br#"{"Int": 42}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Value::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn derive_owned_enum_newtype_only_other() {
+        let (_, v) = with_chunked(br#"{"Bool": true}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Value::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    // ---- derive(DeserializeOwned): enum — generics --------------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum Either<A, B> {
+        Left(A),
+        Right(B),
+    }
+
+    #[test]
+    fn derive_owned_enum_generic_left() {
+        let (_, v) = with_chunked(br#"{"Left": 42}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <Either<i64, bool>>::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Either::Left(42));
+    }
+
+    #[test]
+    fn derive_owned_enum_generic_right() {
+        let (_, v) = with_chunked(br#"{"Right": true}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <Either<i64, bool>>::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Either::Right(true));
+    }
+
+    // ---- derive(DeserializeOwned): default attribute -------------------------
+
+    fn default_count() -> i64 {
+        99
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct WithDefaults {
+        required: i64,
+        #[strede(default = "default_count")]
+        count: i64,
+        #[strede(default)]
+        flag: bool,
+    }
+
+    #[test]
+    fn derive_owned_default_fields_missing() {
+        let (_, v) = with_chunked(br#"{"required": 1}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            WithDefaults::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(
+            v,
+            WithDefaults {
+                required: 1,
+                count: 99,
+                flag: false
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_default_fields_present_overrides() {
+        let (_, v) = with_chunked(
+            br#"{"required": 1, "count": 5, "flag": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                WithDefaults::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            WithDefaults {
+                required: 1,
+                count: 5,
+                flag: true
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_default_required_missing_is_miss() {
+        let result = with_chunked(br#"{"count": 5}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            WithDefaults::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): deserialize_owned_with attribute -----------
+
+    /// Custom owned deserializer: reads an i64 and doubles it.
+    async fn double_i64_owned<'s, D: strede::DeserializerOwned<'s>>(
+        d: D,
+    ) -> Result<Probe<(D::Claim, i64)>, D::Error>
+    where
+        D::Error: strede::DeserializeError,
+    {
+        d.next(|[e]| async move {
+            let (c, v) = hit!(e.deserialize_i64().await);
+            Ok(Probe::Hit((c, v * 2)))
+        })
+        .await
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct WithCustomDe {
+        normal: i64,
+        #[strede(deserialize_owned_with = "double_i64_owned")]
+        doubled: i64,
+    }
+
+    #[test]
+    fn derive_owned_deserialize_with() {
+        let (_, v) = with_chunked(
+            br#"{"normal": 5, "doubled": 3}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                WithCustomDe::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            WithCustomDe {
+                normal: 5,
+                doubled: 6
+            }
+        );
+    }
+
+    // ---- derive(DeserializeOwned): skip_deserializing attribute ---------------
+
+    fn skipped_default() -> i64 {
+        42
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct WithSkip {
+        required: i64,
+        #[strede(skip_deserializing, default = "skipped_default")]
+        skipped: i64,
+        #[strede(skip_deserializing, default)]
+        skipped_trait: bool,
+    }
+
+    #[test]
+    fn derive_owned_skip_uses_default_when_absent() {
+        let (_, v) = with_chunked(br#"{"required": 1}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            WithSkip::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(
+            v,
+            WithSkip {
+                required: 1,
+                skipped: 42,
+                skipped_trait: false
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_skip_ignores_present_value() {
+        let result = with_chunked(
+            br#"{"required": 1, "skipped": 99, "skipped_trait": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                WithSkip::deserialize(de).await
+            },
+        );
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): rename attribute -------------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct RenamedFields {
+        #[strede(rename = "type")]
+        kind: i64,
+        #[strede(rename = "value")]
+        val: bool,
+    }
+
+    #[test]
+    fn derive_owned_rename_struct_fields() {
+        let (_, v) = with_chunked(
+            br#"{"type": 42, "value": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                RenamedFields::deserialize(de).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            RenamedFields {
+                kind: 42,
+                val: true
+            }
+        );
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum RenamedVariants {
+        #[strede(rename = "circle")]
+        Circle,
+        #[strede(rename = "rect")]
+        Rect(i64),
+    }
+
+    #[test]
+    fn derive_owned_rename_unit_variant() {
+        let (_, v) = with_chunked(br#""circle""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedVariants::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, RenamedVariants::Circle);
+    }
+
+    #[test]
+    fn derive_owned_rename_newtype_variant() {
+        let (_, v) = with_chunked(br#"{"rect": 5}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedVariants::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, RenamedVariants::Rect(5));
+    }
+
+    // ---- derive(DeserializeOwned): untagged attribute -----------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(untagged)]
+    enum Untagged {
+        Num(i64),
+        Flag(bool),
+        Pt(i64, i64),
+        Named { x: i64 },
+    }
+
+    #[test]
+    fn derive_owned_untagged_newtype_first() {
+        let (_, v) = with_chunked(b"42", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Untagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Untagged::Num(42));
+    }
+
+    #[test]
+    fn derive_owned_untagged_bool() {
+        let (_, v) = with_chunked(b"true", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Untagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Untagged::Flag(true));
+    }
+
+    #[test]
+    fn derive_owned_untagged_tuple() {
+        let (_, v) = with_chunked(b"[1, 2]", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Untagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Untagged::Pt(1, 2));
+    }
+
+    #[test]
+    fn derive_owned_untagged_struct() {
+        let (_, v) = with_chunked(br#"{"x": 7}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Untagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, Untagged::Named { x: 7 });
+    }
+
+    #[test]
+    fn derive_owned_untagged_all_miss() {
+        let result = with_chunked(br#""hello""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            Untagged::deserialize(de).await
+        });
+        assert_eq!(result, Ok(Probe::Miss));
+    }
+
+    // ---- derive(DeserializeOwned): per-variant untagged ---------------------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    enum MixedTagged {
+        Ping,
+        Data(i64),
+        #[strede(untagged)]
+        Fallback(bool),
+    }
+
+    #[test]
+    fn derive_owned_mixed_tagged_unit() {
+        let (_, v) = with_chunked(br#""Ping""#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            MixedTagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, MixedTagged::Ping);
+    }
+
+    #[test]
+    fn derive_owned_mixed_tagged_newtype() {
+        let (_, v) = with_chunked(br#"{"Data": 42}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            MixedTagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, MixedTagged::Data(42));
+    }
+
+    #[test]
+    fn derive_owned_mixed_untagged_fallback() {
+        let (_, v) = with_chunked(b"true", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            MixedTagged::deserialize(de).await.unwrap().unwrap()
+        });
+        assert_eq!(v, MixedTagged::Fallback(true));
+    }
+}

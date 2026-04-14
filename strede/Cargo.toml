@@ -1,0 +1,14 @@
+[package]
+name = "strede"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "Async, zero-alloc, pull-based deserialization for Rust"
+readme = "../README.md"
+
+[dependencies]
+strede-derive = { path = "../strede-derive", version = "=0.1.0" }
