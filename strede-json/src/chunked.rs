@@ -1083,6 +1083,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqE
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     extern crate alloc;
     use super::*;

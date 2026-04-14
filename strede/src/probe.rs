@@ -38,6 +38,14 @@ impl<T> Probe<T> {
     pub fn is_hit(&self) -> bool {
         matches!(self, Probe::Hit(_))
     }
+
+    /// Map the inner value of a `Hit`, leaving `Miss` unchanged.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Probe<U> {
+        match self {
+            Probe::Hit(v) => Probe::Hit(f(v)),
+            Probe::Miss => Probe::Miss,
+        }
+    }
 }
 
 /// Propagates `Err` and `Ok(Probe::Miss)` from the enclosing function;
@@ -54,8 +62,8 @@ impl<T> Probe<T> {
 macro_rules! hit {
     ($e:expr) => {
         match $e? {
-            ::strede::Probe::Hit(v) => v,
-            ::strede::Probe::Miss => return ::core::result::Result::Ok(::strede::Probe::Miss),
+            $crate::Probe::Hit(v) => v,
+            $crate::Probe::Miss => return ::core::result::Result::Ok($crate::Probe::Miss),
         }
     };
 }

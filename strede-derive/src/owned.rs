@@ -153,9 +153,9 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                 let mut __i = 0usize;
                                 while __i < #de_field_count {
                                     if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                        if __s.starts_with(__chunk) {
+                                        if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
                                             __remaining[__i] =
-                                                ::core::option::Option::Some(&__s[__chunk.len()..]);
+                                                ::core::option::Option::Some(__rest);
                                         } else {
                                             __remaining[__i] = ::core::option::Option::None;
                                         }
@@ -502,9 +502,9 @@ fn gen_chunk_matcher_impl(
                             let mut __i = 0usize;
                             while __i < #count {
                                 if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if __s.starts_with(__chunk) {
+                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
                                         __remaining[__i] =
-                                            ::core::option::Option::Some(&__s[__chunk.len()..]);
+                                            ::core::option::Option::Some(__rest);
                                     } else {
                                         __remaining[__i] = ::core::option::Option::None;
                                     }
@@ -682,9 +682,9 @@ fn expand_owned_enum_unit_only(
                     let mut __i = 0usize;
                     while __i < #variant_count {
                         if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                            if __s.starts_with(__chunk) {
+                            if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
                                 __remaining[__i] =
-                                    ::core::option::Option::Some(&__s[__chunk.len()..]);
+                                    ::core::option::Option::Some(__rest);
                             } else {
                                 __remaining[__i] = ::core::option::Option::None;
                             }
@@ -786,9 +786,9 @@ fn expand_owned_enum_mixed(
                             let mut __i = 0usize;
                             while __i < #unit_count {
                                 if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if __s.starts_with(__chunk) {
+                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
                                         __remaining[__i] =
-                                            ::core::option::Option::Some(&__s[__chunk.len()..]);
+                                            ::core::option::Option::Some(__rest);
                                     } else {
                                         __remaining[__i] = ::core::option::Option::None;
                                     }
@@ -1174,9 +1174,9 @@ fn expand_owned_enum_with_untagged(
                             let mut __i = 0usize;
                             while __i < #unit_count {
                                 if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if __s.starts_with(__chunk) {
+                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
                                         __remaining[__i] =
-                                            ::core::option::Option::Some(&__s[__chunk.len()..]);
+                                            ::core::option::Option::Some(__rest);
                                     } else {
                                         __remaining[__i] = ::core::option::Option::None;
                                     }

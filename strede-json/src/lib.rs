@@ -808,6 +808,7 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     extern crate alloc;
     use super::*;
