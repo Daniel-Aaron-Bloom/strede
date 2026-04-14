@@ -8,9 +8,11 @@ use crate::common::{
 };
 
 pub fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let container_attrs = parse_container_attrs(&input.attrs)?;
+    let krate = &container_attrs.crate_path;
     match &input.data {
-        Data::Struct(_) => expand_owned_struct(input),
-        Data::Enum(_) => expand_owned_enum(input),
+        Data::Struct(_) => expand_owned_struct(input, krate),
+        Data::Enum(_) => expand_owned_enum(input, krate),
         _ => Err(syn::Error::new_spanned(
             &input.ident,
             "DeserializeOwned can only be derived for structs and enums",
@@ -18,7 +20,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     }
 }
 
-fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
+fn expand_owned_struct(input: DeriveInput,
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let named_fields = match &input.data {
         Data::Struct(s) => match &s.fields {
@@ -43,7 +46,7 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
         .iter()
         .map(|n| format_ident!("__f_{}", n))
         .collect();
-    let field_finalizers = gen_field_finalizers(&field_names, &acc_names, &classified_fields);
+    let field_finalizers = gen_field_finalizers(&field_names, &acc_names, &classified_fields, krate);
 
     // Filtered views: only non-skipped fields participate in deserialization.
     let de_field_names: Vec<_> = field_names
@@ -102,7 +105,7 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
         .collect();
 
     let de_with_wrappers =
-        gen_deserialize_with_wrappers_owned(&de_field_names, &de_field_types, &de_classified);
+        gen_deserialize_with_wrappers_owned(&de_field_names, &de_field_types, &de_classified, krate);
 
     // ty_generics: original struct type params.
     let (_, ty_generics, _) = input.generics.split_for_impl();
@@ -117,7 +120,7 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
         let wc = impl_gen.make_where_clause();
         for ty in &de_field_types {
             wc.predicates
-                .push(syn::parse_quote!(#ty: ::strede::DeserializeOwned<'s>));
+                .push(syn::parse_quote!(#ty: #krate::DeserializeOwned<'s>));
         }
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
@@ -132,15 +135,15 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
             // Per-struct field key matcher
             struct __FieldKey(usize);
 
-            impl<'s> ::strede::DeserializeOwned<'s> for __FieldKey {
-                async fn deserialize<__D: ::strede::DeserializerOwned<'s>>(
+            impl<'s> #krate::DeserializeOwned<'s> for __FieldKey {
+                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
-                ) -> ::core::result::Result<::strede::Probe<(__D::Claim, Self)>, __D::Error> {
+                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error> {
                     d.next(|[__e]| async move {
                         let mut __chunks = match __e.deserialize_str_chunks().await? {
-                            ::strede::Probe::Hit(__c) => __c,
-                            ::strede::Probe::Miss => {
-                                return ::core::result::Result::Ok(::strede::Probe::Miss);
+                            #krate::Probe::Hit(__c) => __c,
+                            #krate::Probe::Miss => {
+                                return ::core::result::Result::Ok(#krate::Probe::Miss);
                             }
                         };
 
@@ -163,8 +166,8 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                     __i += 1;
                                 }
                             }).await? {
-                                ::strede::Chunk::Data((__c, ())) => { __chunks = __c; }
-                                ::strede::Chunk::Done(__c) => break __c,
+                                #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
+                                #krate::Chunk::Done(__c) => break __c,
                             }
                         };
 
@@ -179,24 +182,24 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                         }
 
                         ::core::result::Result::Ok(
-                            ::strede::Probe::Hit((__claim, __FieldKey(__matched)))
+                            #krate::Probe::Hit((__claim, __FieldKey(__matched)))
                         )
                     }).await
                 }
             }
 
-            impl #impl_generics ::strede::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: ::strede::DeserializerOwned<'s>>(
+            impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
+                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
-                ) -> ::core::result::Result<::strede::Probe<(__D::Claim, Self)>, __D::Error>
+                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                 where
-                    __D::Error: ::strede::DeserializeError,
+                    __D::Error: #krate::DeserializeError,
                 {
                     d.next(|[__e]| async move {
                         let mut __map = match __e.deserialize_map().await? {
-                            ::strede::Probe::Hit(__m) => __m,
-                            ::strede::Probe::Miss => {
-                                return ::core::result::Result::Ok(::strede::Probe::Miss);
+                            #krate::Probe::Hit(__m) => __m,
+                            #krate::Probe::Miss => {
+                                return ::core::result::Result::Ok(#krate::Probe::Miss);
                             }
                         };
 
@@ -220,17 +223,17 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                                 #(
                                                     #de_field_indices => {
                                                         match __ve.value::<#de_value_types>().await? {
-                                                            ::strede::Probe::Hit((__c, __v)) => {
+                                                            #krate::Probe::Hit((__c, __v)) => {
                                                                 ::core::result::Result::Ok(
-                                                                    ::strede::Probe::Hit((
+                                                                    #krate::Probe::Hit((
                                                                         __c,
                                                                         __Field::#de_field_names(__v #de_value_conversions),
                                                                     ))
                                                                 )
                                                             }
-                                                            ::strede::Probe::Miss => {
+                                                            #krate::Probe::Miss => {
                                                                 ::core::result::Result::Ok(
-                                                                    ::strede::Probe::Miss,
+                                                                    #krate::Probe::Miss,
                                                                 )
                                                             }
                                                         }
@@ -238,7 +241,7 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                                 )*
                                                 _ => {
                                                     ::core::result::Result::Ok(
-                                                        ::strede::Probe::Miss,
+                                                        #krate::Probe::Miss,
                                                     )
                                                 }
                                             }
@@ -246,25 +249,25 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                     },
                                 ).await?;
                                 match __probe {
-                                    ::strede::Probe::Hit((__c, _k, __field)) => {
+                                    #krate::Probe::Hit((__c, _k, __field)) => {
                                         ::core::result::Result::Ok(
-                                            ::strede::Probe::Hit((__c, __field)),
+                                            #krate::Probe::Hit((__c, __field)),
                                         )
                                     }
-                                    ::strede::Probe::Miss => {
-                                        ::core::result::Result::Ok(::strede::Probe::Miss)
+                                    #krate::Probe::Miss => {
+                                        ::core::result::Result::Ok(#krate::Probe::Miss)
                                     }
                                 }
                             }).await? {
-                                ::strede::Probe::Hit(
-                                    ::strede::Chunk::Data((__map_back, __field)),
+                                #krate::Probe::Hit(
+                                    #krate::Chunk::Data((__map_back, __field)),
                                 ) => {
                                     match __field {
                                         #(
                                             __Field::#de_field_names(__v) => {
                                                 if #de_acc_names.is_some() {
                                                     return ::core::result::Result::Err(
-                                                        <__D::Error as ::strede::DeserializeError>::duplicate_field(#de_field_strs)
+                                                        <__D::Error as #krate::DeserializeError>::duplicate_field(#de_field_strs)
                                                     );
                                                 }
                                                 #de_acc_names = ::core::option::Option::Some(__v);
@@ -273,11 +276,11 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                                     }
                                     __map = __map_back;
                                 }
-                                ::strede::Probe::Hit(
-                                    ::strede::Chunk::Done(__c),
+                                #krate::Probe::Hit(
+                                    #krate::Chunk::Done(__c),
                                 ) => break __c,
-                                ::strede::Probe::Miss => {
-                                    return ::core::result::Result::Ok(::strede::Probe::Miss);
+                                #krate::Probe::Miss => {
+                                    return ::core::result::Result::Ok(#krate::Probe::Miss);
                                 }
                             }
                         };
@@ -285,7 +288,7 @@ fn expand_owned_struct(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #( #field_finalizers )*
 
                         ::core::result::Result::Ok(
-                            ::strede::Probe::Hit((__claim, #name { #( #field_names, )* }))
+                            #krate::Probe::Hit((__claim, #name { #( #field_names, )* }))
                         )
                     }).await
                 }
@@ -300,7 +303,7 @@ fn gen_field_finalizers(
     field_names: &[&syn::Ident],
     acc_names: &[syn::Ident],
     classified_fields: &[crate::common::ClassifiedField],
-) -> Vec<TokenStream2> {
+    krate: &syn::Path) -> Vec<TokenStream2> {
     field_names
         .iter()
         .zip(acc_names.iter())
@@ -317,7 +320,7 @@ fn gen_field_finalizers(
             let none_branch = match &cf.default {
                 Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
                 Some(DefaultAttr::Path(path)) => quote! { #path() },
-                None => quote! { return ::core::result::Result::Ok(::strede::Probe::Miss) },
+                None => quote! { return ::core::result::Result::Ok(#krate::Probe::Miss) },
             };
             quote! {
                 let #fname = match #acc {
@@ -334,7 +337,7 @@ fn gen_deserialize_with_wrappers_owned(
     field_names: &[&syn::Ident],
     field_types: &[&syn::Type],
     classified: &[&crate::common::ClassifiedField],
-) -> TokenStream2 {
+    krate: &syn::Path) -> TokenStream2 {
     let mut tokens = TokenStream2::new();
     for ((name, ty), cf) in field_names
         .iter()
@@ -346,19 +349,19 @@ fn gen_deserialize_with_wrappers_owned(
             tokens.extend(quote! {
                 #[allow(non_camel_case_types)]
                 struct #wrapper(#ty);
-                impl<'s> ::strede::DeserializeOwned<'s> for #wrapper {
-                    async fn deserialize<__D: ::strede::DeserializerOwned<'s>>(
+                impl<'s> #krate::DeserializeOwned<'s> for #wrapper {
+                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
-                    ) -> ::core::result::Result<::strede::Probe<(__D::Claim, Self)>, __D::Error>
+                    ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                     where
-                        __D::Error: ::strede::DeserializeError,
+                        __D::Error: #krate::DeserializeError,
                     {
                         match #path(d).await? {
-                            ::strede::Probe::Hit((__c, __v)) => {
-                                ::core::result::Result::Ok(::strede::Probe::Hit((__c, Self(__v))))
+                            #krate::Probe::Hit((__c, __v)) => {
+                                ::core::result::Result::Ok(#krate::Probe::Hit((__c, Self(__v))))
                             }
-                            ::strede::Probe::Miss => {
-                                ::core::result::Result::Ok(::strede::Probe::Miss)
+                            #krate::Probe::Miss => {
+                                ::core::result::Result::Ok(#krate::Probe::Miss)
                             }
                         }
                     }
@@ -373,7 +376,8 @@ fn gen_deserialize_with_wrappers_owned(
 // Owned-family enum derive
 // ---------------------------------------------------------------------------
 
-fn expand_owned_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
+fn expand_owned_enum(input: DeriveInput,
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let data = match &input.data {
         Data::Enum(d) => d,
@@ -396,7 +400,7 @@ fn expand_owned_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
         let wc = impl_gen.make_where_clause();
         for ty in &field_types {
             wc.predicates
-                .push(syn::parse_quote!(#ty: ::strede::DeserializeOwned<'s>));
+                .push(syn::parse_quote!(#ty: #krate::DeserializeOwned<'s>));
         }
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
@@ -425,6 +429,7 @@ fn expand_owned_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
             &tagged_variant_strs,
             variant_count,
             variant_key_sentinel,
+            krate,
         )
     } else {
         quote! {}
@@ -432,23 +437,23 @@ fn expand_owned_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let body = if !has_untagged {
         if has_tagged_unit && !has_tagged_nonunit {
-            expand_owned_enum_unit_only(name, &classified, variant_key_sentinel)?
+            expand_owned_enum_unit_only(name, &classified, variant_key_sentinel, krate)?
         } else if !has_tagged_unit && has_tagged_nonunit {
-            expand_owned_enum_map_only(name, &classified, variant_key_sentinel)?
+            expand_owned_enum_map_only(name, &classified, variant_key_sentinel, krate)?
         } else {
-            expand_owned_enum_mixed(name, &classified, variant_key_sentinel)?
+            expand_owned_enum_mixed(name, &classified, variant_key_sentinel, krate)?
         }
     } else if !has_tagged_unit && !has_tagged_nonunit {
-        expand_owned_enum_untagged_only(name, &classified)?
+        expand_owned_enum_untagged_only(name, &classified, krate)?
     } else {
-        expand_owned_enum_with_untagged(name, &classified, variant_key_sentinel)?
+        expand_owned_enum_with_untagged(name, &classified, variant_key_sentinel, krate)?
     };
 
     // For tuple variants, generate per-variant __TupleVariantOwnedN types.
-    let tuple_variant_helpers = gen_tuple_variant_helpers_owned(&classified);
+    let tuple_variant_helpers = gen_tuple_variant_helpers_owned(&classified, krate);
     // For struct variants, generate per-variant __FieldKeyN and __VariantOwnedN types.
-    let struct_variant_field_keys = gen_struct_variant_field_keys(&classified);
-    let struct_variant_helpers = gen_struct_variant_helpers_owned(&classified);
+    let struct_variant_field_keys = gen_struct_variant_field_keys(&classified, krate);
+    let struct_variant_helpers = gen_struct_variant_helpers_owned(&classified, krate);
 
     Ok(quote! {
         const _: () = {
@@ -459,12 +464,12 @@ fn expand_owned_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
             #struct_variant_field_keys
             #struct_variant_helpers
 
-            impl #impl_generics ::strede::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: ::strede::DeserializerOwned<'s>>(
+            impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
+                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
-                ) -> ::core::result::Result<::strede::Probe<(__D::Claim, Self)>, __D::Error>
+                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                 where
-                    __D::Error: ::strede::DeserializeError,
+                    __D::Error: #krate::DeserializeError,
                 {
                     #body
                 }
@@ -479,17 +484,17 @@ fn gen_chunk_matcher_impl(
     strs: &[String],
     count: usize,
     sentinel: usize,
-) -> TokenStream2 {
+    krate: &syn::Path) -> TokenStream2 {
     quote! {
-        impl<'s> ::strede::DeserializeOwned<'s> for #type_name {
-            async fn deserialize<__D: ::strede::DeserializerOwned<'s>>(
+        impl<'s> #krate::DeserializeOwned<'s> for #type_name {
+            async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
                 d: __D,
-            ) -> ::core::result::Result<::strede::Probe<(__D::Claim, Self)>, __D::Error> {
+            ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error> {
                 d.next(|[__e]| async move {
                     let mut __chunks = match __e.deserialize_str_chunks().await? {
-                        ::strede::Probe::Hit(__c) => __c,
-                        ::strede::Probe::Miss => {
-                            return ::core::result::Result::Ok(::strede::Probe::Miss);
+                        #krate::Probe::Hit(__c) => __c,
+                        #krate::Probe::Miss => {
+                            return ::core::result::Result::Ok(#krate::Probe::Miss);
                         }
                     };
 
@@ -512,8 +517,8 @@ fn gen_chunk_matcher_impl(
                                 __i += 1;
                             }
                         }).await? {
-                            ::strede::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            ::strede::Chunk::Done(__c) => break __c,
+                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
+                            #krate::Chunk::Done(__c) => break __c,
                         }
                     };
 
@@ -528,7 +533,7 @@ fn gen_chunk_matcher_impl(
                     }
 
                     ::core::result::Result::Ok(
-                        ::strede::Probe::Hit((__claim, #type_name(__matched)))
+                        #krate::Probe::Hit((__claim, #type_name(__matched)))
                     )
                 }).await
             }
@@ -537,7 +542,8 @@ fn gen_chunk_matcher_impl(
 }
 
 /// Generate helper tuple struct definitions and DeserializeOwned impls for tuple variants (owned family).
-fn gen_tuple_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenStream2 {
+fn gen_tuple_variant_helpers_owned(classified: &[ClassifiedVariant],
+    krate: &syn::Path) -> TokenStream2 {
     let mut tokens = TokenStream2::new();
     for cv in classified.iter() {
         if let VariantKind::Tuple(fields) = &cv.kind {
@@ -554,12 +560,12 @@ fn gen_tuple_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenStr
                     let (#acc, __seq) = match __seq.next(|[__se]| async move {
                         __se.get::<#ty>().await
                     }).await? {
-                        ::strede::Probe::Hit(::strede::Chunk::Data((__seq_back, __v))) => (__v, __seq_back),
-                        ::strede::Probe::Hit(::strede::Chunk::Done(_)) => {
-                            return ::core::result::Result::Ok(::strede::Probe::Miss);
+                        #krate::Probe::Hit(#krate::Chunk::Data((__seq_back, __v))) => (__v, __seq_back),
+                        #krate::Probe::Hit(#krate::Chunk::Done(_)) => {
+                            return ::core::result::Result::Ok(#krate::Probe::Miss);
                         }
-                        ::strede::Probe::Miss => {
-                            return ::core::result::Result::Ok(::strede::Probe::Miss);
+                        #krate::Probe::Miss => {
+                            return ::core::result::Result::Ok(#krate::Probe::Miss);
                         }
                     };
                 }
@@ -569,36 +575,36 @@ fn gen_tuple_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenStr
                 #[allow(non_camel_case_types)]
                 struct #helper_name( #( #field_types, )* );
 
-                impl<'s> ::strede::DeserializeOwned<'s> for #helper_name
+                impl<'s> #krate::DeserializeOwned<'s> for #helper_name
                 where
-                    #( #field_types: ::strede::DeserializeOwned<'s>, )*
+                    #( #field_types: #krate::DeserializeOwned<'s>, )*
                 {
-                    async fn deserialize<__D2: ::strede::DeserializerOwned<'s>>(
+                    async fn deserialize<__D2: #krate::DeserializerOwned<'s>>(
                         d: __D2,
-                    ) -> ::core::result::Result<::strede::Probe<(__D2::Claim, Self)>, __D2::Error>
+                    ) -> ::core::result::Result<#krate::Probe<(__D2::Claim, Self)>, __D2::Error>
                     where
-                        __D2::Error: ::strede::DeserializeError,
+                        __D2::Error: #krate::DeserializeError,
                     {
                         d.next(|[__e]| async move {
                             let __seq = match __e.deserialize_seq().await? {
-                                ::strede::Probe::Hit(s) => s,
-                                ::strede::Probe::Miss => return ::core::result::Result::Ok(::strede::Probe::Miss),
+                                #krate::Probe::Hit(s) => s,
+                                #krate::Probe::Miss => return ::core::result::Result::Ok(#krate::Probe::Miss),
                             };
 
                             #( #seq_reads )*
 
                             // Expect sequence exhaustion.
                             match __seq.next::<1, _, _, ()>(|[__se]| async move {
-                                ::core::result::Result::Ok(::strede::Probe::Miss)
+                                ::core::result::Result::Ok(#krate::Probe::Miss)
                             }).await? {
-                                ::strede::Probe::Hit(::strede::Chunk::Done(__claim)) => {
-                                    ::core::result::Result::Ok(::strede::Probe::Hit((
+                                #krate::Probe::Hit(#krate::Chunk::Done(__claim)) => {
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((
                                         __claim,
                                         #helper_name( #( #acc_names, )* ),
                                     )))
                                 }
                                 _ => {
-                                    ::core::result::Result::Ok(::strede::Probe::Miss)
+                                    ::core::result::Result::Ok(#krate::Probe::Miss)
                                 }
                             }
                         }).await
@@ -611,7 +617,8 @@ fn gen_tuple_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenStr
 }
 
 /// Generate __FieldKeyN structs and impls for each struct variant.
-fn gen_struct_variant_field_keys(classified: &[ClassifiedVariant]) -> TokenStream2 {
+fn gen_struct_variant_field_keys(classified: &[ClassifiedVariant],
+    krate: &syn::Path) -> TokenStream2 {
     let mut tokens = TokenStream2::new();
     for cv in classified.iter() {
         if let VariantKind::Struct(fields) = &cv.kind {
@@ -625,7 +632,7 @@ fn gen_struct_variant_field_keys(classified: &[ClassifiedVariant]) -> TokenStrea
             let sentinel = field_count;
 
             let struct_def = quote! { struct #key_name(usize); };
-            let impl_block = gen_chunk_matcher_impl(&key_name, &field_strs, field_count, sentinel);
+            let impl_block = gen_chunk_matcher_impl(&key_name, &field_strs, field_count, sentinel, krate);
 
             tokens.extend(struct_def);
             tokens.extend(impl_block);
@@ -638,7 +645,7 @@ fn expand_owned_enum_unit_only(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     _variant_key_sentinel: usize,
-) -> syn::Result<TokenStream2> {
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     let all_variant_strs: Vec<_> = classified
         .iter()
         .filter(|cv| !cv.untagged)
@@ -655,7 +662,7 @@ fn expand_owned_enum_unit_only(
                 let vname = &cv.variant.ident;
                 Some(quote! {
                     #idx => ::core::result::Result::Ok(
-                        ::strede::Probe::Hit((__claim, #name::#vname))
+                        #krate::Probe::Hit((__claim, #name::#vname))
                     ),
                 })
             } else {
@@ -667,9 +674,9 @@ fn expand_owned_enum_unit_only(
     Ok(quote! {
         d.next(|[__e]| async move {
             let mut __chunks = match __e.deserialize_str_chunks().await? {
-                ::strede::Probe::Hit(__c) => __c,
-                ::strede::Probe::Miss => {
-                    return ::core::result::Result::Ok(::strede::Probe::Miss);
+                #krate::Probe::Hit(__c) => __c,
+                #krate::Probe::Miss => {
+                    return ::core::result::Result::Ok(#krate::Probe::Miss);
                 }
             };
 
@@ -692,8 +699,8 @@ fn expand_owned_enum_unit_only(
                         __i += 1;
                     }
                 }).await? {
-                    ::strede::Chunk::Data((__c, ())) => { __chunks = __c; }
-                    ::strede::Chunk::Done(__c) => break __c,
+                    #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
+                    #krate::Chunk::Done(__c) => break __c,
                 }
             };
 
@@ -709,7 +716,7 @@ fn expand_owned_enum_unit_only(
 
             match __matched {
                 #( #unit_match_arms )*
-                _ => ::core::result::Result::Ok(::strede::Probe::Miss),
+                _ => ::core::result::Result::Ok(#krate::Probe::Miss),
             }
         }).await
     })
@@ -719,14 +726,14 @@ fn expand_owned_enum_map_only(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     variant_key_sentinel: usize,
-) -> syn::Result<TokenStream2> {
-    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel);
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
+    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
     Ok(quote! {
         d.next(|[__e]| async move {
             let mut __map = match __e.deserialize_map().await? {
-                ::strede::Probe::Hit(__m) => __m,
-                ::strede::Probe::Miss => {
-                    return ::core::result::Result::Ok(::strede::Probe::Miss);
+                #krate::Probe::Hit(__m) => __m,
+                #krate::Probe::Miss => {
+                    return ::core::result::Result::Ok(#krate::Probe::Miss);
                 }
             };
             #map_body
@@ -738,7 +745,7 @@ fn expand_owned_enum_mixed(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     variant_key_sentinel: usize,
-) -> syn::Result<TokenStream2> {
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     // Build the string chunk-match for tagged unit variant names.
     let unit_variant_strs: Vec<_> = classified
         .iter()
@@ -761,21 +768,21 @@ fn expand_owned_enum_mixed(
             quote! {
                 #local_idx => {
                     return ::core::result::Result::Ok(
-                        ::strede::Probe::Hit((__unit_claim, #name::#vname))
+                        #krate::Probe::Hit((__unit_claim, #name::#vname))
                     );
                 }
             }
         })
         .collect();
 
-    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel);
+    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
 
     // Sequential probing: try str_chunks first (unit variants), then map.
     Ok(quote! {
         d.next(|[__e1, __e2]| async move {
             // Try string first (unit variants).
             match __e1.deserialize_str_chunks().await? {
-                ::strede::Probe::Hit(__chunks) => {
+                #krate::Probe::Hit(__chunks) => {
                     let mut __chunks = __chunks;
                     let mut __remaining: [::core::option::Option<&str>; #unit_count] = [
                         #( ::core::option::Option::Some(#unit_variant_strs), )*
@@ -796,8 +803,8 @@ fn expand_owned_enum_mixed(
                                 __i += 1;
                             }
                         }).await? {
-                            ::strede::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            ::strede::Chunk::Done(__c) => break __c,
+                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
+                            #krate::Chunk::Done(__c) => break __c,
                         }
                     };
 
@@ -814,18 +821,18 @@ fn expand_owned_enum_mixed(
                     match __matched {
                         #( #unit_match_arms )*
                         _ => {
-                            return ::core::result::Result::Ok(::strede::Probe::Miss);
+                            return ::core::result::Result::Ok(#krate::Probe::Miss);
                         }
                     }
                 }
-                ::strede::Probe::Miss => {}
+                #krate::Probe::Miss => {}
             }
 
             // Try map (non-unit variants).
             let mut __map = match __e2.deserialize_map().await? {
-                ::strede::Probe::Hit(__m) => __m,
-                ::strede::Probe::Miss => {
-                    return ::core::result::Result::Ok(::strede::Probe::Miss);
+                #krate::Probe::Hit(__m) => __m,
+                #krate::Probe::Miss => {
+                    return ::core::result::Result::Ok(#krate::Probe::Miss);
                 }
             };
             #map_body
@@ -838,8 +845,8 @@ fn gen_owned_enum_map_body(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     variant_key_sentinel: usize,
-) -> TokenStream2 {
-    let value_dispatch_arms = gen_owned_value_dispatch_arms(name, classified, variant_key_sentinel);
+    krate: &syn::Path) -> TokenStream2 {
+    let value_dispatch_arms = gen_owned_value_dispatch_arms(name, classified, variant_key_sentinel, krate);
 
     quote! {
         // Read the single key-value pair.
@@ -853,33 +860,33 @@ fn gen_owned_enum_map_body(
                 },
             ).await?;
             match __probe {
-                ::strede::Probe::Hit((__c, _k, __v)) => {
-                    ::core::result::Result::Ok(::strede::Probe::Hit((__c, __v)))
+                #krate::Probe::Hit((__c, _k, __v)) => {
+                    ::core::result::Result::Ok(#krate::Probe::Hit((__c, __v)))
                 }
-                ::strede::Probe::Miss => {
-                    ::core::result::Result::Ok(::strede::Probe::Miss)
+                #krate::Probe::Miss => {
+                    ::core::result::Result::Ok(#krate::Probe::Miss)
                 }
             }
         }).await? {
-            ::strede::Probe::Hit(::strede::Chunk::Data(__pair)) => __pair,
-            ::strede::Probe::Hit(::strede::Chunk::Done(_)) => {
-                return ::core::result::Result::Ok(::strede::Probe::Miss);
+            #krate::Probe::Hit(#krate::Chunk::Data(__pair)) => __pair,
+            #krate::Probe::Hit(#krate::Chunk::Done(_)) => {
+                return ::core::result::Result::Ok(#krate::Probe::Miss);
             }
-            ::strede::Probe::Miss => {
-                return ::core::result::Result::Ok(::strede::Probe::Miss);
+            #krate::Probe::Miss => {
+                return ::core::result::Result::Ok(#krate::Probe::Miss);
             }
         };
 
         // Drain the map — expect Done.
         let mut __map = __map_back;
         match __map.next::<1, _, _, ()>(|[__ke]| async move {
-            ::core::result::Result::Ok(::strede::Probe::Miss)
+            ::core::result::Result::Ok(#krate::Probe::Miss)
         }).await? {
-            ::strede::Probe::Hit(::strede::Chunk::Done(__claim)) => {
-                ::core::result::Result::Ok(::strede::Probe::Hit((__claim, __enum_val)))
+            #krate::Probe::Hit(#krate::Chunk::Done(__claim)) => {
+                ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __enum_val)))
             }
             _ => {
-                ::core::result::Result::Ok(::strede::Probe::Miss)
+                ::core::result::Result::Ok(#krate::Probe::Miss)
             }
         }
     }
@@ -890,7 +897,7 @@ fn gen_owned_value_dispatch_arms(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     _sentinel: usize,
-) -> TokenStream2 {
+    krate: &syn::Path) -> TokenStream2 {
     // Build arms using tagged-variant local indices (matching __VariantKey output).
     let tagged: Vec<_> = classified.iter().filter(|cv| !cv.untagged).collect();
     let arms: Vec<_> = tagged.iter().enumerate().filter_map(|(idx, cv)| {
@@ -899,13 +906,13 @@ fn gen_owned_value_dispatch_arms(
             VariantKind::Newtype(ty) => Some(quote! {
                 #idx => {
                     match __ve.value::<#ty>().await? {
-                        ::strede::Probe::Hit((__c, __v)) => {
+                        #krate::Probe::Hit((__c, __v)) => {
                             ::core::result::Result::Ok(
-                                ::strede::Probe::Hit((__c, #name::#vname(__v)))
+                                #krate::Probe::Hit((__c, #name::#vname(__v)))
                             )
                         }
-                        ::strede::Probe::Miss => {
-                            ::core::result::Result::Ok(::strede::Probe::Miss)
+                        #krate::Probe::Miss => {
+                            ::core::result::Result::Ok(#krate::Probe::Miss)
                         }
                     }
                 }
@@ -918,13 +925,13 @@ fn gen_owned_value_dispatch_arms(
                 Some(quote! {
                     #idx => {
                         match __ve.value::<#helper_name>().await? {
-                            ::strede::Probe::Hit((__c, __v)) => {
+                            #krate::Probe::Hit((__c, __v)) => {
                                 ::core::result::Result::Ok(
-                                    ::strede::Probe::Hit((__c, #name::#vname { #( #field_names: __v.#field_names, )* }))
+                                    #krate::Probe::Hit((__c, #name::#vname { #( #field_names: __v.#field_names, )* }))
                                 )
                             }
-                            ::strede::Probe::Miss => {
-                                ::core::result::Result::Ok(::strede::Probe::Miss)
+                            #krate::Probe::Miss => {
+                                ::core::result::Result::Ok(#krate::Probe::Miss)
                             }
                         }
                     }
@@ -938,13 +945,13 @@ fn gen_owned_value_dispatch_arms(
                 Some(quote! {
                     #idx => {
                         match __ve.value::<#helper_name>().await? {
-                            ::strede::Probe::Hit((__c, __v)) => {
+                            #krate::Probe::Hit((__c, __v)) => {
                                 ::core::result::Result::Ok(
-                                    ::strede::Probe::Hit((__c, #name::#vname( #( __v.#field_indices, )* )))
+                                    #krate::Probe::Hit((__c, #name::#vname( #( __v.#field_indices, )* )))
                                 )
                             }
-                            ::strede::Probe::Miss => {
-                                ::core::result::Result::Ok(::strede::Probe::Miss)
+                            #krate::Probe::Miss => {
+                                ::core::result::Result::Ok(#krate::Probe::Miss)
                             }
                         }
                     }
@@ -957,13 +964,14 @@ fn gen_owned_value_dispatch_arms(
     quote! {
         match __idx {
             #( #arms )*
-            _ => ::core::result::Result::Ok(::strede::Probe::Miss),
+            _ => ::core::result::Result::Ok(#krate::Probe::Miss),
         }
     }
 }
 
 /// Generate helper struct definitions and DeserializeOwned impls for struct variants (owned family).
-fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenStream2 {
+fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant],
+    krate: &syn::Path) -> TokenStream2 {
     let mut tokens = TokenStream2::new();
     for cv in classified.iter() {
         if let VariantKind::Struct(fields) = &cv.kind {
@@ -982,7 +990,7 @@ fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenSt
                 .iter()
                 .map(|n| format_ident!("__f_{}", n))
                 .collect();
-            let field_finalizers = gen_field_finalizers(&field_names, &acc_names, &cf);
+            let field_finalizers = gen_field_finalizers(&field_names, &acc_names, &cf, krate);
 
             tokens.extend(quote! {
                 #[allow(non_camel_case_types)]
@@ -990,21 +998,21 @@ fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenSt
                     #( #field_names: #field_types, )*
                 }
 
-                impl<'s> ::strede::DeserializeOwned<'s> for #helper_name
+                impl<'s> #krate::DeserializeOwned<'s> for #helper_name
                 where
-                    #( #field_types: ::strede::DeserializeOwned<'s>, )*
+                    #( #field_types: #krate::DeserializeOwned<'s>, )*
                 {
-                    async fn deserialize<__D2: ::strede::DeserializerOwned<'s>>(
+                    async fn deserialize<__D2: #krate::DeserializerOwned<'s>>(
                         d: __D2,
-                    ) -> ::core::result::Result<::strede::Probe<(__D2::Claim, Self)>, __D2::Error>
+                    ) -> ::core::result::Result<#krate::Probe<(__D2::Claim, Self)>, __D2::Error>
                     where
-                        __D2::Error: ::strede::DeserializeError,
+                        __D2::Error: #krate::DeserializeError,
                     {
                         d.next(|[__e]| async move {
                             let mut __map = match __e.deserialize_map().await? {
-                                ::strede::Probe::Hit(__m) => __m,
-                                ::strede::Probe::Miss => {
-                                    return ::core::result::Result::Ok(::strede::Probe::Miss);
+                                #krate::Probe::Hit(__m) => __m,
+                                #krate::Probe::Miss => {
+                                    return ::core::result::Result::Ok(#krate::Probe::Miss);
                                 }
                             };
 
@@ -1020,38 +1028,38 @@ fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenSt
                                                     #(
                                                         #field_indices => {
                                                             match __ve.value::<#field_types>().await? {
-                                                                ::strede::Probe::Hit((__c, __v)) => {
+                                                                #krate::Probe::Hit((__c, __v)) => {
                                                                     ::core::result::Result::Ok(
-                                                                        ::strede::Probe::Hit((__c, (#field_indices, __v)))
+                                                                        #krate::Probe::Hit((__c, (#field_indices, __v)))
                                                                     )
                                                                 }
-                                                                ::strede::Probe::Miss => {
-                                                                    ::core::result::Result::Ok(::strede::Probe::Miss)
+                                                                #krate::Probe::Miss => {
+                                                                    ::core::result::Result::Ok(#krate::Probe::Miss)
                                                                 }
                                                             }
                                                         }
                                                     )*
-                                                    _ => ::core::result::Result::Ok(::strede::Probe::Miss),
+                                                    _ => ::core::result::Result::Ok(#krate::Probe::Miss),
                                                 }
                                             }
                                         },
                                     ).await?;
                                     match __probe {
-                                        ::strede::Probe::Hit((__c, _k, __fv)) => {
-                                            ::core::result::Result::Ok(::strede::Probe::Hit((__c, __fv)))
+                                        #krate::Probe::Hit((__c, _k, __fv)) => {
+                                            ::core::result::Result::Ok(#krate::Probe::Hit((__c, __fv)))
                                         }
-                                        ::strede::Probe::Miss => {
-                                            ::core::result::Result::Ok(::strede::Probe::Miss)
+                                        #krate::Probe::Miss => {
+                                            ::core::result::Result::Ok(#krate::Probe::Miss)
                                         }
                                     }
                                 }).await? {
-                                    ::strede::Probe::Hit(::strede::Chunk::Data((__map_back, __fv))) => {
+                                    #krate::Probe::Hit(#krate::Chunk::Data((__map_back, __fv))) => {
                                         match __fv.0 {
                                             #(
                                                 #field_indices => {
                                                     if #acc_names.is_some() {
                                                         return ::core::result::Result::Err(
-                                                            <__D2::Error as ::strede::DeserializeError>::duplicate_field(#field_strs)
+                                                            <__D2::Error as #krate::DeserializeError>::duplicate_field(#field_strs)
                                                         );
                                                     }
                                                     #acc_names = ::core::option::Option::Some(__fv.1);
@@ -1061,16 +1069,16 @@ fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenSt
                                         }
                                         __map = __map_back;
                                     }
-                                    ::strede::Probe::Hit(::strede::Chunk::Done(__c)) => break __c,
-                                    ::strede::Probe::Miss => {
-                                        return ::core::result::Result::Ok(::strede::Probe::Miss);
+                                    #krate::Probe::Hit(#krate::Chunk::Done(__c)) => break __c,
+                                    #krate::Probe::Miss => {
+                                        return ::core::result::Result::Ok(#krate::Probe::Miss);
                                     }
                                 }
                             };
 
                             #( #field_finalizers )*
 
-                            ::core::result::Result::Ok(::strede::Probe::Hit((__claim, #helper_name { #( #field_names, )* })))
+                            ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #helper_name { #( #field_names, )* })))
                         }).await
                     }
                 }
@@ -1084,17 +1092,17 @@ fn gen_struct_variant_helpers_owned(classified: &[ClassifiedVariant]) -> TokenSt
 fn expand_owned_enum_untagged_only(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
-) -> syn::Result<TokenStream2> {
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     let n_handles = classified.len();
     let handle_names: Vec<_> = (0..n_handles).map(|i| format_ident!("__e{}", i)).collect();
 
     let refs: Vec<_> = classified.iter().collect();
-    let probe_chain = gen_untagged_probe_chain_owned(name, &refs, &handle_names);
+    let probe_chain = gen_untagged_probe_chain_owned(name, &refs, &handle_names, krate);
 
     Ok(quote! {
         d.next(|[#( #handle_names ),*]| async move {
             #probe_chain
-            ::core::result::Result::Ok(::strede::Probe::Miss)
+            ::core::result::Result::Ok(#krate::Probe::Miss)
         }).await
     })
 }
@@ -1104,7 +1112,7 @@ fn expand_owned_enum_with_untagged(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     variant_key_sentinel: usize,
-) -> syn::Result<TokenStream2> {
+    krate: &syn::Path) -> syn::Result<TokenStream2> {
     let has_tagged_unit = classified
         .iter()
         .any(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit));
@@ -1155,7 +1163,7 @@ fn expand_owned_enum_with_untagged(
                 quote! {
                     #local_idx => {
                         return ::core::result::Result::Ok(
-                            ::strede::Probe::Hit((__unit_claim, #name::#vname))
+                            #krate::Probe::Hit((__unit_claim, #name::#vname))
                         );
                     }
                 }
@@ -1164,7 +1172,7 @@ fn expand_owned_enum_with_untagged(
 
         quote! {
             match #h.deserialize_str_chunks().await? {
-                ::strede::Probe::Hit(__chunks) => {
+                #krate::Probe::Hit(__chunks) => {
                     let mut __chunks = __chunks;
                     let mut __remaining: [::core::option::Option<&str>; #unit_count] = [
                         #( ::core::option::Option::Some(#unit_variant_strs), )*
@@ -1184,8 +1192,8 @@ fn expand_owned_enum_with_untagged(
                                 __i += 1;
                             }
                         }).await? {
-                            ::strede::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            ::strede::Chunk::Done(__c) => break __c,
+                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
+                            #krate::Chunk::Done(__c) => break __c,
                         }
                     };
                     let mut __matched = #unit_count;
@@ -1200,11 +1208,11 @@ fn expand_owned_enum_with_untagged(
                     match __matched {
                         #( #unit_match_arms )*
                         _ => {
-                            return ::core::result::Result::Ok(::strede::Probe::Miss);
+                            return ::core::result::Result::Ok(#krate::Probe::Miss);
                         }
                     }
                 }
-                ::strede::Probe::Miss => {}
+                #krate::Probe::Miss => {}
             }
         }
     } else {
@@ -1213,22 +1221,22 @@ fn expand_owned_enum_with_untagged(
 
     // Tagged map section.
     let map_section = if let Some(h) = &map_handle {
-        let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel);
+        let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
         quote! {
             match #h.deserialize_map().await? {
-                ::strede::Probe::Hit(mut __map) => {
+                #krate::Probe::Hit(mut __map) => {
                     let __map_result = { #map_body };
                     match __map_result {
-                        ::core::result::Result::Ok(::strede::Probe::Hit(__v)) => {
-                            return ::core::result::Result::Ok(::strede::Probe::Hit(__v));
+                        ::core::result::Result::Ok(#krate::Probe::Hit(__v)) => {
+                            return ::core::result::Result::Ok(#krate::Probe::Hit(__v));
                         }
                         ::core::result::Result::Err(__e) => {
                             return ::core::result::Result::Err(__e);
                         }
-                        ::core::result::Result::Ok(::strede::Probe::Miss) => {}
+                        ::core::result::Result::Ok(#krate::Probe::Miss) => {}
                     }
                 }
-                ::strede::Probe::Miss => {}
+                #krate::Probe::Miss => {}
             }
         }
     } else {
@@ -1238,14 +1246,14 @@ fn expand_owned_enum_with_untagged(
     // Untagged section.
     let untagged_classified: Vec<_> = classified.iter().filter(|cv| cv.untagged).collect();
     let untagged_section =
-        gen_untagged_probe_chain_owned(name, &untagged_classified, &untagged_handles);
+        gen_untagged_probe_chain_owned(name, &untagged_classified, &untagged_handles, krate);
 
     Ok(quote! {
         d.next(|[#( #all_handles ),*]| async move {
             #str_section
             #map_section
             #untagged_section
-            ::core::result::Result::Ok(::strede::Probe::Miss)
+            ::core::result::Result::Ok(#krate::Probe::Miss)
         }).await
     })
 }
@@ -1255,7 +1263,7 @@ fn gen_untagged_probe_chain_owned(
     name: &syn::Ident,
     variants: &[&ClassifiedVariant],
     handles: &[syn::Ident],
-) -> TokenStream2 {
+    krate: &syn::Path) -> TokenStream2 {
     let mut arms = TokenStream2::new();
     for (i, cv) in variants.iter().enumerate() {
         let handle = &handles[i];
@@ -1264,24 +1272,24 @@ fn gen_untagged_probe_chain_owned(
             VariantKind::Unit => {
                 quote! {
                     match #handle.deserialize_null().await? {
-                        ::strede::Probe::Hit(__c) => {
+                        #krate::Probe::Hit(__c) => {
                             return ::core::result::Result::Ok(
-                                ::strede::Probe::Hit((__c, #name::#vname))
+                                #krate::Probe::Hit((__c, #name::#vname))
                             );
                         }
-                        ::strede::Probe::Miss => {}
+                        #krate::Probe::Miss => {}
                     }
                 }
             }
             VariantKind::Newtype(ty) => {
                 quote! {
                     match #handle.deserialize_value::<#ty>().await? {
-                        ::strede::Probe::Hit((__c, __v)) => {
+                        #krate::Probe::Hit((__c, __v)) => {
                             return ::core::result::Result::Ok(
-                                ::strede::Probe::Hit((__c, #name::#vname(__v)))
+                                #krate::Probe::Hit((__c, #name::#vname(__v)))
                             );
                         }
-                        ::strede::Probe::Miss => {}
+                        #krate::Probe::Miss => {}
                     }
                 }
             }
@@ -1291,12 +1299,12 @@ fn gen_untagged_probe_chain_owned(
                     (0..fields.len()).map(syn::Index::from).collect();
                 quote! {
                     match #handle.deserialize_value::<#helper_name>().await? {
-                        ::strede::Probe::Hit((__c, __v)) => {
+                        #krate::Probe::Hit((__c, __v)) => {
                             return ::core::result::Result::Ok(
-                                ::strede::Probe::Hit((__c, #name::#vname( #( __v.#field_indices, )* )))
+                                #krate::Probe::Hit((__c, #name::#vname( #( __v.#field_indices, )* )))
                             );
                         }
-                        ::strede::Probe::Miss => {}
+                        #krate::Probe::Miss => {}
                     }
                 }
             }
@@ -1306,12 +1314,12 @@ fn gen_untagged_probe_chain_owned(
                     fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
                 quote! {
                     match #handle.deserialize_value::<#helper_name>().await? {
-                        ::strede::Probe::Hit((__c, __v)) => {
+                        #krate::Probe::Hit((__c, __v)) => {
                             return ::core::result::Result::Ok(
-                                ::strede::Probe::Hit((__c, #name::#vname { #( #field_names: __v.#field_names, )* }))
+                                #krate::Probe::Hit((__c, #name::#vname { #( #field_names: __v.#field_names, )* }))
                             );
                         }
-                        ::strede::Probe::Miss => {}
+                        #krate::Probe::Miss => {}
                     }
                 }
             }

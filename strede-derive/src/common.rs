@@ -83,6 +83,7 @@ pub fn all_field_types(data: &syn::DataEnum) -> Vec<&syn::Type> {
 
 pub struct ContainerAttrs {
     pub untagged: bool,
+    pub crate_path: syn::Path,
 }
 
 pub struct VariantAttrs {
@@ -107,6 +108,7 @@ pub enum DefaultAttr {
 
 pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs> {
     let mut untagged = false;
+    let mut crate_path: Option<syn::Path> = None;
     for attr in attrs {
         if !attr.path().is_ident("strede") {
             continue;
@@ -115,12 +117,20 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
             if meta.path.is_ident("untagged") {
                 untagged = true;
                 Ok(())
+            } else if meta.path.is_ident("crate") {
+                let value = meta.value()?;
+                let s: syn::LitStr = value.parse()?;
+                crate_path = Some(s.parse()?);
+                Ok(())
             } else {
                 Err(meta.error("unknown strede attribute"))
             }
         })?;
     }
-    Ok(ContainerAttrs { untagged })
+    Ok(ContainerAttrs {
+        untagged,
+        crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::strede)),
+    })
 }
 
 pub fn parse_variant_attrs(attrs: &[syn::Attribute]) -> syn::Result<VariantAttrs> {

@@ -15,12 +15,17 @@ struct MissArm {
 }
 
 struct SelectProbeInput {
+    krate: syn::Path,
     arms: Vec<ProbeArm>,
     miss: Option<MissArm>,
 }
 
 impl Parse for SelectProbeInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        // Parse leading `@crate_path` injected by the wrapper macro.
+        let _: Token![@] = input.parse()?;
+        let krate: syn::Path = input.parse()?;
+
         let mut arms = Vec::new();
         let mut miss = None;
 
@@ -51,7 +56,7 @@ impl Parse for SelectProbeInput {
             arms.push(ProbeArm { pat, expr, body });
         }
 
-        Ok(SelectProbeInput { arms, miss })
+        Ok(SelectProbeInput { krate, arms, miss })
     }
 }
 
@@ -68,7 +73,7 @@ impl Parse for SelectProbeInput {
 /// wakeup (in declaration order).  `Pending` means "waiting for data";
 /// `Miss` marks an arm done; first `Hit` wins; `Err` short-circuits.
 pub fn select_probe_impl(input: TokenStream) -> TokenStream {
-    let SelectProbeInput { arms, miss } = parse_macro_input!(input as SelectProbeInput);
+    let SelectProbeInput { krate, arms, miss } = parse_macro_input!(input as SelectProbeInput);
 
     let n = arms.len();
 
@@ -107,12 +112,12 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
                         ::core::pin::Pin::as_mut(&mut #fut), __cx
                     ) {
                         ::core::task::Poll::Ready(::core::result::Result::Ok(
-                            ::strede::Probe::Hit(#pat)
+                            #krate::Probe::Hit(#pat)
                         )) => {
                             return ::core::task::Poll::Ready(#body);
                         }
                         ::core::task::Poll::Ready(::core::result::Result::Ok(
-                            ::strede::Probe::Miss
+                            #krate::Probe::Miss
                         )) => {
                             #done = true;
                         }
@@ -141,7 +146,7 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
             let b = &m.body;
             quote! { #b }
         }
-        None => quote! { ::core::result::Result::Ok(::strede::Probe::Miss) },
+        None => quote! { ::core::result::Result::Ok(#krate::Probe::Miss) },
     };
 
     let expanded = quote! {

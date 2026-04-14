@@ -8,7 +8,7 @@ mod owned;
 mod select_probe;
 
 #[proc_macro]
-pub fn select_probe(input: TokenStream) -> TokenStream {
+pub fn select_probe_inner(input: TokenStream) -> TokenStream {
     select_probe::select_probe_impl(input)
 }
 

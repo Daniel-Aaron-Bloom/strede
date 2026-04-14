@@ -49,7 +49,15 @@ pub mod shared_buf;
 
 // -- proc-macros --
 pub use strede_derive::DeserializeOwned;
-pub use strede_derive::select_probe;
+#[doc(hidden)]
+pub use strede_derive::select_probe_inner;
+
+#[macro_export]
+macro_rules! select_probe {
+    ($($tt:tt)*) => {
+        $crate::select_probe_inner!(@$crate $($tt)*)
+    };
+}
 
 // -- shared types --
 pub use error::DeserializeError;
