@@ -11,13 +11,21 @@ use crate::{Chunk, DeserializeError, Probe};
 /// Implement this to make a type readable by any format that implements
 /// [`Deserializer`].  The method drives the deserializer forward and returns
 /// the fully constructed value, or a fatal format error.
-pub trait Deserialize<'de>: Sized {
-    /// Deserialize `Self` from `d`.
+///
+/// The `Extra` type parameter is side-channel context passed into
+/// [`Entry::deserialize_value`], [`SeqEntry::get`], [`MapKeyEntry::key`], and
+/// [`MapValueEntry::value`] at the call site.  Defaults to `()` for types that
+/// need no extra context.
+pub trait Deserialize<'de, Extra = ()>: Sized {
+    /// Deserialize `Self` from `d`, with caller-supplied side-channel `extra`.
     ///
-    /// - `Ok(Probe::Hit(value))` — succeeded.
+    /// - `Ok(Probe::Hit((claim, value)))` — succeeded; thread `claim` back to the caller.
     /// - `Ok(Probe::Miss)` — token type didn't match; stream not advanced.
     /// - `Err(e)` — fatal format error (malformed data, I/O failure).
-    async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error>;
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: Extra,
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -27,47 +35,44 @@ pub trait Deserialize<'de>: Sized {
 /// A stream of tokens that can be decoded into Rust values.
 ///
 /// The deserializer owns the stream and is the sole means of advancing it —
-/// all advancement goes through [`Deserializer::next`].  Type probing is done
+/// all advancement goes through [`Deserializer::entry`].  Type probing is done
 /// through [`Entry`] handles handed to the closure.
-pub trait Deserializer<'de> {
+pub trait Deserializer<'de>: Sized {
     /// Fatal error type produced by this format.
     type Error: DeserializeError;
 
+    /// Proof-of-consumption token returned from [`Deserializer::entry`].
+    type Claim: 'de;
+
     /// Owned handle for one item slot.  See [`Entry`].
-    type Entry<'a>: Entry<'de, Error = Self::Error>
-    where
-        Self: 'a,
-        'de: 'a;
+    type Entry: Entry<'de, Error = Self::Error>;
 
     /// Advance to the next item in the stream.
     ///
     /// Passes `N` owned [`Entry`] handles to `f`.  When a probe inside `f`
     /// resolves `Ok(Probe::Hit((claim, r)))`, the winning arm returns it;
-    /// `next` verifies the claim and returns `Ok(Probe::Hit(r))`.  Returns
-    /// `Err(e)` if a fatal error occurs before or during `f`.
+    /// `entry` verifies the claim and returns `Ok(Probe::Hit((claim, r)))`.
+    /// Returns `Err(e)` if a fatal error occurs before or during `f`.
     /// `Ok(Probe::Miss)` propagates upward if no probe matched.
     /// `Pending` until a token is available.
     ///
     /// Use `N > 1` to race multiple probe arms via [`select_probe!`](crate::select_probe) without
     /// borrow conflicts.  Handles dropped without resolving do not advance
     /// the stream.
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    async fn entry<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<R>, Self::Error>
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::Entry<'s>; N]) -> Fut,
-        Fut: Future<
-            Output = Result<Probe<(<Self::Entry<'s> as Entry<'de>>::Claim, R)>, Self::Error>,
-        >;
+        F: FnMut([Self::Entry; N]) -> Fut,
+        Fut: Future<Output = Result<Probe<(<Self::Entry as Entry<'de>>::Claim, R)>, Self::Error>>;
 }
 
 // ---------------------------------------------------------------------------
 // Entry — type-probing handle for one item slot
 // ---------------------------------------------------------------------------
 
-/// Owned handle for one item slot, passed into the closure of [`Deserializer::next`].
+/// Owned handle for one item slot, passed into the closure of [`Deserializer::entry`].
 ///
 /// Each probe consumes `self` and resolves to `Ok(Probe::Hit((Claim, T)))` when
 /// the current token is of type `T`, `Ok(Probe::Miss)` if the type doesn't
@@ -79,15 +84,19 @@ pub trait Deserializer<'de> {
 /// Type mismatches **must** return `Ok(Probe::Miss)` — never `Err`.  `Err` is
 /// reserved for fatal format errors (malformed data, I/O failure).
 ///
-/// Use `N > 1` in `next` to race arms via [`select_probe!`](crate::select_probe):
+/// Use `N > 1` in `entry` to race arms via [`select_probe!`](crate::select_probe):
 ///
 /// ```rust,ignore
-/// let value = d.next(|[e1, e2, e3, e4]| async move {
+/// let value = d.entry(|[e1, e2, e3, e4]| async {
 ///     select_probe! {
-///         (c, v) = e1.deserialize_bool()  => Ok(Probe::Hit((c, Value::Bool(v)))),
-///         (c, v) = e2.deserialize_i64()   => Ok(Probe::Hit((c, Value::Int(v)))),
-///         (c, v) = e3.deserialize_str()   => Ok(Probe::Hit((c, Value::Str(v)))),
-///         m      = e4.deserialize_map()   => {
+///         e1.deserialize_bool(),
+///         e2.deserialize_i64(),
+///         async move {
+///             let (c, v) = hit!(e3.deserialize_str().await);
+///             Ok(Probe::Hit((c, Value::Str(v))))
+///         },
+///         async move {
+///             let mut m = hit!(e4.deserialize_map().await);
 ///             let (c, v) = collect_map(m).await?;
 ///             Ok(Probe::Hit((c, Value::Map(v))))
 ///         },
@@ -96,7 +105,7 @@ pub trait Deserializer<'de> {
 /// ```
 pub trait Entry<'de>: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
 
     /// Proof-of-consumption token.  Must be returned from the `next` closure
     /// alongside the caller's value so the deserializer can advance the stream.
@@ -149,7 +158,7 @@ pub trait Entry<'de>: Sized {
     /// `Err` on fatal format error only.
     async fn deserialize_str(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error>;
     /// Begin streaming a string chunk-by-chunk.  The [`Entry::Claim`] is
-    /// returned by [`StrAccess::next`] when the string is exhausted.
+    /// returned by [`StrAccess::next_str`] when the string is exhausted.
     /// Handles all strings including those with escape sequences.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error>;
@@ -161,7 +170,7 @@ pub trait Entry<'de>: Sized {
     /// `Err` on fatal format error only.
     async fn deserialize_bytes(self) -> Result<Probe<(Self::Claim, &'de [u8])>, Self::Error>;
     /// Begin streaming a byte string chunk-by-chunk.  The [`Entry::Claim`] is
-    /// returned by [`BytesAccess::next`] when the byte string is exhausted.
+    /// returned by [`BytesAccess::next_bytes`] when the byte string is exhausted.
     /// Handles all byte strings including those requiring transcoding.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
@@ -180,8 +189,9 @@ pub trait Entry<'de>: Sized {
     /// - Token matching `T::deserialize` → `Ok(Probe::Hit((claim, Some(v))))`
     /// - Token matching neither → `Ok(Probe::Miss)`
     /// - Fatal format error → `Err(e)`
-    async fn deserialize_option<T: Deserialize<'de>>(
+    async fn deserialize_option<T: Deserialize<'de, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error>;
 
     /// Probe for a null token.
@@ -191,14 +201,29 @@ pub trait Entry<'de>: Sized {
     /// - `Err(e)` — fatal format error.
     async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error>;
 
-    /// Delegate to `T::deserialize` from this entry handle.
+    /// Delegate to `T::deserialize` from this entry handle, forwarding `extra`.
     ///
     /// Creates a sub-deserializer with the current token pre-loaded and
     /// calls `T::deserialize`.  Returns `Hit` if `T` matched, `Miss` if
     /// `T::deserialize` returned `Miss`.
-    async fn deserialize_value<T: Deserialize<'de>>(
+    async fn deserialize_value<T: Deserialize<'de, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+
+    /// Fork a sibling entry handle for the same item slot.
+    ///
+    /// Both `self` and the returned handle refer to the same slot.
+    /// Whichever resolves a probe first claims the slot; the other
+    /// becomes inert and may be dropped without advancing the stream.
+    fn fork(&mut self) -> Self;
+
+    /// Consume and discard the current token regardless of its type
+    /// (scalar, string, map, or sequence).
+    ///
+    /// Always succeeds on well-formed input.  Returns the [`Claim`](Entry::Claim)
+    /// so the stream can advance.  `Err` only on malformed data.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,24 +241,36 @@ pub trait Entry<'de>: Sized {
 /// let mut chunks = hit!(e.deserialize_str_chunks().await);
 /// let mut out = String::new();
 /// let claim = loop {
-///     match chunks.next().await? {
-///         Chunk::Data(chunk) => out.push_str(chunk),
+///     match chunks.next_str(|s| out.push_str(s)).await? {
+///         Chunk::Data((new, ())) => chunks = new,
 ///         Chunk::Done(claim) => break claim,
 ///     }
 /// };
 /// ```
-pub trait StrAccess {
+pub trait StrAccess: Sized {
     /// Proof-of-consumption token, returned when the string is exhausted.
     /// Must match the enclosing [`Entry::Claim`].
     type Claim;
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
 
-    /// - `Ok(Chunk::Data(chunk))` — next chunk; valid until the next call.
+    /// Fork a sibling accessor at the same read position.
+    ///
+    /// Both `self` and the returned accessor are independent: advancing one
+    /// does not affect the other.  Both start from the current chunk
+    /// position and must each be driven to `Done` independently.
+    fn fork(&mut self) -> Self;
+
+    /// Advance to the next chunk, passing it to `f`.
+    ///
+    /// - `Ok(Chunk::Data((self, r)))` — next chunk processed; accessor returned for the next call.
     /// - `Ok(Chunk::Done(claim))` — string exhausted; claim is now valid.
     /// - `Err(e)` — fatal format error.
     /// - `Pending` — no data yet.
-    async fn next(&mut self) -> Result<Chunk<&str, Self::Claim>, Self::Error>;
+    async fn next_str<R>(
+        self,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,24 +287,34 @@ pub trait StrAccess {
 /// let mut chunks = hit!(e.deserialize_bytes_chunks().await);
 /// let mut out = Vec::new();
 /// let claim = loop {
-///     match chunks.next().await? {
-///         Chunk::Data(chunk) => out.extend_from_slice(chunk),
+///     match chunks.next_bytes(|b| out.extend_from_slice(b)).await? {
+///         Chunk::Data((new, ())) => chunks = new,
 ///         Chunk::Done(claim) => break claim,
 ///     }
 /// };
 /// ```
-pub trait BytesAccess {
+pub trait BytesAccess: Sized {
     /// Proof-of-consumption token, returned when the byte string is exhausted.
     /// Must match the enclosing [`Entry::Claim`].
     type Claim;
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
 
-    /// - `Ok(Chunk::Data(chunk))` — next chunk; valid until the next call.
+    /// Fork a sibling accessor at the same read position.
+    ///
+    /// See [`StrAccess::fork`] for full semantics.
+    fn fork(&mut self) -> Self;
+
+    /// Advance to the next chunk, passing it to `f`.
+    ///
+    /// - `Ok(Chunk::Data((self, r)))` — next chunk processed; accessor returned for the next call.
     /// - `Ok(Chunk::Done(claim))` — byte string exhausted; claim is now valid.
     /// - `Err(e)` — fatal format error.
     /// - `Pending` — no data yet.
-    async fn next(&mut self) -> Result<Chunk<&[u8], Self::Claim>, Self::Error>;
+    async fn next_bytes<R>(
+        self,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,19 +322,23 @@ pub trait BytesAccess {
 // ---------------------------------------------------------------------------
 
 /// Iterates the key-value pairs of a map.  Obtained from [`Entry::deserialize_map`].
-pub trait MapAccess<'de> {
+pub trait MapAccess<'de>: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
 
     /// Proof-of-consumption token returned on map exhaustion; must match
     /// the enclosing [`Entry::Claim`].
     type Claim: 'de;
 
     /// Owned handle for reading one key.  See [`MapKeyEntry`].
-    type KeyEntry<'a>: MapKeyEntry<'de, Claim = Self::Claim, Error = Self::Error>
-    where
-        Self: 'a,
-        'de: 'a;
+    type KeyEntry: MapKeyEntry<'de, Claim = Self::Claim, Error = Self::Error>;
+
+    /// Fork a sibling accessor at the same map position.
+    ///
+    /// Both `self` and the returned accessor are independent iterators
+    /// starting from the current pair.  Each must consume all remaining
+    /// pairs (or be dropped) independently.
+    fn fork(&mut self) -> Self;
 
     /// Advance to the next key-value pair, passing `N` owned [`MapKeyEntry`]
     /// handles to `f`.  The closure must return `Ok(Probe::Hit((claim, r)))` where
@@ -295,18 +346,17 @@ pub trait MapAccess<'de> {
     /// [`MapKeyEntry::key`], or `Ok(Probe::Miss)` if no key matched.
     ///
     /// Returns:
-    /// - `Ok(Probe::Hit(Chunk::Data(r)))` — a pair was consumed.
+    /// - `Ok(Probe::Hit(Chunk::Data((self, r))))` — a pair was consumed.
     /// - `Ok(Probe::Hit(Chunk::Done(claim)))` — map exhausted.
     /// - `Ok(Probe::Miss)` — closure returned Miss (no key probe matched).
     /// - `Err(e)` — fatal format error.
     /// - `Pending` — no data yet.
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    async fn next_kv<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<Chunk<R, Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::KeyEntry<'s>; N]) -> Fut,
+        F: FnMut([Self::KeyEntry; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
@@ -321,9 +371,9 @@ pub trait MapAccess<'de> {
 /// ```rust,ignore
 /// let mut out = HashMap::new();
 /// loop {
-///     match map.next(|[ke]| async move {
-///         match ke.key::<String, 1, _, _, _>(|_k, [ve]| async move {
-///             let (claim, v) = hit!(ve.value::<u32>().await);
+///     match map.next_kv(|[ke]| async {
+///         match ke.key(|_k: &String, [ve]| async {
+///             let (claim, v) = hit!(ve.value::<u32, ()>(()).await);
 ///             Ok(Probe::Hit((claim, v)))
 ///         }).await? {
 ///             Probe::Hit((claim, k, v)) => Ok(Probe::Hit((claim, (k, v)))),
@@ -338,17 +388,26 @@ pub trait MapAccess<'de> {
 /// ```
 pub trait MapKeyEntry<'de> {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
     /// Proof-of-consumption token; must match the enclosing [`MapAccess::Claim`].
     type Claim: 'de;
     type ValueEntry: MapValueEntry<'de, Claim = Self::Claim, Error = Self::Error>;
 
-    async fn key<K: Deserialize<'de>, const N: usize, F, Fut, R>(
+    /// Fork a sibling key-entry handle for the same map pair.
+    ///
+    /// Both handles refer to the same key slot; whichever resolves `key`
+    /// first claims the pair.
+    fn fork(&mut self) -> Self
+    where
+        Self: Sized;
+
+    async fn key<K: Deserialize<'de, KExtra>, KExtra, const N: usize, F, Fut, R>(
         self,
+        extra: KExtra,
         f: F,
     ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
     where
-        F: FnOnce(&K, [Self::ValueEntry; N]) -> Fut,
+        F: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
@@ -358,15 +417,29 @@ pub trait MapKeyEntry<'de> {
 /// `[ValueEntry; N]` argument to its closure.
 pub trait MapValueEntry<'de> {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
     /// Proof-of-consumption token; must match the enclosing [`MapAccess::Claim`].
     type Claim: 'de;
 
-    /// Deserialize the value as `V`.  Returns `Ok(Probe::Hit((claim, value)))`;
-    /// the claim must be threaded out through [`MapKeyEntry::key`] and back to
-    /// [`MapAccess::next`] to advance the stream.  `Ok(Probe::Miss)` if
-    /// `V::deserialize` misses; `Err` on fatal format error only.
-    async fn value<V: Deserialize<'de>>(self) -> Result<Probe<(Self::Claim, V)>, Self::Error>;
+    /// Deserialize the value as `V`, forwarding `extra` into `V::deserialize`.
+    /// Returns `Ok(Probe::Hit((claim, value)))`; the claim must be threaded out
+    /// through [`MapKeyEntry::key`] and back to [`MapAccess::next`] to advance
+    /// the stream.  `Ok(Probe::Miss)` if `V::deserialize` misses; `Err` on
+    /// fatal format error only.
+    async fn value<V: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, V)>, Self::Error>;
+
+    /// Fork a sibling value-entry handle for the same map value slot.
+    ///
+    /// Both handles refer to the same value; whichever resolves `value`
+    /// first claims it.
+    fn fork(&mut self) -> Self;
+
+    /// Consume and discard the value without deserializing it.
+    /// Returns the [`Claim`](MapValueEntry::Claim) so the stream can advance.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,29 +451,33 @@ pub trait MapValueEntry<'de> {
 /// ```rust,ignore
 /// let mut out = Vec::new();
 /// loop {
-///     match seq.next(|[e]| async move {
-///         let (claim, v) = hit!(e.get::<u32>().await);
+///     match hit!(seq.next(|[e]| async {
+///         let (claim, v) = hit!(e.get::<u32, ()>(()).await);
 ///         Ok(Probe::Hit((claim, v)))
-///     }).await? {
-///         Probe::Hit(Chunk::Data(v)) => out.push(v),
-///         Probe::Hit(Chunk::Done(claim)) => return Ok(Probe::Hit((claim, out))),
-///         Probe::Miss => { /* unexpected element type */ }
+///     }).await) {
+///         Chunk::Data((n_seq, v)) => {
+///             out.push(v)
+///             seq = n_seq;
+///         },
+///         Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
 ///     }
 /// }
 /// ```
-pub trait SeqAccess<'de> {
+pub trait SeqAccess<'de>: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
 
     /// Proof-of-consumption token returned on sequence exhaustion; must match
     /// the enclosing [`Entry::Claim`].
     type Claim: 'de;
 
     /// Owned handle for one sequence element.  See [`SeqEntry`].
-    type Elem<'a>: SeqEntry<'de, Claim = Self::Claim, Error = Self::Error>
-    where
-        Self: 'a,
-        'de: 'a;
+    type Elem: SeqEntry<'de, Claim = Self::Claim, Error = Self::Error>;
+
+    /// Fork a sibling accessor at the same sequence position.
+    ///
+    /// See [`MapAccess::fork`] for full semantics.
+    fn fork(&mut self) -> Self;
 
     /// Advance to the next element, passing `N` owned [`SeqEntry`] handles to `f`.
     ///
@@ -410,28 +487,111 @@ pub trait SeqAccess<'de> {
     /// - `Ok(Probe::Miss)` — closure returned Miss.
     /// - `Err(e)` — fatal format error.
     /// - `Pending` — no data yet.
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    async fn next<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<Chunk<R, Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::Elem<'s>; N]) -> Fut,
+        F: FnMut([Self::Elem; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
 /// Owned handle for one element in a sequence.
 pub trait SeqEntry<'de> {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error;
+    type Error: DeserializeError;
     /// Proof-of-consumption token; must match the enclosing [`SeqAccess::Claim`].
     type Claim: 'de;
 
-    /// Deserialize the element as `T`.  Returns `Ok(Probe::Hit((claim, value)))`;
-    /// the claim must be returned from the closure passed to [`SeqAccess::next`]
-    /// to advance the stream.  `Ok(Probe::Miss)` if `T::deserialize` misses;
-    /// `Err` on fatal format error only.
-    async fn get<T: Deserialize<'de>>(self) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+    /// Deserialize the element as `T`, forwarding `extra` into `T::deserialize`.
+    /// Returns `Ok(Probe::Hit((claim, value)))`; the claim must be returned from
+    /// the closure passed to [`SeqAccess::next`] to advance the stream.
+    /// `Ok(Probe::Miss)` if `T::deserialize` misses; `Err` on fatal format error only.
+    async fn get<T: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+
+    /// Fork a sibling element handle for the same sequence slot.
+    ///
+    /// Both handles refer to the same element; whichever resolves `get`
+    /// first claims it.
+    fn fork(&mut self) -> Self
+    where
+        Self: Sized;
+
+    /// Consume and discard the element without deserializing it.
+    /// Returns the [`Claim`](SeqEntry::Claim) so the stream can advance.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
+}
+
+// ---------------------------------------------------------------------------
+// Never impls — borrow family
+// ---------------------------------------------------------------------------
+
+impl<'n, C, E: DeserializeError> StrAccess for crate::Never<'n, C, E> {
+    type Claim = C;
+    type Error = E;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next_str<R>(
+        self,
+        _f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, C, E: DeserializeError> BytesAccess for crate::Never<'n, C, E> {
+    type Claim = C;
+    type Error = E;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next_bytes<R>(
+        self,
+        _f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> SeqAccess<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type Claim = C;
+    type Elem = crate::Never<'n, C, E>;
+
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next<const N: usize, F, Fut, R>(
+        self,
+        _f: F,
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    where
+        F: FnMut([Self::Elem; N]) -> Fut,
+        Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+    {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> SeqEntry<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type Claim = C;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn get<T: Deserialize<'de, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        match self.0 {}
+    }
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        match self.0 {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,8 +601,11 @@ pub trait SeqEntry<'de> {
 macro_rules! impl_deserialize_primitive {
     ($ty:ty, $method:ident) => {
         impl<'de> Deserialize<'de> for $ty {
-            async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-                d.next(|[e]| async move { e.$method().await }).await
+            async fn deserialize<D: Deserializer<'de>>(
+                d: D,
+                _extra: (),
+            ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+                d.entry(|[e]| async { e.$method().await }).await
             }
         }
     };
@@ -463,22 +626,29 @@ impl_deserialize_primitive!(f32, deserialize_f32);
 impl_deserialize_primitive!(f64, deserialize_f64);
 impl_deserialize_primitive!(char, deserialize_char);
 
-impl<'de> Deserialize<'de> for &'de str {
-    async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-        d.next(|[e]| async move { e.deserialize_str().await }).await
+impl<'de: 'a, 'a> Deserialize<'de> for &'a str {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        _extra: (),
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        d.entry(|[e]| e.deserialize_str()).await
     }
 }
 
-impl<'de> Deserialize<'de> for &'de [u8] {
-    async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-        d.next(|[e]| async move { e.deserialize_bytes().await })
-            .await
+impl<'de: 'a, 'a> Deserialize<'de> for &'a [u8] {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        _extra: (),
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        d.entry(|[e]| e.deserialize_bytes()).await
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Option<T> {
-    async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-        d.next(|[e]| async move { e.deserialize_option::<T>().await })
-            .await
+impl<'de, Extra: Copy, T: Deserialize<'de, Extra>> Deserialize<'de, Extra> for Option<T> {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: Extra,
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        d.entry(|[e]| e.deserialize_option::<T, Extra>(extra)).await
     }
 }

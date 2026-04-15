@@ -1,14 +1,14 @@
 use core::fmt;
 use strede::DeserializeError;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum JsonError {
     UnexpectedEnd,
     UnexpectedByte { byte: u8 },
     InvalidNumber,
     InvalidEscape,
     InvalidUtf8,
-    TrailingGarbage,
+    ExpectedEnd,
     DuplicateField(&'static str),
 }
 
@@ -22,7 +22,7 @@ impl fmt::Display for JsonError {
             Self::InvalidNumber => write!(f, "invalid number"),
             Self::InvalidEscape => write!(f, "invalid escape sequence"),
             Self::InvalidUtf8 => write!(f, "invalid UTF-8"),
-            Self::TrailingGarbage => write!(f, "trailing garbage after top-level value"),
+            Self::ExpectedEnd => write!(f, "trailing garbage after top-level value"),
             Self::DuplicateField(name) => write!(f, "duplicate field `{name}`"),
         }
     }

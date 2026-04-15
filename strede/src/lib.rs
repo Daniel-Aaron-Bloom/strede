@@ -18,11 +18,18 @@
 //! the value:
 //!
 //! ```rust,ignore
-//! let v = d.next(|[e1, e2, e3]| async move {
+//! let v = d.next(|[e1, e2, e3]| async {
 //!     select_probe! {
-//!         (claim, f) = e1.deserialize_f32()  => Ok(Probe::Hit((claim, Value::Float(f)))),
-//!         (claim, s) = e2.deserialize_str()  => Ok(Probe::Hit((claim, Value::Str(s)))),
-//!         m          = e3.deserialize_map()  => {
+//!         async move {
+//!             let (claim, f) = hit!(e1.deserialize_f32().await);
+//!             Ok(Probe::Hit((claim, Value::Float(f))))
+//!         },
+//!         async move {
+//!             let (claim, s) = hit!(e2.deserialize_str().await);
+//!             Ok(Probe::Hit((claim, Value::Str(s))))
+//!         },
+//!         async move {
+//!             let (claim, m) = hit!(e3.deserialize_map().await);
 //!             let (claim, v) = collect_map(m).await?;
 //!             Ok(Probe::Hit((claim, Value::Map(v))))
 //!         },
@@ -38,37 +45,81 @@
 
 // `async fn` in public traits can't express `Send` bounds on the returned
 // futures — intentional here so implementations aren't forced to be Send.
-#![no_std]
+// #![no_std]
 #![allow(async_fn_in_trait)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 mod borrow;
 mod error;
+mod impls;
 mod owned;
 mod probe;
 pub mod shared_buf;
 
+use core::{convert::Infallible, marker::PhantomData};
+
 // -- proc-macros --
-pub use strede_derive::DeserializeOwned;
 #[doc(hidden)]
 pub use strede_derive::select_probe_inner;
-
-#[macro_export]
-macro_rules! select_probe {
-    ($($tt:tt)*) => {
-        $crate::select_probe_inner!(@$crate $($tt)*)
-    };
-}
+pub use strede_derive::{Deserialize, DeserializeOwned};
 
 // -- shared types --
 pub use error::DeserializeError;
 pub use probe::{Chunk, Probe};
 pub use shared_buf::{Buffer, Handle, SharedBuf};
 
+/// The uninhabited bottom type — equivalent to `!` but stable on all editions.
+///
+/// Used as the associated `StrChunks`, `BytesChunks`, and `Seq` types on
+/// [`Entry`] / [`EntryOwned`] implementations that never produce those
+/// accessor kinds.  Because `Never` has no values, all trait method bodies
+/// on `Never` are written as `match self {}` and the compiler accepts them
+/// without any reachable code.
+#[doc(hidden)]
+pub struct Never<'a, Claim, Error>(
+    Infallible,
+    PhantomData<(fn(*const Claim), fn(*const Error), fn(&'a ()))>,
+);
+
 // -- borrow family --
 pub use borrow::{
     BytesAccess, Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry,
     SeqAccess, SeqEntry, StrAccess,
 };
+
+// -- default expression helper --
+// Used by the derive macro to support both `default = "path"` (called as a
+// function) and `default = "expr"` (used as-is).  Inherent method resolution
+// beats trait methods, so `DefaultWrapper(fn_path).value()` calls the function
+// while `DefaultWrapper(expr).value()` returns the value directly.
+#[doc(hidden)]
+pub trait DefaultValue {
+    type Value;
+    fn value(self) -> Self::Value;
+}
+
+#[doc(hidden)]
+pub struct DefaultWrapper<T>(pub T);
+
+impl<T> DefaultValue for DefaultWrapper<T> {
+    type Value = T;
+    #[inline]
+    fn value(self) -> T {
+        self.0
+    }
+}
+
+impl<T, F: FnOnce() -> T> DefaultWrapper<F> {
+    #[inline]
+    pub fn value(self) -> T {
+        self.0()
+    }
+}
+
+// -- utility types --
+pub use impls::{Match, Skip, tag_facade};
 
 // -- owned family --
 pub use owned::{

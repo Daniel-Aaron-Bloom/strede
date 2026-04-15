@@ -106,12 +106,12 @@ impl<'de> JsonDeserializer<'de> {
     }
 }
 
-async fn json_deserializer_next<'s, 'de: 's, const N: usize, F, Fut, R>(
-    de: &'s mut JsonDeserializer<'de>,
-    f: F,
-) -> Result<Probe<R>, JsonError>
+async fn json_deserializer_next<'de, const N: usize, F, Fut, R>(
+    mut de: JsonDeserializer<'de>,
+    mut f: F,
+) -> Result<Probe<(JsonClaim<'de>, R)>, JsonError>
 where
-    F: FnOnce([JsonEntry<'de>; N]) -> Fut,
+    F: FnMut([JsonEntry<'de>; N]) -> Fut,
     Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
 {
     let token = de.next_dispatch()?;
@@ -122,46 +122,33 @@ where
     };
     match f(core::array::from_fn(|_| entry.clone())).await? {
         Probe::Hit((claim, r)) => {
-            de.tokenizer = claim.tokenizer;
-            de.src = claim.src;
             if de.is_root {
-                let mut rest = de.src;
+                let mut rest = claim.src;
                 while !rest.is_empty() && matches!(rest[0], b' ' | b'\t' | b'\n' | b'\r') {
                     rest = &rest[1..];
                 }
                 if !rest.is_empty() {
-                    return Err(JsonError::TrailingGarbage);
+                    return Err(JsonError::ExpectedEnd);
                 }
             }
-            Ok(Probe::Hit(r))
+            Ok(Probe::Hit((claim, r)))
         }
-        Probe::Miss => {
-            // Restore: put the token back so the next call can retry.
-            de.pending_tok = Some(token);
-            Ok(Probe::Miss)
-        }
+        Probe::Miss => Ok(Probe::Miss),
     }
 }
 
 impl<'de> Deserializer<'de> for JsonDeserializer<'de> {
     type Error = JsonError;
+    type Claim = JsonClaim<'de>;
+    type Entry = JsonEntry<'de>;
 
-    type Entry<'a>
-        = JsonEntry<'de>
-    where
-        Self: 'a,
-        'de: 'a;
-
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    async fn entry<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<R>, Self::Error>
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::Entry<'s>; N]) -> Fut,
-        Fut: core::future::Future<
-                Output = Result<Probe<(<Self::Entry<'s> as Entry<'de>>::Claim, R)>, Self::Error>,
-            >,
+        F: FnMut([Self::Entry; N]) -> Fut,
+        Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
     {
         json_deserializer_next(self, f).await
     }
@@ -185,6 +172,70 @@ impl<'de> JsonEntry<'de> {
     }
 }
 
+/// Skip one complete JSON value given its leading token.
+/// Returns the tokenizer state positioned after the skipped value.
+fn skip_value(src: &mut &[u8], tok: Token) -> Result<Tokenizer, JsonError> {
+    match tok {
+        Token::Simple(SimpleToken::Null | SimpleToken::Bool(_), tok) => Ok(tok),
+        Token::Number(mut access) => {
+            while access.next_chunk(src)?.is_some() {}
+            Ok(Tokenizer::new())
+        }
+        Token::Str(mut access) => {
+            while access.next_chunk(src)?.is_some() {}
+            Ok(Tokenizer::new())
+        }
+        Token::Simple(SimpleToken::ObjectStart, mut tok) => {
+            let mut first = true;
+            loop {
+                // Expect comma (after first pair) or closing brace.
+                if !first {
+                    match tok.next_token(src)? {
+                        Token::Simple(SimpleToken::Comma, next) => tok = next,
+                        Token::Simple(SimpleToken::ObjectEnd, next) => return Ok(next),
+                        _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+                    }
+                }
+                first = false;
+                // Read key or closing brace (for empty object on first iteration).
+                let key_tok = match tok.next_token(src)? {
+                    Token::Simple(SimpleToken::ObjectEnd, next) => return Ok(next),
+                    t => t,
+                };
+                // Skip the key (must be a string).
+                tok = skip_value(src, key_tok)?;
+                // Consume colon.
+                match tok.next_token(src)? {
+                    Token::Simple(SimpleToken::Colon, next) => tok = next,
+                    _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+                }
+                // Read and skip the value.
+                let val_tok = tok.next_token(src)?;
+                tok = skip_value(src, val_tok)?;
+            }
+        }
+        Token::Simple(SimpleToken::ArrayStart, mut tok) => {
+            let mut first = true;
+            loop {
+                if !first {
+                    match tok.next_token(src)? {
+                        Token::Simple(SimpleToken::Comma, next) => tok = next,
+                        Token::Simple(SimpleToken::ArrayEnd, next) => return Ok(next),
+                        _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+                    }
+                }
+                first = false;
+                let elem_tok = match tok.next_token(src)? {
+                    Token::Simple(SimpleToken::ArrayEnd, next) => return Ok(next),
+                    t => t,
+                };
+                tok = skip_value(src, elem_tok)?;
+            }
+        }
+        _ => Err(JsonError::UnexpectedByte { byte: 0 }),
+    }
+}
+
 impl<'de> Entry<'de> for JsonEntry<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
@@ -192,6 +243,10 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     type BytesChunks = JsonBytesAccess<'de>;
     type Map = JsonMapAccess<'de>;
     type Seq = JsonSeqAccess<'de>;
+
+    fn fork(&mut self) -> Self {
+        self.clone()
+    }
 
     // ---- Scalars -----------------------------------------------------------
 
@@ -364,8 +419,9 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
 
     // ---- Option ------------------------------------------------------------
 
-    async fn deserialize_option<T: Deserialize<'de>>(
+    async fn deserialize_option<T: Deserialize<'de, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
@@ -376,15 +432,9 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
                 None,
             ))),
             other => {
-                let mut sub = JsonDeserializer::sub_with_pending(self.src, other);
-                let v = hit!(T::deserialize(&mut sub).await);
-                Ok(Probe::Hit((
-                    JsonClaim {
-                        tokenizer: sub.tokenizer,
-                        src: sub.src,
-                    },
-                    Some(v),
-                )))
+                let sub = JsonDeserializer::sub_with_pending(self.src, other);
+                let (claim, v) = hit!(T::deserialize(sub, extra).await);
+                Ok(Probe::Hit((claim, Some(v))))
             }
         }
     }
@@ -403,18 +453,22 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
 
     // ---- Value (delegate to T::deserialize) ---------------------------------
 
-    async fn deserialize_value<T: Deserialize<'de>>(
+    async fn deserialize_value<T: Deserialize<'de, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-        let mut sub = JsonDeserializer::sub_with_pending(self.src, self.token);
-        let v = hit!(T::deserialize(&mut sub).await);
-        Ok(Probe::Hit((
-            JsonClaim {
-                tokenizer: sub.tokenizer,
-                src: sub.src,
-            },
-            v,
-        )))
+        let sub = JsonDeserializer::sub_with_pending(self.src, self.token);
+        let (claim, v) = hit!(T::deserialize(sub, extra).await);
+        Ok(Probe::Hit((claim, v)))
+    }
+
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        let mut src = self.src;
+        let tok = skip_value(&mut src, self.token)?;
+        Ok(JsonClaim {
+            tokenizer: tok,
+            src,
+        })
     }
 }
 
@@ -472,10 +526,24 @@ impl<'de> StrAccess for JsonStrAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    async fn next(&mut self) -> Result<Chunk<&str, Self::Claim>, Self::Error> {
+    fn fork(&mut self) -> Self {
+        Self {
+            access: self.access,
+            src: self.src,
+            char_buf: self.char_buf,
+        }
+    }
+
+    async fn next_str<R>(
+        mut self,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.access.next_chunk(&mut self.src) {
-            Ok(Some(StrChunk::Slice(s))) => Ok(Chunk::Data(s)),
-            Ok(Some(StrChunk::Char(c))) => Ok(Chunk::Data(&*c.encode_utf8(&mut self.char_buf))),
+            Ok(Some(StrChunk::Slice(s))) => Ok(Chunk::Data((self, f(s)))),
+            Ok(Some(StrChunk::Char(c))) => {
+                let r = f(c.encode_utf8(&mut self.char_buf));
+                Ok(Chunk::Data((self, r)))
+            }
             Ok(None) => Ok(Chunk::Done(JsonClaim {
                 tokenizer: Tokenizer::new(),
                 src: self.src,
@@ -495,11 +563,23 @@ impl<'de> BytesAccess for JsonBytesAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    async fn next(&mut self) -> Result<Chunk<&[u8], Self::Claim>, Self::Error> {
+    fn fork(&mut self) -> Self {
+        Self {
+            access: self.access,
+            src: self.src,
+            char_buf: self.char_buf,
+        }
+    }
+
+    async fn next_bytes<R>(
+        mut self,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.access.next_chunk(&mut self.src) {
-            Ok(Some(StrChunk::Slice(s))) => Ok(Chunk::Data(s.as_bytes())),
+            Ok(Some(StrChunk::Slice(s))) => Ok(Chunk::Data((self, f(s.as_bytes())))),
             Ok(Some(StrChunk::Char(c))) => {
-                Ok(Chunk::Data(c.encode_utf8(&mut self.char_buf).as_bytes()))
+                let r = f(c.encode_utf8(&mut self.char_buf).as_bytes());
+                Ok(Chunk::Data((self, r)))
             }
             Ok(None) => Ok(Chunk::Done(JsonClaim {
                 tokenizer: Tokenizer::new(),
@@ -520,12 +600,12 @@ pub struct JsonMapAccess<'de> {
     first: bool,
 }
 
-async fn json_map_next<'s, 'de: 's, const N: usize, F, Fut, R>(
-    map: &'s mut JsonMapAccess<'de>,
-    f: F,
-) -> Result<Probe<Chunk<R, JsonClaim<'de>>>, JsonError>
+async fn json_map_next<'de, const N: usize, F, Fut, R>(
+    mut map: JsonMapAccess<'de>,
+    mut f: F,
+) -> Result<Probe<Chunk<(JsonMapAccess<'de>, R), JsonClaim<'de>>>, JsonError>
 where
-    F: FnOnce([JsonMapKeyEntry<'de>; N]) -> Fut,
+    F: FnMut([JsonMapKeyEntry<'de>; N]) -> Fut,
     Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
 {
     // After first pair, expect comma or closing brace.
@@ -569,26 +649,29 @@ where
     let (claim, r) = hit!(f(core::array::from_fn(|_| key_entry.clone())).await);
     map.tokenizer = claim.tokenizer;
     map.src = claim.src;
-    Ok(Probe::Hit(Chunk::Data(r)))
+    Ok(Probe::Hit(Chunk::Data((map, r))))
 }
 
 impl<'de> MapAccess<'de> for JsonMapAccess<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
 
-    type KeyEntry<'a>
-        = JsonMapKeyEntry<'de>
-    where
-        Self: 'a,
-        'de: 'a;
+    type KeyEntry = JsonMapKeyEntry<'de>;
 
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    fn fork(&mut self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.clone(),
+            src: self.src,
+            first: self.first,
+        }
+    }
+
+    async fn next_kv<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<Chunk<R, Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::KeyEntry<'s>; N]) -> Fut,
+        F: FnMut([Self::KeyEntry; N]) -> Fut,
         Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
     {
         json_map_next(self, f).await
@@ -618,39 +701,41 @@ impl<'de> MapKeyEntry<'de> for JsonMapKeyEntry<'de> {
     type Claim = JsonClaim<'de>;
     type ValueEntry = JsonMapValueEntry<'de>;
 
-    async fn key<K: Deserialize<'de>, const N: usize, F, Fut, R>(
+    fn fork(&mut self) -> Self {
+        self.clone()
+    }
+
+    async fn key<K: Deserialize<'de, KExtra>, KExtra, const N: usize, F, Fut, R>(
         self,
-        f: F,
+        extra: KExtra,
+        mut f: F,
     ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
     where
-        F: FnOnce(&K, [Self::ValueEntry; N]) -> Fut,
+        F: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
         Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
     {
         // Deserialize the key through a sub-deserializer that replays key_tok.
-        let mut key_deser = JsonDeserializer::sub_with_pending(self.src, self.key_tok);
-        let k = hit!(K::deserialize(&mut key_deser).await);
+        let key_deser = JsonDeserializer::sub_with_pending(self.src, self.key_tok);
+        let (key_claim, k) = hit!(K::deserialize(key_deser, extra).await);
 
-        // Consume the colon separator.
-        let old = core::mem::replace(&mut key_deser.tokenizer, Tokenizer::new());
-        match old.next_token(&mut key_deser.src) {
-            Ok(Token::Simple(SimpleToken::Colon, new_tok)) => {
-                key_deser.tokenizer = new_tok;
-            }
+        // Use the claim's tokenizer/src to read the colon separator.
+        let mut after_key_src = key_claim.src;
+        let after_key_tok = key_claim.tokenizer;
+        let (colon_new_tok, after_colon_src) = match after_key_tok.next_token(&mut after_key_src) {
+            Ok(Token::Simple(SimpleToken::Colon, new_tok)) => (new_tok, after_key_src),
             Ok(_) => return Err(JsonError::UnexpectedByte { byte: 0 }),
             Err(e) => return Err(e),
-        }
+        };
 
         // Read the first token of the value.
-        let value_tok = {
-            let old = core::mem::replace(&mut key_deser.tokenizer, Tokenizer::new());
-            match old.next_token(&mut key_deser.src) {
-                Ok(t) => t,
-                Err(e) => return Err(e),
-            }
+        let mut after_colon_src2 = after_colon_src;
+        let value_tok = match colon_new_tok.next_token(&mut after_colon_src2) {
+            Ok(t) => t,
+            Err(e) => return Err(e),
         };
 
         let ve = JsonMapValueEntry {
-            src: key_deser.src,
+            src: after_colon_src2,
             value_tok,
         };
         let (claim, r) = hit!(f(&k, core::array::from_fn(|_| ve.clone())).await);
@@ -676,16 +761,26 @@ impl<'de> MapValueEntry<'de> for JsonMapValueEntry<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
 
-    async fn value<V: Deserialize<'de>>(self) -> Result<Probe<(Self::Claim, V)>, Self::Error> {
-        let mut value_deser = JsonDeserializer::sub_with_pending(self.src, self.value_tok);
-        let v = hit!(V::deserialize(&mut value_deser).await);
-        Ok(Probe::Hit((
-            JsonClaim {
-                tokenizer: value_deser.tokenizer,
-                src: value_deser.src,
-            },
-            v,
-        )))
+    fn fork(&mut self) -> Self {
+        self.clone()
+    }
+
+    async fn value<V: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, V)>, Self::Error> {
+        let value_deser = JsonDeserializer::sub_with_pending(self.src, self.value_tok);
+        let (claim, v) = hit!(V::deserialize(value_deser, extra).await);
+        Ok(Probe::Hit((claim, v)))
+    }
+
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        let mut src = self.src;
+        let tok = skip_value(&mut src, self.value_tok)?;
+        Ok(JsonClaim {
+            tokenizer: tok,
+            src,
+        })
     }
 }
 
@@ -702,12 +797,12 @@ pub struct JsonSeqAccess<'de> {
 // Free function to work around a rustc ICE (triggered by RPITIT lifetime checking
 // in `compare_impl_item` for cross-crate `async fn` trait implementations).
 // By placing the async body here (local DefId), region checking uses local DefIds.
-async fn json_seq_next<'s, 'de: 's, const N: usize, F, Fut, R>(
-    seq: &'s mut JsonSeqAccess<'de>,
-    f: F,
-) -> Result<Probe<Chunk<R, JsonClaim<'de>>>, JsonError>
+async fn json_seq_next<'de, const N: usize, F, Fut, R>(
+    mut seq: JsonSeqAccess<'de>,
+    mut f: F,
+) -> Result<Probe<Chunk<(JsonSeqAccess<'de>, R), JsonClaim<'de>>>, JsonError>
 where
-    F: FnOnce([JsonSeqEntry<'de>; N]) -> Fut,
+    F: FnMut([JsonSeqEntry<'de>; N]) -> Fut,
     Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
 {
     // After first element, expect comma or closing bracket.
@@ -751,25 +846,29 @@ where
     let (claim, r) = hit!(f(core::array::from_fn(|_| se.clone())).await);
     seq.tokenizer = claim.tokenizer;
     seq.src = claim.src;
-    Ok(Probe::Hit(Chunk::Data(r)))
+    Ok(Probe::Hit(Chunk::Data((seq, r))))
 }
 
 impl<'de> SeqAccess<'de> for JsonSeqAccess<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
 
-    type Elem<'a>
-        = JsonSeqEntry<'de>
-    where
-        Self: 'a;
+    type Elem = JsonSeqEntry<'de>;
 
-    async fn next<'s, const N: usize, F, Fut, R>(
-        &'s mut self,
+    fn fork(&mut self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.clone(),
+            src: self.src,
+            first: self.first,
+        }
+    }
+
+    async fn next<const N: usize, F, Fut, R>(
+        self,
         f: F,
-    ) -> Result<Probe<Chunk<R, Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        'de: 's,
-        F: FnOnce([Self::Elem<'s>; N]) -> Fut,
+        F: FnMut([Self::Elem; N]) -> Fut,
         Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
     {
         json_seq_next(self, f).await
@@ -794,16 +893,26 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
 
-    async fn get<T: Deserialize<'de>>(self) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-        let mut elem_deser = JsonDeserializer::sub_with_pending(self.src, self.elem_tok);
-        let v = hit!(T::deserialize(&mut elem_deser).await);
-        Ok(Probe::Hit((
-            JsonClaim {
-                tokenizer: elem_deser.tokenizer,
-                src: elem_deser.src,
-            },
-            v,
-        )))
+    fn fork(&mut self) -> Self {
+        self.clone()
+    }
+
+    async fn get<T: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        let elem_deser = JsonDeserializer::sub_with_pending(self.src, self.elem_tok);
+        let (claim, v) = hit!(T::deserialize(elem_deser, extra).await);
+        Ok(Probe::Hit((claim, v)))
+    }
+
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        let mut src = self.src;
+        let tok = skip_value(&mut src, self.elem_tok)?;
+        Ok(JsonClaim {
+            tokenizer: tok,
+            src,
+        })
     }
 }
 
@@ -813,9 +922,10 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::string::String;
+    use alloc::{vec, vec::Vec};
     use strede::{
-        Deserialize, Deserializer, MapAccess, MapKeyEntry, MapValueEntry, Probe, SeqAccess,
-        SeqEntry,
+        Deserialize, Deserializer, MapAccess, MapKeyEntry, MapValueEntry, Match, Probe, SeqAccess,
+        SeqEntry, StrAccess,
     };
 
     // Minimal no-op executor.  In-memory input never yields `Pending` so all
@@ -836,8 +946,11 @@ mod tests {
     // Local Deserialize impls for test-only newtypes.
     struct U32(u32);
     impl<'de> Deserialize<'de> for U32 {
-        async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-            d.next(|[e]| async move {
+        async fn deserialize<D: Deserializer<'de>>(
+            d: D,
+            _extra: (),
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.entry(|[e]| async {
                 let (c, v) = hit!(e.deserialize_u32().await);
                 Ok(Probe::Hit((c, U32(v))))
             })
@@ -847,8 +960,11 @@ mod tests {
 
     struct Str<'de>(&'de str);
     impl<'de> Deserialize<'de> for Str<'de> {
-        async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-            d.next(|[e]| async move {
+        async fn deserialize<D: Deserializer<'de>>(
+            d: D,
+            _extra: (),
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.entry(|[e]| async {
                 let (c, v) = hit!(e.deserialize_str().await);
                 Ok(Probe::Hit((c, Str(v))))
             })
@@ -860,8 +976,8 @@ mod tests {
 
     #[test]
     fn bool_true() {
-        let mut de = JsonDeserializer::new(b"true");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_bool().await }))
+        let de = JsonDeserializer::new(b"true");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_bool().await }))
             .unwrap()
             .unwrap();
         assert!(v);
@@ -869,8 +985,8 @@ mod tests {
 
     #[test]
     fn bool_false() {
-        let mut de = JsonDeserializer::new(b"false");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_bool().await }))
+        let de = JsonDeserializer::new(b"false");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_bool().await }))
             .unwrap()
             .unwrap();
         assert!(!v);
@@ -880,8 +996,8 @@ mod tests {
 
     #[test]
     fn u32_positive() {
-        let mut de = JsonDeserializer::new(b"42");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_u32().await }))
+        let de = JsonDeserializer::new(b"42");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_u32().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, 42u32);
@@ -889,8 +1005,8 @@ mod tests {
 
     #[test]
     fn i64_negative() {
-        let mut de = JsonDeserializer::new(b"-7");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_i64().await }))
+        let de = JsonDeserializer::new(b"-7");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_i64().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, -7i64);
@@ -899,8 +1015,8 @@ mod tests {
     #[test]
     fn u128_large() {
         // 2^64 — exceeds u64::MAX, exercises the u128 parse path.
-        let mut de = JsonDeserializer::new(b"18446744073709551616");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_u128().await }))
+        let de = JsonDeserializer::new(b"18446744073709551616");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_u128().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, u64::MAX as u128 + 1);
@@ -910,8 +1026,8 @@ mod tests {
 
     #[test]
     fn f64_decimal() {
-        let mut de = JsonDeserializer::new(b"3.14");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_f64().await }))
+        let de = JsonDeserializer::new(b"3.14");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_f64().await }))
             .unwrap()
             .unwrap();
         assert!((v - 3.14f64).abs() < 1e-10);
@@ -919,8 +1035,8 @@ mod tests {
 
     #[test]
     fn f32_half() {
-        let mut de = JsonDeserializer::new(b"1.5");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_f32().await }))
+        let de = JsonDeserializer::new(b"1.5");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_f32().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, 1.5f32);
@@ -930,8 +1046,8 @@ mod tests {
 
     #[test]
     fn str_plain() {
-        let mut de = JsonDeserializer::new(b"\"hello\"");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_str().await }))
+        let de = JsonDeserializer::new(b"\"hello\"");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_str().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, "hello");
@@ -939,8 +1055,8 @@ mod tests {
 
     #[test]
     fn str_empty() {
-        let mut de = JsonDeserializer::new(b"\"\"");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_str().await }))
+        let de = JsonDeserializer::new(b"\"\"");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_str().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, "");
@@ -948,8 +1064,8 @@ mod tests {
 
     #[test]
     fn char_single() {
-        let mut de = JsonDeserializer::new(b"\"A\"");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_char().await }))
+        let de = JsonDeserializer::new(b"\"A\"");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_char().await }))
             .unwrap()
             .unwrap();
         assert_eq!(v, 'A');
@@ -961,24 +1077,27 @@ mod tests {
     fn deserialize_str_misses_on_escape_sequences_too() {
         // Strings with escapes return Miss, not an error — src is owned so the
         // stream position can be handed off to a deserialize_str_chunks arm.
-        let mut de = JsonDeserializer::new(b"\"\\n\"");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_str().await }));
+        let de = JsonDeserializer::new(b"\"\\n\"");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_str().await }));
         assert!(matches!(result, Ok(Probe::Miss)));
     }
 
     #[test]
     fn str_chunks_escape_newline() {
         // JSON "hello\nworld": tokenizer yields "hello", '\n' (Char), "world".
-        let mut de = JsonDeserializer::new(b"\"hello\\nworld\"");
-        let total_len = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"\"hello\\nworld\"");
+        let (_, total_len) = block_on(de.entry(|[e]| async {
             let mut chunks = match e.deserialize_str_chunks().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => panic!("expected str chunks"),
             };
             let mut len = 0usize;
             loop {
-                match chunks.next().await? {
-                    Chunk::Data(chunk) => len += chunk.len(),
+                match chunks.next_str(|chunk| chunk.len()).await? {
+                    Chunk::Data((new, n)) => {
+                        chunks = new;
+                        len += n;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, len))),
                 }
             }
@@ -991,16 +1110,19 @@ mod tests {
     #[test]
     fn str_chunks_unicode_escape() {
         // JSON "\u0041" decodes to 'A' (1 byte in UTF-8).
-        let mut de = JsonDeserializer::new(b"\"\\u0041\"");
-        let total_len = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"\"\\u0041\"");
+        let (_, total_len) = block_on(de.entry(|[e]| async {
             let mut chunks = match e.deserialize_str_chunks().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => panic!("expected str chunks"),
             };
             let mut len = 0usize;
             loop {
-                match chunks.next().await? {
-                    Chunk::Data(chunk) => len += chunk.len(),
+                match chunks.next_str(|chunk| chunk.len()).await? {
+                    Chunk::Data((new, n)) => {
+                        chunks = new;
+                        len += n;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, len))),
                 }
             }
@@ -1014,22 +1136,23 @@ mod tests {
 
     /// Helper: collect all str_chunks into a String.
     fn collect_str_chunks(input: &[u8]) -> String {
-        let mut de = JsonDeserializer::new(input);
-        block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(input);
+        block_on(de.entry(|[e]| async {
             let mut chunks = match e.deserialize_str_chunks().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => panic!("expected str chunks"),
             };
             let mut out = String::new();
             loop {
-                match chunks.next().await? {
-                    Chunk::Data(chunk) => out.push_str(chunk),
+                match chunks.next_str(|chunk| out.push_str(chunk)).await? {
+                    Chunk::Data((new, ())) => chunks = new,
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
                 }
             }
         }))
         .unwrap()
         .unwrap()
+        .1
     }
 
     #[test]
@@ -1061,15 +1184,15 @@ mod tests {
 
     #[test]
     fn str_chunks_lone_high_surrogate_err() {
-        let mut de = JsonDeserializer::new(b"\"\\uD834\"");
-        let result = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"\"\\uD834\"");
+        let result = block_on(de.entry(|[e]| async {
             let mut chunks = match e.deserialize_str_chunks().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => panic!("expected str chunks"),
             };
             loop {
-                match chunks.next().await? {
-                    Chunk::Data(_) => {}
+                match chunks.next_str(|_| ()).await? {
+                    Chunk::Data((new, ())) => chunks = new,
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, ()))),
                 }
             }
@@ -1079,15 +1202,15 @@ mod tests {
 
     #[test]
     fn str_chunks_lone_low_surrogate_err() {
-        let mut de = JsonDeserializer::new(b"\"\\uDD1E\"");
-        let result = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"\"\\uDD1E\"");
+        let result = block_on(de.entry(|[e]| async {
             let mut chunks = match e.deserialize_str_chunks().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => panic!("expected str chunks"),
             };
             loop {
-                match chunks.next().await? {
-                    Chunk::Data(_) => {}
+                match chunks.next_str(|_| ()).await? {
+                    Chunk::Data((new, ())) => chunks = new,
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, ()))),
                 }
             }
@@ -1099,8 +1222,8 @@ mod tests {
 
     #[test]
     fn seq_sum_of_numbers() {
-        let mut de = JsonDeserializer::new(b"[1, 2, 3]");
-        let sum = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"[1, 2, 3]");
+        let (_, sum) = block_on(de.entry(|[e]| async {
             let mut seq = match e.deserialize_seq().await? {
                 Probe::Hit(s) => s,
                 Probe::Miss => panic!("expected seq"),
@@ -1108,14 +1231,17 @@ mod tests {
             let mut sum = 0u32;
             loop {
                 match seq
-                    .next(|[se]| async move {
-                        let (claim, v) = hit!(se.get::<U32>().await);
+                    .next(|[se]| async {
+                        let (claim, v) = hit!(se.get::<U32, ()>(()).await);
                         Ok(Probe::Hit((claim, v.0)))
                     })
                     .await?
                     .unwrap()
                 {
-                    Chunk::Data(v) => sum += v,
+                    Chunk::Data((n_seq, v)) => {
+                        sum += v;
+                        seq = n_seq;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, sum))),
                 }
             }
@@ -1127,8 +1253,8 @@ mod tests {
 
     #[test]
     fn seq_empty() {
-        let mut de = JsonDeserializer::new(b"[]");
-        let count = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"[]");
+        let (_, count) = block_on(de.entry(|[e]| async {
             let mut seq = match e.deserialize_seq().await? {
                 Probe::Hit(s) => s,
                 Probe::Miss => panic!("expected seq"),
@@ -1136,14 +1262,17 @@ mod tests {
             let mut count = 0usize;
             loop {
                 match seq
-                    .next(|[se]| async move {
-                        let (claim, v) = hit!(se.get::<U32>().await);
+                    .next(|[se]| async {
+                        let (claim, v) = hit!(se.get::<U32, ()>(()).await);
                         Ok(Probe::Hit((claim, v.0)))
                     })
                     .await?
                     .unwrap()
                 {
-                    Chunk::Data(_) => count += 1,
+                    Chunk::Data((n_seq, _)) => {
+                        count += 1;
+                        seq = n_seq;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, count))),
                 }
             }
@@ -1157,8 +1286,8 @@ mod tests {
 
     #[test]
     fn map_single_pair() {
-        let mut de = JsonDeserializer::new(b"{\"x\": 10}");
-        let (key, val) = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"{\"x\": 10}");
+        let (_, (key, val)) = block_on(de.entry(|[e]| async {
             let mut map = match e.deserialize_map().await? {
                 Probe::Hit(m) => m,
                 Probe::Miss => panic!("expected map"),
@@ -1167,10 +1296,10 @@ mod tests {
             let mut val = 0u32;
             loop {
                 match map
-                    .next(|[ke]| async move {
+                    .next_kv(|[ke]| async {
                         let (claim, k, v) = hit!(
-                            ke.key::<Str<'_>, 1, _, _, _>(|_k, [ve]| async move {
-                                let (claim, v) = hit!(ve.value::<U32>().await);
+                            ke.key((), |_k: &Str<'_>, [ve]| async {
+                                let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
                                 Ok(Probe::Hit((claim, v.0)))
                             })
                             .await
@@ -1180,9 +1309,10 @@ mod tests {
                     .await?
                     .unwrap()
                 {
-                    Chunk::Data((k, v)) => {
+                    Chunk::Data((m, (k, v))) => {
                         key = k;
                         val = v;
+                        map = m;
                     }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, (key, val)))),
                 }
@@ -1196,8 +1326,8 @@ mod tests {
 
     #[test]
     fn map_empty() {
-        let mut de = JsonDeserializer::new(b"{}");
-        let count = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"{}");
+        let (_, count) = block_on(de.entry(|[e]| async {
             let mut map = match e.deserialize_map().await? {
                 Probe::Hit(m) => m,
                 Probe::Miss => panic!("expected map"),
@@ -1205,10 +1335,10 @@ mod tests {
             let mut count = 0usize;
             loop {
                 match map
-                    .next(|[ke]| async move {
+                    .next_kv(|[ke]| async {
                         let (claim, k, v) = hit!(
-                            ke.key::<Str<'_>, 1, _, _, _>(|_k, [ve]| async move {
-                                let (claim, v) = hit!(ve.value::<U32>().await);
+                            ke.key((), |_k: &Str<'_>, [ve]| async {
+                                let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
                                 Ok(Probe::Hit((claim, v.0)))
                             })
                             .await
@@ -1218,7 +1348,10 @@ mod tests {
                     .await?
                     .unwrap()
                 {
-                    Chunk::Data(_) => count += 1,
+                    Chunk::Data((m, _)) => {
+                        count += 1;
+                        map = m;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, count))),
                 }
             }
@@ -1230,8 +1363,8 @@ mod tests {
 
     #[test]
     fn map_multiple_pairs() {
-        let mut de = JsonDeserializer::new(b"{\"a\": 1, \"b\": 2, \"c\": 3}");
-        let sum = block_on(de.next(|[e]| async move {
+        let de = JsonDeserializer::new(b"{\"a\": 1, \"b\": 2, \"c\": 3}");
+        let (_, sum) = block_on(de.entry(|[e]| async {
             let mut map = match e.deserialize_map().await? {
                 Probe::Hit(m) => m,
                 Probe::Miss => panic!("expected map"),
@@ -1239,10 +1372,10 @@ mod tests {
             let mut total = 0u32;
             loop {
                 match map
-                    .next(|[ke]| async move {
+                    .next_kv(|[ke]| async {
                         let (claim, _k, v) = hit!(
-                            ke.key::<Str<'_>, 1, _, _, _>(|_k, [ve]| async move {
-                                let (claim, v) = hit!(ve.value::<U32>().await);
+                            ke.key((), |_k: &Str<'_>, [ve]| async {
+                                let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
                                 Ok(Probe::Hit((claim, v.0)))
                             })
                             .await
@@ -1252,7 +1385,10 @@ mod tests {
                     .await?
                     .unwrap()
                 {
-                    Chunk::Data(v) => total += v,
+                    Chunk::Data((m, v)) => {
+                        total += v;
+                        map = m;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, total))),
                 }
             }
@@ -1266,8 +1402,11 @@ mod tests {
 
     struct Bool(bool);
     impl<'de> Deserialize<'de> for Bool {
-        async fn deserialize<D: Deserializer<'de>>(d: &mut D) -> Result<Probe<Self>, D::Error> {
-            d.next(|[e]| async move {
+        async fn deserialize<D: Deserializer<'de>>(
+            d: D,
+            _extra: (),
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            d.entry(|[e]| async {
                 let (c, v) = hit!(e.deserialize_bool().await);
                 Ok(Probe::Hit((c, Bool(v))))
             })
@@ -1277,8 +1416,8 @@ mod tests {
 
     #[test]
     fn option_null_is_none() {
-        let mut de = JsonDeserializer::new(b"null");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_option::<Bool>().await }))
+        let de = JsonDeserializer::new(b"null");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_option::<Bool, ()>(()).await }))
             .unwrap()
             .unwrap();
         assert!(v.is_none());
@@ -1286,8 +1425,8 @@ mod tests {
 
     #[test]
     fn option_bool_is_some() {
-        let mut de = JsonDeserializer::new(b"true");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_option::<Bool>().await }))
+        let de = JsonDeserializer::new(b"true");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_option::<Bool, ()>(()).await }))
             .unwrap()
             .unwrap();
         assert!(v.unwrap().0);
@@ -1297,15 +1436,15 @@ mod tests {
 
     #[test]
     fn error_truncated_literal() {
-        let mut de = JsonDeserializer::new(b"tru");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_bool().await }));
+        let de = JsonDeserializer::new(b"tru");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_bool().await }));
         assert!(matches!(result, Err(JsonError::UnexpectedEnd)));
     }
 
     #[test]
     fn error_invalid_number() {
-        let mut de = JsonDeserializer::new(b"1.}");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_f64().await }));
+        let de = JsonDeserializer::new(b"1.}");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_f64().await }));
         assert!(matches!(result, Err(JsonError::InvalidNumber)));
     }
 
@@ -1313,8 +1452,8 @@ mod tests {
     fn deserialize_str_misses_on_escape_sequences() {
         // deserialize_str only hits for zero-copy slices; strings with escape
         // sequences return Miss so callers can fall through to deserialize_str_chunks.
-        let mut de = JsonDeserializer::new(b"\"\\n\"");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_str().await }));
+        let de = JsonDeserializer::new(b"\"\\n\"");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_str().await }));
         assert!(matches!(result, Ok(Probe::Miss)));
     }
 
@@ -1322,22 +1461,22 @@ mod tests {
 
     #[test]
     fn trailing_garbage_after_bool() {
-        let mut de = JsonDeserializer::new(b"true garbage");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_bool().await }));
-        assert_eq!(result, Err(JsonError::TrailingGarbage));
+        let de = JsonDeserializer::new(b"true garbage");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_bool().await }));
+        assert!(matches!(result, Err(JsonError::ExpectedEnd)));
     }
 
     #[test]
     fn trailing_garbage_after_number() {
-        let mut de = JsonDeserializer::new(b"42 extra");
-        let result = block_on(de.next(|[e]| async move { e.deserialize_u32().await }));
-        assert_eq!(result, Err(JsonError::TrailingGarbage));
+        let de = JsonDeserializer::new(b"42 extra");
+        let result = block_on(de.entry(|[e]| async { e.deserialize_u32().await }));
+        assert!(matches!(result, Err(JsonError::ExpectedEnd)));
     }
 
     #[test]
     fn trailing_whitespace_is_ok() {
-        let mut de = JsonDeserializer::new(b"true   \n");
-        let v = block_on(de.next(|[e]| async move { e.deserialize_bool().await }))
+        let de = JsonDeserializer::new(b"true   \n");
+        let (_, v) = block_on(de.entry(|[e]| async { e.deserialize_bool().await }))
             .unwrap()
             .unwrap();
         assert!(v);
@@ -1353,27 +1492,27 @@ mod tests {
 
     #[test]
     fn derive_basic() {
-        let mut de = JsonDeserializer::new(b"{\"x\": 1, \"y\": -2}");
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"y\": -2}");
         assert_eq!(
-            block_on(Point::deserialize(&mut de)),
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Point { x: 1, y: -2 })),
         );
     }
 
     #[test]
     fn derive_fields_out_of_order() {
-        let mut de = JsonDeserializer::new(b"{\"y\": 7, \"x\": 3}");
+        let de = JsonDeserializer::new(b"{\"y\": 7, \"x\": 3}");
         assert_eq!(
-            block_on(Point::deserialize(&mut de)),
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Point { x: 3, y: 7 })),
         );
     }
 
     #[test]
     fn derive_duplicate_field() {
-        let mut de = JsonDeserializer::new(b"{\"x\": 1, \"x\": 2, \"y\": 3}");
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"x\": 2, \"y\": 3}");
         assert_eq!(
-            block_on(Point::deserialize(&mut de)),
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Err(JsonError::DuplicateField("x")),
         );
     }
@@ -1381,29 +1520,41 @@ mod tests {
     #[test]
     fn derive_unknown_field_is_miss() {
         // "z" is an unknown field — derive returns Miss.
-        let mut de = JsonDeserializer::new(b"{\"x\": 1, \"z\": 99, \"y\": 2}");
-        assert_eq!(block_on(Point::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"z\": 99, \"y\": 2}");
+        assert_eq!(
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     #[test]
     fn derive_missing_field_is_miss() {
         // "y" is missing — derive returns Miss.
-        let mut de = JsonDeserializer::new(b"{\"x\": 5}");
-        assert_eq!(block_on(Point::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(b"{\"x\": 5}");
+        assert_eq!(
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: non-object input → Miss ------------------------------------
 
     #[test]
     fn derive_non_object_is_miss() {
-        let mut de = JsonDeserializer::new(b"42");
-        assert_eq!(block_on(Point::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(b"42");
+        assert_eq!(
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     #[test]
     fn derive_array_is_miss() {
-        let mut de = JsonDeserializer::new(b"[1, 2]");
-        assert_eq!(block_on(Point::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(b"[1, 2]");
+        assert_eq!(
+            block_on(Point::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: mixed field types ------------------------------------------
@@ -1417,9 +1568,9 @@ mod tests {
 
     #[test]
     fn derive_mixed_types() {
-        let mut de = JsonDeserializer::new(br#"{"name": "hello", "count": 7, "active": true}"#);
+        let de = JsonDeserializer::new(br#"{"name": "hello", "count": 7, "active": true}"#);
         assert_eq!(
-            block_on(Mixed::deserialize(&mut de)),
+            block_on(Mixed::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Mixed {
                 name: "hello",
                 count: 7,
@@ -1430,9 +1581,9 @@ mod tests {
 
     #[test]
     fn derive_mixed_types_reordered() {
-        let mut de = JsonDeserializer::new(br#"{"active": false, "name": "world", "count": 0}"#);
+        let de = JsonDeserializer::new(br#"{"active": false, "name": "world", "count": 0}"#);
         assert_eq!(
-            block_on(Mixed::deserialize(&mut de)),
+            block_on(Mixed::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Mixed {
                 name: "world",
                 count: 0,
@@ -1450,9 +1601,9 @@ mod tests {
 
     #[test]
     fn derive_mixed_owned_types() {
-        let mut de = JsonDeserializer::new(br#"{"score": 3.14, "count": 7, "active": true}"#);
+        let de = JsonDeserializer::new(br#"{"score": 3.14, "count": 7, "active": true}"#);
         assert_eq!(
-            block_on(MixedOwned::deserialize(&mut de)),
+            block_on(MixedOwned::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(MixedOwned {
                 score: 3.14,
                 count: 7,
@@ -1470,9 +1621,9 @@ mod tests {
 
     #[test]
     fn derive_single_field() {
-        let mut de = JsonDeserializer::new(br#"{"value": -99}"#);
+        let de = JsonDeserializer::new(br#"{"value": -99}"#);
         assert_eq!(
-            block_on(Wrapper::deserialize(&mut de)),
+            block_on(Wrapper::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Wrapper { value: -99 })),
         );
     }
@@ -1487,10 +1638,10 @@ mod tests {
 
     #[test]
     fn derive_nested_struct() {
-        let mut de =
+        let de =
             JsonDeserializer::new(br#"{"origin": {"x": 1, "y": 2}, "size": {"x": 10, "y": 20}}"#);
         assert_eq!(
-            block_on(Rect::deserialize(&mut de)),
+            block_on(Rect::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Rect {
                 origin: Point { x: 1, y: 2 },
                 size: Point { x: 10, y: 20 },
@@ -1508,9 +1659,9 @@ mod tests {
 
     #[test]
     fn derive_option_present() {
-        let mut de = JsonDeserializer::new(br#"{"required": 1, "maybe": 42}"#);
+        let de = JsonDeserializer::new(br#"{"required": 1, "maybe": 42}"#);
         assert_eq!(
-            block_on(OptFields::deserialize(&mut de)),
+            block_on(OptFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(OptFields {
                 required: 1,
                 maybe: Some(42)
@@ -1520,9 +1671,9 @@ mod tests {
 
     #[test]
     fn derive_option_null() {
-        let mut de = JsonDeserializer::new(br#"{"required": 1, "maybe": null}"#);
+        let de = JsonDeserializer::new(br#"{"required": 1, "maybe": null}"#);
         assert_eq!(
-            block_on(OptFields::deserialize(&mut de)),
+            block_on(OptFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(OptFields {
                 required: 1,
                 maybe: None
@@ -1540,9 +1691,9 @@ mod tests {
 
     #[test]
     fn derive_generic_two_type_params() {
-        let mut de = JsonDeserializer::new(br#"{"first": 10, "second": true}"#);
+        let de = JsonDeserializer::new(br#"{"first": 10, "second": true}"#);
         assert_eq!(
-            block_on(<Pair<i64, bool>>::deserialize(&mut de)),
+            block_on(<Pair<i64, bool>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Pair {
                 first: 10,
                 second: true
@@ -1552,9 +1703,9 @@ mod tests {
 
     #[test]
     fn derive_generic_different_instantiation() {
-        let mut de = JsonDeserializer::new(br#"{"first": false, "second": 42}"#);
+        let de = JsonDeserializer::new(br#"{"first": false, "second": 42}"#);
         assert_eq!(
-            block_on(<Pair<bool, u32>>::deserialize(&mut de)),
+            block_on(<Pair<bool, u32>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Pair {
                 first: false,
                 second: 42
@@ -1569,9 +1720,9 @@ mod tests {
 
     #[test]
     fn derive_generic_single_param() {
-        let mut de = JsonDeserializer::new(br#"{"inner": 99}"#);
+        let de = JsonDeserializer::new(br#"{"inner": 99}"#);
         assert_eq!(
-            block_on(<GenericWrapper<i64>>::deserialize(&mut de)),
+            block_on(<GenericWrapper<i64>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(GenericWrapper { inner: 99 })),
         );
     }
@@ -1579,9 +1730,9 @@ mod tests {
     #[test]
     fn derive_generic_nested() {
         // GenericWrapper<Point> — generic struct containing a non-generic derived struct
-        let mut de = JsonDeserializer::new(br#"{"inner": {"x": 5, "y": 6}}"#);
+        let de = JsonDeserializer::new(br#"{"inner": {"x": 5, "y": 6}}"#);
         assert_eq!(
-            block_on(<GenericWrapper<Point>>::deserialize(&mut de)),
+            block_on(<GenericWrapper<Point>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(GenericWrapper {
                 inner: Point { x: 5, y: 6 }
             })),
@@ -1591,9 +1742,10 @@ mod tests {
     #[test]
     fn derive_generic_nested_generic() {
         // GenericWrapper<GenericWrapper<bool>> — nested generics
-        let mut de = JsonDeserializer::new(br#"{"inner": {"inner": true}}"#);
+        let de = JsonDeserializer::new(br#"{"inner": {"inner": true}}"#);
         assert_eq!(
-            block_on(<GenericWrapper<GenericWrapper<bool>>>::deserialize(&mut de)),
+            block_on(<GenericWrapper<GenericWrapper<bool>>>::deserialize(de, ()))
+                .map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(GenericWrapper {
                 inner: GenericWrapper { inner: true }
             })),
@@ -1602,15 +1754,15 @@ mod tests {
 
     #[test]
     fn derive_generic_with_option() {
-        let mut de = JsonDeserializer::new(br#"{"inner": null}"#);
+        let de = JsonDeserializer::new(br#"{"inner": null}"#);
         assert_eq!(
-            block_on(<GenericWrapper<Option<i64>>>::deserialize(&mut de)),
+            block_on(<GenericWrapper<Option<i64>>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(GenericWrapper { inner: None })),
         );
 
-        let mut de = JsonDeserializer::new(br#"{"inner": 7}"#);
+        let de = JsonDeserializer::new(br#"{"inner": 7}"#);
         assert_eq!(
-            block_on(<GenericWrapper<Option<i64>>>::deserialize(&mut de)),
+            block_on(<GenericWrapper<Option<i64>>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(GenericWrapper { inner: Some(7) })),
         );
     }
@@ -1623,9 +1775,9 @@ mod tests {
 
     #[test]
     fn derive_generic_with_lifetime() {
-        let mut de = JsonDeserializer::new(br#"{"label": "test", "value": 42}"#);
+        let de = JsonDeserializer::new(br#"{"label": "test", "value": 42}"#);
         assert_eq!(
-            block_on(<WithLifetimeAndGeneric<i64>>::deserialize(&mut de)),
+            block_on(<WithLifetimeAndGeneric<i64>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithLifetimeAndGeneric {
                 label: "test",
                 value: 42
@@ -1644,32 +1796,38 @@ mod tests {
 
     #[test]
     fn derive_enum_unit_variant() {
-        let mut de = JsonDeserializer::new(br#""Red""#);
+        let de = JsonDeserializer::new(br#""Red""#);
         assert_eq!(
-            block_on(Color::deserialize(&mut de)),
+            block_on(Color::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Color::Red)),
         );
     }
 
     #[test]
     fn derive_enum_unit_variant_other() {
-        let mut de = JsonDeserializer::new(br#""Blue""#);
+        let de = JsonDeserializer::new(br#""Blue""#);
         assert_eq!(
-            block_on(Color::deserialize(&mut de)),
+            block_on(Color::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Color::Blue)),
         );
     }
 
     #[test]
     fn derive_enum_unit_unknown_variant_is_miss() {
-        let mut de = JsonDeserializer::new(br#""Yellow""#);
-        assert_eq!(block_on(Color::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#""Yellow""#);
+        assert_eq!(
+            block_on(Color::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     #[test]
     fn derive_enum_unit_non_string_is_miss() {
-        let mut de = JsonDeserializer::new(b"42");
-        assert_eq!(block_on(Color::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(b"42");
+        assert_eq!(
+            block_on(Color::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: enum — mixed (unit + newtype + struct) ----------------------
@@ -1683,29 +1841,29 @@ mod tests {
 
     #[test]
     fn derive_enum_mixed_unit_variant() {
-        let mut de = JsonDeserializer::new(br#""Circle""#);
+        let de = JsonDeserializer::new(br#""Circle""#);
         assert_eq!(
-            block_on(Shape::deserialize(&mut de)),
+            block_on(Shape::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Shape::Circle)),
         );
     }
 
     #[test]
     fn derive_enum_newtype_variant() {
-        let mut de = JsonDeserializer::new(br#"{"Square": {"x": 1, "y": 2}}"#);
+        let de = JsonDeserializer::new(br#"{"Square": {"x": 1, "y": 2}}"#);
         assert_eq!(
-            block_on(Shape::deserialize(&mut de)),
+            block_on(Shape::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Shape::Square(Point { x: 1, y: 2 }))),
         );
     }
 
     #[test]
     fn derive_enum_struct_variant() {
-        let mut de = JsonDeserializer::new(
+        let de = JsonDeserializer::new(
             br#"{"Rect": {"origin": {"x": 0, "y": 0}, "size": {"x": 10, "y": 20}}}"#,
         );
         assert_eq!(
-            block_on(Shape::deserialize(&mut de)),
+            block_on(Shape::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Shape::Rect {
                 origin: Point { x: 0, y: 0 },
                 size: Point { x: 10, y: 20 },
@@ -1715,14 +1873,20 @@ mod tests {
 
     #[test]
     fn derive_enum_unknown_variant_map_is_miss() {
-        let mut de = JsonDeserializer::new(br#"{"Triangle": {"x": 1}}"#);
-        assert_eq!(block_on(Shape::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#"{"Triangle": {"x": 1}}"#);
+        assert_eq!(
+            block_on(Shape::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     #[test]
     fn derive_enum_empty_map_is_miss() {
-        let mut de = JsonDeserializer::new(br#"{}"#);
-        assert_eq!(block_on(Shape::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#"{}"#);
+        assert_eq!(
+            block_on(Shape::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: enum — newtype-only (no unit variants) ---------------------
@@ -1735,18 +1899,18 @@ mod tests {
 
     #[test]
     fn derive_enum_newtype_only() {
-        let mut de = JsonDeserializer::new(br#"{"Int": 42}"#);
+        let de = JsonDeserializer::new(br#"{"Int": 42}"#);
         assert_eq!(
-            block_on(Value::deserialize(&mut de)),
+            block_on(Value::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Value::Int(42))),
         );
     }
 
     #[test]
     fn derive_enum_newtype_only_other() {
-        let mut de = JsonDeserializer::new(br#"{"Bool": true}"#);
+        let de = JsonDeserializer::new(br#"{"Bool": true}"#);
         assert_eq!(
-            block_on(Value::deserialize(&mut de)),
+            block_on(Value::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Value::Bool(true))),
         );
     }
@@ -1761,18 +1925,18 @@ mod tests {
 
     #[test]
     fn derive_enum_generic_left() {
-        let mut de = JsonDeserializer::new(br#"{"Left": 42}"#);
+        let de = JsonDeserializer::new(br#"{"Left": 42}"#);
         assert_eq!(
-            block_on(<Either<i64, bool>>::deserialize(&mut de)),
+            block_on(<Either<i64, bool>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Either::Left(42))),
         );
     }
 
     #[test]
     fn derive_enum_generic_right() {
-        let mut de = JsonDeserializer::new(br#"{"Right": true}"#);
+        let de = JsonDeserializer::new(br#"{"Right": true}"#);
         assert_eq!(
-            block_on(<Either<i64, bool>>::deserialize(&mut de)),
+            block_on(<Either<i64, bool>>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Either::Right(true))),
         );
     }
@@ -1789,36 +1953,36 @@ mod tests {
 
     #[test]
     fn derive_enum_tuple_variant_two_fields() {
-        let mut de = JsonDeserializer::new(br#"{"Point": [3, 4]}"#);
+        let de = JsonDeserializer::new(br#"{"Point": [3, 4]}"#);
         assert_eq!(
-            block_on(Geom::deserialize(&mut de)),
+            block_on(Geom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Geom::Point(3, 4))),
         );
     }
 
     #[test]
     fn derive_enum_tuple_variant_three_fields() {
-        let mut de = JsonDeserializer::new(br#"{"Color": [255, 128, 0]}"#);
+        let de = JsonDeserializer::new(br#"{"Color": [255, 128, 0]}"#);
         assert_eq!(
-            block_on(Geom::deserialize(&mut de)),
+            block_on(Geom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Geom::Color(255, 128, 0))),
         );
     }
 
     #[test]
     fn derive_enum_tuple_variant_mixed_with_unit() {
-        let mut de = JsonDeserializer::new(br#""Unit""#);
+        let de = JsonDeserializer::new(br#""Unit""#);
         assert_eq!(
-            block_on(Geom::deserialize(&mut de)),
+            block_on(Geom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Geom::Unit)),
         );
     }
 
     #[test]
     fn derive_enum_tuple_variant_mixed_with_newtype() {
-        let mut de = JsonDeserializer::new(br#"{"Single": true}"#);
+        let de = JsonDeserializer::new(br#"{"Single": true}"#);
         assert_eq!(
-            block_on(Geom::deserialize(&mut de)),
+            block_on(Geom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Geom::Single(true))),
         );
     }
@@ -1826,8 +1990,11 @@ mod tests {
     #[test]
     fn derive_enum_tuple_variant_wrong_length_is_miss() {
         // Array with too many elements
-        let mut de = JsonDeserializer::new(br#"{"Point": [1, 2, 3]}"#);
-        assert_eq!(block_on(Geom::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#"{"Point": [1, 2, 3]}"#);
+        assert_eq!(
+            block_on(Geom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: default attribute ---------------------------------------------
@@ -1847,9 +2014,9 @@ mod tests {
 
     #[test]
     fn derive_default_fields_missing() {
-        let mut de = JsonDeserializer::new(br#"{"required": 1}"#);
+        let de = JsonDeserializer::new(br#"{"required": 1}"#);
         assert_eq!(
-            block_on(WithDefaults::deserialize(&mut de)),
+            block_on(WithDefaults::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithDefaults {
                 required: 1,
                 count: 99,
@@ -1860,9 +2027,9 @@ mod tests {
 
     #[test]
     fn derive_default_fields_present_overrides() {
-        let mut de = JsonDeserializer::new(br#"{"required": 1, "count": 5, "flag": true}"#);
+        let de = JsonDeserializer::new(br#"{"required": 1, "count": 5, "flag": true}"#);
         assert_eq!(
-            block_on(WithDefaults::deserialize(&mut de)),
+            block_on(WithDefaults::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithDefaults {
                 required: 1,
                 count: 5,
@@ -1873,10 +2040,47 @@ mod tests {
 
     #[test]
     fn derive_default_required_missing_is_miss() {
-        let mut de = JsonDeserializer::new(br#"{"count": 5}"#);
+        let de = JsonDeserializer::new(br#"{"count": 5}"#);
         assert_eq!(
-            block_on(WithDefaults::deserialize(&mut de)),
+            block_on(WithDefaults::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Miss),
+        );
+    }
+
+    // ---- derive: default expression attribute -----------------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct WithDefaultExpr {
+        required: i64,
+        #[strede(default = "99i64")]
+        count: i64,
+        #[strede(default = "String::from(\"hello\")")]
+        greeting: String,
+    }
+
+    #[test]
+    fn derive_default_expr_missing() {
+        let de = JsonDeserializer::new(br#"{"required": 1}"#);
+        assert_eq!(
+            block_on(WithDefaultExpr::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithDefaultExpr {
+                required: 1,
+                count: 99,
+                greeting: String::from("hello"),
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_default_expr_present_overrides() {
+        let de = JsonDeserializer::new(br#"{"required": 1, "count": 5, "greeting": "world"}"#);
+        assert_eq!(
+            block_on(WithDefaultExpr::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithDefaultExpr {
+                required: 1,
+                count: 5,
+                greeting: String::from("world"),
+            })),
         );
     }
 
@@ -1884,12 +2088,12 @@ mod tests {
 
     /// Custom deserializer: reads an i64 and doubles it.
     async fn double_i64<'de, D: strede::Deserializer<'de>>(
-        d: &mut D,
-    ) -> Result<Probe<i64>, D::Error>
+        d: D,
+    ) -> Result<Probe<(D::Claim, i64)>, D::Error>
     where
         D::Error: strede::DeserializeError,
     {
-        d.next(|[e]| async move {
+        d.entry(|[e]| async {
             let (c, v) = hit!(e.deserialize_i64().await);
             Ok(Probe::Hit((c, v * 2)))
         })
@@ -1905,9 +2109,9 @@ mod tests {
 
     #[test]
     fn derive_deserialize_with() {
-        let mut de = JsonDeserializer::new(br#"{"normal": 5, "doubled": 3}"#);
+        let de = JsonDeserializer::new(br#"{"normal": 5, "doubled": 3}"#);
         assert_eq!(
-            block_on(WithCustomDe::deserialize(&mut de)),
+            block_on(WithCustomDe::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithCustomDe {
                 normal: 5,
                 doubled: 6
@@ -1932,9 +2136,9 @@ mod tests {
 
     #[test]
     fn derive_skip_uses_default_when_absent() {
-        let mut de = JsonDeserializer::new(br#"{"required": 1}"#);
+        let de = JsonDeserializer::new(br#"{"required": 1}"#);
         assert_eq!(
-            block_on(WithSkip::deserialize(&mut de)),
+            block_on(WithSkip::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithSkip {
                 required: 1,
                 skipped: 42,
@@ -1946,16 +2150,18 @@ mod tests {
     #[test]
     fn derive_skip_ignores_present_value() {
         // Even though "skipped" is in the data, it should be ignored (treated as unknown → Miss)
-        let mut de =
-            JsonDeserializer::new(br#"{"required": 1, "skipped": 99, "skipped_trait": true}"#);
-        assert_eq!(block_on(WithSkip::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#"{"required": 1, "skipped": 99, "skipped_trait": true}"#);
+        assert_eq!(
+            block_on(WithSkip::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     #[test]
     fn derive_skip_mixed_with_required() {
-        let mut de = JsonDeserializer::new(br#"{"required": 7}"#);
+        let de = JsonDeserializer::new(br#"{"required": 7}"#);
         assert_eq!(
-            block_on(WithSkip::deserialize(&mut de)),
+            block_on(WithSkip::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(WithSkip {
                 required: 7,
                 skipped: 42,
@@ -1976,9 +2182,9 @@ mod tests {
 
     #[test]
     fn derive_rename_struct_fields() {
-        let mut de = JsonDeserializer::new(br#"{"type": 42, "value": true}"#);
+        let de = JsonDeserializer::new(br#"{"type": 42, "value": true}"#);
         assert_eq!(
-            block_on(RenamedFields::deserialize(&mut de)),
+            block_on(RenamedFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(RenamedFields {
                 kind: 42,
                 val: true
@@ -1988,9 +2194,9 @@ mod tests {
 
     #[test]
     fn derive_rename_original_name_is_miss() {
-        let mut de = JsonDeserializer::new(br#"{"kind": 42, "val": true}"#);
+        let de = JsonDeserializer::new(br#"{"kind": 42, "val": true}"#);
         assert_eq!(
-            block_on(RenamedFields::deserialize(&mut de)),
+            block_on(RenamedFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Miss),
         );
     }
@@ -2005,28 +2211,154 @@ mod tests {
 
     #[test]
     fn derive_rename_unit_variant() {
-        let mut de = JsonDeserializer::new(br#""circle""#);
+        let de = JsonDeserializer::new(br#""circle""#);
         assert_eq!(
-            block_on(RenamedVariants::deserialize(&mut de)),
+            block_on(RenamedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(RenamedVariants::Circle)),
         );
     }
 
     #[test]
     fn derive_rename_newtype_variant() {
-        let mut de = JsonDeserializer::new(br#"{"rect": 5}"#);
+        let de = JsonDeserializer::new(br#"{"rect": 5}"#);
         assert_eq!(
-            block_on(RenamedVariants::deserialize(&mut de)),
+            block_on(RenamedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(RenamedVariants::Rect(5))),
         );
     }
 
     #[test]
     fn derive_rename_original_variant_name_is_miss() {
-        let mut de = JsonDeserializer::new(br#""Circle""#);
+        let de = JsonDeserializer::new(br#""Circle""#);
         assert_eq!(
-            block_on(RenamedVariants::deserialize(&mut de)),
+            block_on(RenamedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Miss),
+        );
+    }
+
+    // ---- derive: alias attribute ------------------------------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct AliasedFields {
+        #[strede(alias = "hostname", alias = "server")]
+        host: String,
+        port: u16,
+    }
+
+    #[test]
+    fn derive_alias_primary_name() {
+        let de = JsonDeserializer::new(br#"{"host": "a.com", "port": 80}"#);
+        assert_eq!(
+            block_on(AliasedFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedFields {
+                host: String::from("a.com"),
+                port: 80
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_alias_first_alias() {
+        let de = JsonDeserializer::new(br#"{"hostname": "b.com", "port": 443}"#);
+        assert_eq!(
+            block_on(AliasedFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedFields {
+                host: String::from("b.com"),
+                port: 443
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_alias_second_alias() {
+        let de = JsonDeserializer::new(br#"{"server": "c.com", "port": 8080}"#);
+        assert_eq!(
+            block_on(AliasedFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedFields {
+                host: String::from("c.com"),
+                port: 8080
+            })),
+        );
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct RenamedWithAlias {
+        #[strede(rename = "type", alias = "kind")]
+        ty: String,
+    }
+
+    #[test]
+    fn derive_rename_with_alias_primary() {
+        let de = JsonDeserializer::new(br#"{"type": "a"}"#);
+        assert_eq!(
+            block_on(RenamedWithAlias::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(RenamedWithAlias {
+                ty: String::from("a")
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_rename_with_alias_alias() {
+        let de = JsonDeserializer::new(br#"{"kind": "b"}"#);
+        assert_eq!(
+            block_on(RenamedWithAlias::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(RenamedWithAlias {
+                ty: String::from("b")
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_rename_with_alias_original_is_miss() {
+        let de = JsonDeserializer::new(br#"{"ty": "c"}"#);
+        assert_eq!(
+            block_on(RenamedWithAlias::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    enum AliasedVariants {
+        #[strede(alias = "pong")]
+        Ping,
+        #[strede(alias = "payload")]
+        Data(i64),
+    }
+
+    #[test]
+    fn derive_alias_unit_variant_primary() {
+        let de = JsonDeserializer::new(br#""Ping""#);
+        assert_eq!(
+            block_on(AliasedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedVariants::Ping)),
+        );
+    }
+
+    #[test]
+    fn derive_alias_unit_variant_alias() {
+        let de = JsonDeserializer::new(br#""pong""#);
+        assert_eq!(
+            block_on(AliasedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedVariants::Ping)),
+        );
+    }
+
+    #[test]
+    fn derive_alias_newtype_variant_primary() {
+        let de = JsonDeserializer::new(br#"{"Data": 42}"#);
+        assert_eq!(
+            block_on(AliasedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedVariants::Data(42))),
+        );
+    }
+
+    #[test]
+    fn derive_alias_newtype_variant_alias() {
+        let de = JsonDeserializer::new(br#"{"payload": 42}"#);
+        assert_eq!(
+            block_on(AliasedVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(AliasedVariants::Data(42))),
         );
     }
 
@@ -2043,44 +2375,47 @@ mod tests {
 
     #[test]
     fn derive_untagged_newtype_first_match() {
-        let mut de = JsonDeserializer::new(b"42");
+        let de = JsonDeserializer::new(b"42");
         assert_eq!(
-            block_on(Untagged::deserialize(&mut de)),
+            block_on(Untagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Untagged::Num(42))),
         );
     }
 
     #[test]
     fn derive_untagged_newtype_second_match() {
-        let mut de = JsonDeserializer::new(b"true");
+        let de = JsonDeserializer::new(b"true");
         assert_eq!(
-            block_on(Untagged::deserialize(&mut de)),
+            block_on(Untagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Untagged::Flag(true))),
         );
     }
 
     #[test]
     fn derive_untagged_tuple_variant() {
-        let mut de = JsonDeserializer::new(b"[1, 2]");
+        let de = JsonDeserializer::new(b"[1, 2]");
         assert_eq!(
-            block_on(Untagged::deserialize(&mut de)),
+            block_on(Untagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Untagged::Pt(1, 2))),
         );
     }
 
     #[test]
     fn derive_untagged_struct_variant() {
-        let mut de = JsonDeserializer::new(br#"{"x": 7}"#);
+        let de = JsonDeserializer::new(br#"{"x": 7}"#);
         assert_eq!(
-            block_on(Untagged::deserialize(&mut de)),
+            block_on(Untagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(Untagged::Named { x: 7 })),
         );
     }
 
     #[test]
     fn derive_untagged_all_miss() {
-        let mut de = JsonDeserializer::new(br#""hello""#);
-        assert_eq!(block_on(Untagged::deserialize(&mut de)), Ok(Probe::Miss),);
+        let de = JsonDeserializer::new(br#""hello""#);
+        assert_eq!(
+            block_on(Untagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
     }
 
     // ---- derive: per-variant untagged -----------------------------------------
@@ -2095,27 +2430,27 @@ mod tests {
 
     #[test]
     fn derive_mixed_tagged_unit() {
-        let mut de = JsonDeserializer::new(br#""Ping""#);
+        let de = JsonDeserializer::new(br#""Ping""#);
         assert_eq!(
-            block_on(MixedTagged::deserialize(&mut de)),
+            block_on(MixedTagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(MixedTagged::Ping)),
         );
     }
 
     #[test]
     fn derive_mixed_tagged_newtype() {
-        let mut de = JsonDeserializer::new(br#"{"Data": 42}"#);
+        let de = JsonDeserializer::new(br#"{"Data": 42}"#);
         assert_eq!(
-            block_on(MixedTagged::deserialize(&mut de)),
+            block_on(MixedTagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(MixedTagged::Data(42))),
         );
     }
 
     #[test]
     fn derive_mixed_untagged_fallback() {
-        let mut de = JsonDeserializer::new(b"true");
+        let de = JsonDeserializer::new(b"true");
         assert_eq!(
-            block_on(MixedTagged::deserialize(&mut de)),
+            block_on(MixedTagged::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
             Ok(Probe::Hit(MixedTagged::Fallback(true))),
         );
     }
@@ -2124,78 +2459,94 @@ mod tests {
 
     #[test]
     fn select_probe_first_arm_hits() {
-        let mut de = JsonDeserializer::new(b"42");
-        let result: Result<Probe<i64>, JsonError> = block_on(async {
-            de.next(|[e1, e2]| async move {
+        let de = JsonDeserializer::new(b"42");
+        let result: Result<Probe<(JsonClaim, i64)>, JsonError> = block_on(async {
+            de.entry(|[e1, e2]| async {
                 strede::select_probe! {
-                    (claim, v) = e1.deserialize_i64() => Ok(Probe::Hit((claim, v))),
-                    (claim, v) = e2.deserialize_bool() => Ok(Probe::Hit((claim, if v { 1i64 } else { 0 }))),
-                }
-            }).await
-        });
-        assert_eq!(result, Ok(Probe::Hit(42)));
-    }
-
-    #[test]
-    fn select_probe_second_arm_hits() {
-        let mut de = JsonDeserializer::new(b"true");
-        let result: Result<Probe<i64>, JsonError> = block_on(async {
-            de.next(|[e1, e2]| async move {
-                strede::select_probe! {
-                    (claim, v) = e1.deserialize_i64() => Ok(Probe::Hit((claim, v))),
-                    (claim, v) = e2.deserialize_bool() => Ok(Probe::Hit((claim, if v { 1i64 } else { 0 }))),
-                }
-            }).await
-        });
-        assert_eq!(result, Ok(Probe::Hit(1)));
-    }
-
-    #[test]
-    fn select_probe_all_miss_default() {
-        let mut de = JsonDeserializer::new(br#""hello""#);
-        let result: Result<Probe<i64>, JsonError> = block_on(async {
-            de.next(|[e1, e2]| async move {
-                strede::select_probe! {
-                    (claim, v) = e1.deserialize_i64() => Ok(Probe::Hit((claim, v))),
-                    (claim, v) = e2.deserialize_bool() => Ok(Probe::Hit((claim, if v { 1i64 } else { 0 }))),
-                }
-            }).await
-        });
-        assert_eq!(result, Ok(Probe::Miss));
-    }
-
-    #[test]
-    fn select_probe_all_miss_with_handler() {
-        let mut de = JsonDeserializer::new(br#""hello""#);
-        let result: Result<Probe<i64>, JsonError> = block_on(async {
-            de.next(|[e1, e2]| async move {
-                strede::select_probe! {
-                    (claim, v) = e1.deserialize_i64() => Ok(Probe::Hit((claim, v))),
-                    (claim, v) = e2.deserialize_bool() => Ok(Probe::Hit((claim, if v { 1i64 } else { 0 }))),
-                    miss => Ok(Probe::Miss),
-                }
-            }).await
-        });
-        assert_eq!(result, Ok(Probe::Miss));
-    }
-
-    #[test]
-    fn select_probe_single_arm() {
-        let mut de = JsonDeserializer::new(b"false");
-        let result: Result<Probe<bool>, JsonError> = block_on(async {
-            de.next(|[e]| async move {
-                strede::select_probe! {
-                    (claim, v) = e.deserialize_bool() => Ok(Probe::Hit((claim, v))),
+                    e1.deserialize_i64(),
+                    async move {
+                        let (claim, v) = strede::hit!(e2.deserialize_bool().await);
+                        Ok(Probe::Hit((claim, if v { 1i64 } else { 0 })))
+                    },
                 }
             })
             .await
         });
-        assert_eq!(result, Ok(Probe::Hit(false)));
+        assert_eq!(result.map(|p| p.map(|(_, v)| v)), Ok(Probe::Hit(42)));
+    }
+
+    #[test]
+    fn select_probe_second_arm_hits() {
+        let de = JsonDeserializer::new(b"true");
+        let result: Result<Probe<(JsonClaim, i64)>, JsonError> = block_on(async {
+            de.entry(|[e1, e2]| async {
+                strede::select_probe! {
+                    e1.deserialize_i64(),
+                    async move {
+                        let (claim, v) = strede::hit!(e2.deserialize_bool().await);
+                        Ok(Probe::Hit((claim, if v { 1i64 } else { 0 })))
+                    },
+                }
+            })
+            .await
+        });
+        assert_eq!(result.map(|p| p.map(|(_, v)| v)), Ok(Probe::Hit(1)));
+    }
+
+    #[test]
+    fn select_probe_all_miss_default() {
+        let de = JsonDeserializer::new(br#""hello""#);
+        let result: Result<Probe<(JsonClaim, i64)>, JsonError> = block_on(async {
+            de.entry(|[e1, e2]| async {
+                strede::select_probe! {
+                    e1.deserialize_i64(),
+                    async move {
+                        let (claim, v) = strede::hit!(e2.deserialize_bool().await);
+                        Ok(Probe::Hit((claim, if v { 1i64 } else { 0 })))
+                    },
+                }
+            })
+            .await
+        });
+        assert_eq!(result.map(|p| p.map(|(_, v)| v)), Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn select_probe_all_miss_with_handler() {
+        let de = JsonDeserializer::new(br#""hello""#);
+        let result: Result<Probe<(JsonClaim, i64)>, JsonError> = block_on(async {
+            de.entry(|[e1, e2]| async {
+                strede::select_probe! {
+                    e1.deserialize_i64(),
+                    async move {
+                        let (claim, v) = strede::hit!(e2.deserialize_bool().await);
+                        Ok(Probe::Hit((claim, if v { 1i64 } else { 0 })))
+                    },
+                    miss => Ok(Probe::Miss),
+                }
+            })
+            .await
+        });
+        assert_eq!(result.map(|p| p.map(|(_, v)| v)), Ok(Probe::Miss));
+    }
+
+    #[test]
+    fn select_probe_single_arm() {
+        let de = JsonDeserializer::new(b"false");
+        let result: Result<Probe<(JsonClaim, bool)>, JsonError> = block_on(async {
+            de.entry(|[e]| async {
+                strede::select_probe! {
+                    e.deserialize_bool(),
+                }
+            })
+            .await
+        });
+        assert_eq!(result.map(|p| p.map(|(_, v)| v)), Ok(Probe::Hit(false)));
     }
 
     #[test]
     fn select_probe_three_arms() {
-        let mut de = JsonDeserializer::new(br#""test""#);
+        let de = JsonDeserializer::new(br#""test""#);
         #[derive(Debug, PartialEq)]
         enum Val<'a> {
             Num(i64),
@@ -2203,16 +2554,1040 @@ mod tests {
             Str(&'a str),
         }
 
-        let result: Result<Probe<Val>, JsonError> = block_on(async {
-            de.next(|[e1, e2, e3]| async move {
+        let result: Result<Probe<(JsonClaim, Val)>, JsonError> = block_on(async {
+            de.entry(|[e1, e2, e3]| async {
                 strede::select_probe! {
-                    (claim, v) = e1.deserialize_i64()  => Ok(Probe::Hit((claim, Val::Num(v)))),
-                    (claim, v) = e2.deserialize_bool() => Ok(Probe::Hit((claim, Val::Bool(v)))),
-                    (claim, v) = e3.deserialize_str()  => Ok(Probe::Hit((claim, Val::Str(v)))),
+                    async move {
+                        let (claim, v) = strede::hit!(e1.deserialize_i64().await);
+                        Ok(Probe::Hit((claim, Val::Num(v))))
+                    },
+                    async move {
+                        let (claim, v) = strede::hit!(e2.deserialize_bool().await);
+                        Ok(Probe::Hit((claim, Val::Bool(v))))
+                    },
+                    async move {
+                        let (claim, v) = strede::hit!(e3.deserialize_str().await);
+                        Ok(Probe::Hit((claim, Val::Str(v))))
+                    },
                 }
             })
             .await
         });
-        assert_eq!(result, Ok(Probe::Hit(Val::Str("test"))));
+        assert_eq!(
+            result.map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Val::Str("test")))
+        );
+    }
+
+    // ==== skip_value tests ====================================================
+
+    #[test]
+    fn skip_null() {
+        let mut src: &[u8] = b"null, rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        // Should be positioned right after "null"
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_bool() {
+        let mut src: &[u8] = b"true, rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_number() {
+        let mut src: &[u8] = b"12345, rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_string() {
+        let mut src: &[u8] = b"\"hello\\nworld\", rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_empty_object() {
+        let mut src: &[u8] = b"{}, rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_empty_array() {
+        let mut src: &[u8] = b"[], rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    #[test]
+    fn skip_nested_structure() {
+        let mut src: &[u8] = b"{\"a\": [1, {\"b\": 2}], \"c\": null}, rest";
+        let tok = Tokenizer::new().next_token(&mut src).unwrap();
+        let tok = skip_value(&mut src, tok).unwrap();
+        let next = tok.next_token(&mut src).unwrap();
+        assert!(matches!(next, Token::Simple(SimpleToken::Comma, _)));
+    }
+
+    // ==== allow_unknown_fields (borrow family) ================================
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(allow_unknown_fields)]
+    struct Lenient {
+        x: u32,
+        y: u32,
+    }
+
+    #[test]
+    fn allow_unknown_fields_basic() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"extra\": 99, \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_string_value() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"name\": \"hello\", \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_nested_object_value() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"nested\": {\"a\": [1,2,3]}, \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_null_value() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"gone\": null, \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_array_value() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"list\": [1, \"a\", true], \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_bool_value() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"flag\": false, \"y\": 2}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_no_extra() {
+        let de = JsonDeserializer::new(b"{\"x\": 10, \"y\": 20}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 10, y: 20 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_multiple_unknowns() {
+        let de = JsonDeserializer::new(b"{\"a\": 1, \"x\": 5, \"b\": 2, \"y\": 6, \"c\": 3}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(Lenient { x: 5, y: 6 })),
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_missing_required_still_misses() {
+        // y is missing — even with allow_unknown_fields, required fields must be present.
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"extra\": 99}");
+        assert_eq!(
+            block_on(Lenient::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss)
+        );
+    }
+
+    #[test]
+    fn allow_unknown_fields_duplicate_still_errors() {
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"y\": 2, \"x\": 3}");
+        assert!(
+            block_on(Lenient::deserialize(de, ()))
+                .map(|p| p.map(|(_, v)| v))
+                .is_err()
+        );
+    }
+
+    // ==== tuple struct derive =================================================
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct TuplePair(u32, u32);
+
+    #[test]
+    fn derive_tuple_struct_basic() {
+        let de = JsonDeserializer::new(b"[10, 20]");
+        assert_eq!(
+            block_on(TuplePair::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TuplePair(10, 20))),
+        );
+    }
+
+    #[test]
+    fn derive_tuple_struct_wrong_length_is_miss() {
+        let de = JsonDeserializer::new(b"[1, 2, 3]");
+        assert_eq!(
+            block_on(TuplePair::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss)
+        );
+    }
+
+    #[test]
+    fn derive_tuple_struct_too_short_is_miss() {
+        let de = JsonDeserializer::new(b"[1]");
+        assert_eq!(
+            block_on(TuplePair::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss)
+        );
+    }
+
+    #[test]
+    fn derive_tuple_struct_non_array_is_miss() {
+        let de = JsonDeserializer::new(b"42");
+        assert_eq!(
+            block_on(TuplePair::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss)
+        );
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct TupleTriple(u32, bool, u32);
+
+    #[test]
+    fn derive_tuple_struct_mixed_types() {
+        let de = JsonDeserializer::new(b"[1, true, 3]");
+        assert_eq!(
+            block_on(TupleTriple::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TupleTriple(1, true, 3))),
+        );
+    }
+
+    // ==== transparent derive ==================================================
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(transparent)]
+    struct TransparentNamed {
+        inner: u32,
+    }
+
+    #[test]
+    fn derive_transparent_named() {
+        let de = JsonDeserializer::new(b"42");
+        assert_eq!(
+            block_on(TransparentNamed::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TransparentNamed { inner: 42 })),
+        );
+    }
+
+    #[test]
+    fn derive_transparent_named_miss() {
+        let de = JsonDeserializer::new(b"\"hello\"");
+        assert_eq!(
+            block_on(TransparentNamed::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(transparent)]
+    struct TransparentNewtype(u32);
+
+    #[test]
+    fn derive_transparent_tuple() {
+        let de = JsonDeserializer::new(b"99");
+        assert_eq!(
+            block_on(TransparentNewtype::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TransparentNewtype(99))),
+        );
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(transparent)]
+    struct TransparentBool(bool);
+
+    #[test]
+    fn derive_transparent_bool() {
+        let de = JsonDeserializer::new(b"true");
+        assert_eq!(
+            block_on(TransparentBool::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TransparentBool(true))),
+        );
+    }
+
+    // ==== unit struct derive ==================================================
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct UnitStruct;
+
+    #[test]
+    fn derive_unit_struct_null() {
+        let de = JsonDeserializer::new(b"null");
+        assert_eq!(
+            block_on(UnitStruct::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(UnitStruct)),
+        );
+    }
+
+    #[test]
+    fn derive_unit_struct_non_null_is_miss() {
+        let de = JsonDeserializer::new(b"42");
+        assert_eq!(
+            block_on(UnitStruct::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // ==== bound attribute =====================================================
+
+    // A supertrait used to test bound replacement: anything that implements
+    // Deserialize also implements MyDeserialize, so the generated body
+    // (which calls T::deserialize) still compiles.
+    trait MyDeserialize<'de>: strede::Deserialize<'de> {}
+    impl<'de, T: strede::Deserialize<'de>> MyDeserialize<'de> for T {}
+
+    // -- container-level bound = "T: Copy" (harmless extra bound) -------------
+
+    // The auto-bound would be `T: Deserialize<'de>`. With `bound = "T: Copy"`,
+    // only `T: Copy` appears in the impl — the body still compiles because
+    // Copy is only needed at the call site to prove the type is acceptable,
+    // not inside the generated deserialization body. Here we instantiate with
+    // u32 (Copy + Deserialize) so everything is satisfied.
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(bound = "T: Copy + strede::Deserialize<'de>")]
+    struct BoundedCopy<T> {
+        value: T,
+    }
+
+    #[test]
+    fn derive_container_bound_copy_hit() {
+        let de = JsonDeserializer::new(br#"{"value": 7}"#);
+        assert_eq!(
+            block_on(BoundedCopy::<u32>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(BoundedCopy { value: 7u32 })),
+        );
+    }
+
+    #[test]
+    fn derive_container_bound_copy_miss() {
+        let de = JsonDeserializer::new(br#""oops""#);
+        assert_eq!(
+            block_on(BoundedCopy::<u32>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // -- container-level bound replacing T: Deserialize with MyDeserialize ----
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(bound = "T: MyDeserialize<'de>")]
+    struct BoundedMyDeserialize<T> {
+        a: T,
+        b: u32,
+    }
+
+    #[test]
+    fn derive_container_bound_custom_trait_hit() {
+        let de = JsonDeserializer::new(br#"{"a": true, "b": 9}"#);
+        assert_eq!(
+            block_on(BoundedMyDeserialize::<bool>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(BoundedMyDeserialize { a: true, b: 9 })),
+        );
+    }
+
+    #[test]
+    fn derive_container_bound_custom_trait_miss() {
+        let de = JsonDeserializer::new(br#""nope""#);
+        assert_eq!(
+            block_on(BoundedMyDeserialize::<bool>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // -- field-level bound: extra Copy on one field, auto-bound on the other --
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct FieldBoundCopy<T, U> {
+        #[strede(bound = "T: Copy + strede::Deserialize<'de>")]
+        first: T,
+        second: U, // auto-bound: U: Deserialize<'de>
+    }
+
+    #[test]
+    fn derive_field_bound_copy_hit() {
+        let de = JsonDeserializer::new(br#"{"first": 3, "second": false}"#);
+        assert_eq!(
+            block_on(FieldBoundCopy::<u32, bool>::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(FieldBoundCopy {
+                first: 3u32,
+                second: false
+            })),
+        );
+    }
+
+    // -- field-level bound replacing T: Deserialize with MyDeserialize --------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct FieldBoundMyDeserialize<T> {
+        #[strede(bound = "T: MyDeserialize<'de>")]
+        inner: T,
+        tag: u32,
+    }
+
+    #[test]
+    fn derive_field_bound_custom_trait_hit() {
+        let de = JsonDeserializer::new(br#"{"inner": 1, "tag": 2}"#);
+        assert_eq!(
+            block_on(FieldBoundMyDeserialize::<u32>::deserialize(de, ()))
+                .map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(FieldBoundMyDeserialize {
+                inner: 1u32,
+                tag: 2
+            })),
+        );
+    }
+
+    // ---- derive: rename_all attribute ------------------------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(rename_all = "camelCase")]
+    struct CamelCaseFields {
+        first_name: String,
+        last_name: String,
+        age_years: u32,
+    }
+
+    #[test]
+    fn derive_rename_all_camel_case_hit() {
+        let de = JsonDeserializer::new(
+            br#"{"firstName": "Alice", "lastName": "Smith", "ageYears": 30}"#,
+        );
+        assert_eq!(
+            block_on(CamelCaseFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(CamelCaseFields {
+                first_name: String::from("Alice"),
+                last_name: String::from("Smith"),
+                age_years: 30,
+            })),
+        );
+    }
+
+    #[test]
+    fn derive_rename_all_original_name_is_miss() {
+        let de = JsonDeserializer::new(
+            br#"{"first_name": "Alice", "last_name": "Smith", "age_years": 30}"#,
+        );
+        assert_eq!(
+            block_on(CamelCaseFields::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // rename_all with an explicit rename on one field — explicit wins
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(rename_all = "camelCase")]
+    struct RenameAllWithExplicit {
+        first_name: String,
+        #[strede(rename = "custom_key")]
+        last_name: String,
+    }
+
+    #[test]
+    fn derive_rename_all_explicit_rename_wins() {
+        let de = JsonDeserializer::new(br#"{"firstName": "Bob", "custom_key": "Jones"}"#);
+        assert_eq!(
+            block_on(RenameAllWithExplicit::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(RenameAllWithExplicit {
+                first_name: String::from("Bob"),
+                last_name: String::from("Jones"),
+            })),
+        );
+    }
+
+    // rename_all on enum variants
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(rename_all = "snake_case")]
+    enum SnakeCaseVariants {
+        MyVariant,
+        AnotherOne(i64),
+        WithStruct { x: u32, y: u32 },
+    }
+
+    #[test]
+    fn derive_rename_all_unit_variant() {
+        let de = JsonDeserializer::new(br#""my_variant""#);
+        assert_eq!(
+            block_on(SnakeCaseVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(SnakeCaseVariants::MyVariant)),
+        );
+    }
+
+    #[test]
+    fn derive_rename_all_newtype_variant() {
+        let de = JsonDeserializer::new(br#"{"another_one": 7}"#);
+        assert_eq!(
+            block_on(SnakeCaseVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(SnakeCaseVariants::AnotherOne(7))),
+        );
+    }
+
+    #[test]
+    fn derive_rename_all_struct_variant() {
+        let de = JsonDeserializer::new(br#"{"with_struct": {"x": 1, "y": 2}}"#);
+        assert_eq!(
+            block_on(SnakeCaseVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(SnakeCaseVariants::WithStruct { x: 1, y: 2 })),
+        );
+    }
+
+    #[test]
+    fn derive_rename_all_original_variant_name_is_miss() {
+        let de = JsonDeserializer::new(br#""MyVariant""#);
+        assert_eq!(
+            block_on(SnakeCaseVariants::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // ---- derive: other attribute ------------------------------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    enum WithOther {
+        Known,
+        #[strede(other)]
+        Unknown,
+    }
+
+    #[test]
+    fn derive_other_known_variant_hits() {
+        let de = JsonDeserializer::new(br#""Known""#);
+        assert_eq!(
+            block_on(WithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithOther::Known)),
+        );
+    }
+
+    #[test]
+    fn derive_other_unknown_string_returns_other() {
+        let de = JsonDeserializer::new(br#""anything_else""#);
+        assert_eq!(
+            block_on(WithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithOther::Unknown)),
+        );
+    }
+
+    // other in a mixed enum (unit + non-unit variants)
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    enum MixedWithOther {
+        Unit,
+        Pair(i64),
+        #[strede(other)]
+        Unknown,
+    }
+
+    #[test]
+    fn derive_other_mixed_known_unit() {
+        let de = JsonDeserializer::new(br#""Unit""#);
+        assert_eq!(
+            block_on(MixedWithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(MixedWithOther::Unit)),
+        );
+    }
+
+    #[test]
+    fn derive_other_mixed_known_nonunit() {
+        let de = JsonDeserializer::new(br#"{"Pair": 42}"#);
+        assert_eq!(
+            block_on(MixedWithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(MixedWithOther::Pair(42))),
+        );
+    }
+
+    #[test]
+    fn derive_other_mixed_unknown_string() {
+        let de = JsonDeserializer::new(br#""nope""#);
+        assert_eq!(
+            block_on(MixedWithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(MixedWithOther::Unknown)),
+        );
+    }
+
+    #[test]
+    fn derive_other_mixed_unknown_map_key() {
+        let de = JsonDeserializer::new(br#"{"nope": 99}"#);
+        assert_eq!(
+            block_on(MixedWithOther::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(MixedWithOther::Unknown)),
+        );
+    }
+
+    // ---- derive: from attribute (field level) ---------------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct WithFrom {
+        name: String,
+        /// Deserializes as u32, then widens to u64 via From.
+        #[strede(from = "u32")]
+        count: u64,
+    }
+
+    #[test]
+    fn derive_field_from_converts() {
+        let de = JsonDeserializer::new(br#"{"name": "hi", "count": 7}"#);
+        assert_eq!(
+            block_on(WithFrom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithFrom {
+                name: String::from("hi"),
+                count: 7
+            })),
+        );
+    }
+
+    // ---- derive: try_from attribute (field level) ----------------------------
+
+    /// Newtype that only accepts positive integers.
+    #[derive(Debug, PartialEq)]
+    struct Positive(i64);
+
+    impl TryFrom<i64> for Positive {
+        type Error = ();
+        fn try_from(v: i64) -> Result<Self, ()> {
+            if v > 0 { Ok(Positive(v)) } else { Err(()) }
+        }
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct WithTryFrom {
+        #[strede(try_from = "i64")]
+        value: Positive,
+    }
+
+    #[test]
+    fn derive_field_try_from_hit() {
+        let de = JsonDeserializer::new(br#"{"value": 5}"#);
+        assert_eq!(
+            block_on(WithTryFrom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(WithTryFrom { value: Positive(5) })),
+        );
+    }
+
+    #[test]
+    fn derive_field_try_from_miss_on_conversion_failure() {
+        let de = JsonDeserializer::new(br#"{"value": -3}"#);
+        assert_eq!(
+            block_on(WithTryFrom::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // ---- derive: from attribute (container level) ----------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(from = "f64")]
+    struct MetersWrapper(#[allow(dead_code)] f64);
+
+    impl From<f64> for MetersWrapper {
+        fn from(v: f64) -> Self {
+            MetersWrapper(v)
+        }
+    }
+
+    #[test]
+    fn derive_container_from_converts() {
+        let de = JsonDeserializer::new(b"3.14");
+        assert_eq!(
+            block_on(MetersWrapper::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(MetersWrapper(3.14))),
+        );
+    }
+
+    // ---- derive: try_from attribute (container level) ------------------------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(try_from = "String")]
+    struct NonEmptyStringWrapper(String);
+
+    impl TryFrom<String> for NonEmptyStringWrapper {
+        type Error = ();
+        fn try_from(s: String) -> Result<Self, ()> {
+            if s.is_empty() {
+                Err(())
+            } else {
+                Ok(NonEmptyStringWrapper(s))
+            }
+        }
+    }
+
+    #[test]
+    fn derive_container_try_from_hit() {
+        let de = JsonDeserializer::new(br#""hello""#);
+        assert_eq!(
+            block_on(NonEmptyStringWrapper::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(NonEmptyStringWrapper(String::from("hello")))),
+        );
+    }
+
+    #[test]
+    fn derive_container_try_from_miss_on_conversion_failure() {
+        let de = JsonDeserializer::new(br#""""#);
+        assert_eq!(
+            block_on(NonEmptyStringWrapper::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    // ---- fork ---------------------------------------------------------------
+
+    #[test]
+    fn str_access_fork_reads_same_content() {
+        // Fork a StrAccess at the start; both forks must read the same full string.
+        let (_, (a, b)) = block_on(JsonDeserializer::new(b"\"hello\\nworld\"").entry(
+            |[e]| async {
+                let mut chunks = match e.deserialize_str_chunks().await? {
+                    Probe::Hit(c) => c,
+                    Probe::Miss => panic!("expected str chunks"),
+                };
+                let mut fork = chunks.fork();
+
+                let mut a = String::new();
+                loop {
+                    match chunks.next_str(|s| a.push_str(s)).await? {
+                        Chunk::Data((new, ())) => chunks = new,
+                        Chunk::Done(_) => break, // drop original claim; fork drives to Done below
+                    }
+                }
+
+                let mut b = String::new();
+                let claim = loop {
+                    match fork.next_str(|s| b.push_str(s)).await? {
+                        Chunk::Data((new, ())) => fork = new,
+                        Chunk::Done(claim) => break claim,
+                    }
+                };
+                Ok(Probe::Hit((claim, (a, b))))
+            },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(a, "hello\nworld");
+        assert_eq!(b, "hello\nworld");
+    }
+
+    #[test]
+    fn seq_access_fork_computes_same_sum() {
+        // Fork a SeqAccess at the start; both forks must see all elements.
+        let (_, (s1, s2)) = block_on(JsonDeserializer::new(b"[1, 2, 3]").entry(|[e]| async {
+            let mut seq = match e.deserialize_seq().await? {
+                Probe::Hit(s) => s,
+                Probe::Miss => panic!("expected seq"),
+            };
+            let mut fork = seq.fork();
+
+            let mut s1 = 0u32;
+            loop {
+                match seq
+                    .next(|[se]| async {
+                        let (claim, v) = hit!(se.get::<U32, ()>(()).await);
+                        Ok(Probe::Hit((claim, v.0)))
+                    })
+                    .await?
+                    .unwrap()
+                {
+                    Chunk::Data((n_seq, v)) => {
+                        s1 += v;
+                        seq = n_seq;
+                    }
+                    Chunk::Done(_) => break, // drop original claim
+                }
+            }
+
+            let mut s2 = 0u32;
+            let claim = loop {
+                match fork
+                    .next(|[se]| async {
+                        let (claim, v) = hit!(se.get::<U32, ()>(()).await);
+                        Ok(Probe::Hit((claim, v.0)))
+                    })
+                    .await?
+                    .unwrap()
+                {
+                    Chunk::Data((n_seq, v)) => {
+                        s2 += v;
+                        fork = n_seq;
+                    }
+                    Chunk::Done(claim) => break claim,
+                }
+            };
+            Ok(Probe::Hit((claim, (s1, s2))))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(s1, 6);
+        assert_eq!(s2, 6);
+    }
+
+    // ---- Match (borrow family) -----------------------------------------------
+
+    #[test]
+    fn match_str_hits_plain() {
+        let de = JsonDeserializer::new(b"\"hello\"");
+        let v = block_on(<Match as Deserialize<&str>>::deserialize(de, "hello")).unwrap();
+        assert!(matches!(v, Probe::Hit((_, Match))));
+    }
+
+    #[test]
+    fn match_str_misses_wrong_content() {
+        let de = JsonDeserializer::new(b"\"hello\"");
+        let v = block_on(<Match as Deserialize<&str>>::deserialize(de, "world")).unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_str_hits_escaped() {
+        // "hello\nworld" has an escape sequence — deserialize_str misses,
+        // deserialize_str_chunks handles it.
+        let de = JsonDeserializer::new(b"\"hello\\nworld\"");
+        let v = block_on(<Match as Deserialize<&str>>::deserialize(
+            de,
+            "hello\nworld",
+        ))
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, Match))));
+    }
+
+    #[test]
+    fn match_str_misses_escaped_wrong_content() {
+        let de = JsonDeserializer::new(b"\"hello\\nworld\"");
+        let v = block_on(<Match as Deserialize<&str>>::deserialize(
+            de,
+            "hello\tworld",
+        ))
+        .unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_str_misses_wrong_type() {
+        let de = JsonDeserializer::new(b"42");
+        let v = block_on(<Match as Deserialize<&str>>::deserialize(de, "42")).unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_bytes_hits() {
+        let de = JsonDeserializer::new(b"\"hello\"");
+        let v = block_on(<Match as Deserialize<&[u8]>>::deserialize(de, b"hello")).unwrap();
+        assert!(matches!(v, Probe::Hit((_, Match))));
+    }
+
+    #[test]
+    fn match_bytes_misses_wrong_content() {
+        let de = JsonDeserializer::new(b"\"hello\"");
+        let v = block_on(<Match as Deserialize<&[u8]>>::deserialize(de, b"world")).unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_bytes_misses_wrong_type() {
+        let de = JsonDeserializer::new(b"42");
+        let v = block_on(<Match as Deserialize<&[u8]>>::deserialize(de, b"42")).unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    // ---- tag_facade: TagFilteredMap -------------------------------------------
+
+    use strede::tag_facade::{TagFilteredMap, TagFilteredMapDeserializer};
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct TagFacadePoint {
+        x: i64,
+        y: i64,
+    }
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    struct TagFacadeEmpty {}
+
+    #[test]
+    fn tag_filtered_map_passes_non_tag_keys() {
+        // {"x": 1, "y": 2} — filter on "tag"; neither key is "tag" so both pass through.
+        let de = JsonDeserializer::new(b"{\"x\": 1, \"y\": 2}");
+        let (_, keys) = block_on(de.entry(|[e]| async move {
+            let inner = strede::hit!(e.deserialize_map().await);
+            let mut map = TagFilteredMap::new(inner, "tag");
+            let mut keys = Vec::new();
+            let claim = loop {
+                match strede::hit!(
+                    map.next_kv::<1, _, _, String>(|[ke]| async move {
+                        let (c, _k, s) = strede::hit!(
+                            ke.key((), |k: &&str, [ve]| {
+                                let s = alloc::string::String::from(*k);
+                                async move {
+                                    let c = ve.skip().await?;
+                                    Ok(Probe::Hit((c, s)))
+                                }
+                            })
+                            .await
+                        );
+                        Ok(Probe::Hit((c, s)))
+                    })
+                    .await
+                ) {
+                    strede::Chunk::Data((m, k)) => {
+                        map = m;
+                        keys.push(k);
+                    }
+                    strede::Chunk::Done(c) => break c,
+                }
+            };
+            Ok(Probe::Hit((claim, keys)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(keys, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn tag_filtered_map_skips_tag_key() {
+        // {"type": "Foo", "value": 42} — filter on "type"; only "value" should be seen.
+        let de = JsonDeserializer::new(b"{\"type\": \"Foo\", \"value\": 42}");
+        let (_, keys) = block_on(de.entry(|[e]| async move {
+            let inner = strede::hit!(e.deserialize_map().await);
+            let mut map = TagFilteredMap::new(inner, "type");
+            let mut keys = Vec::new();
+            let claim = loop {
+                match strede::hit!(
+                    map.next_kv::<1, _, _, String>(|[ke]| async move {
+                        let (c, _k, s) = strede::hit!(
+                            ke.key((), |k: &&str, [ve]| {
+                                let s = alloc::string::String::from(*k);
+                                async move {
+                                    let c = ve.skip().await?;
+                                    Ok(Probe::Hit((c, s)))
+                                }
+                            })
+                            .await
+                        );
+                        Ok(Probe::Hit((c, s)))
+                    })
+                    .await
+                ) {
+                    strede::Chunk::Data((m, k)) => {
+                        map = m;
+                        keys.push(k);
+                    }
+                    strede::Chunk::Done(c) => break c,
+                }
+            };
+            Ok(Probe::Hit((claim, keys)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(keys, vec!["value"]);
+    }
+
+    #[test]
+    fn tag_filtered_map_skips_tag_key_in_middle() {
+        // {"a": 1, "type": "X", "b": 2} — "type" in the middle should be skipped.
+        let de = JsonDeserializer::new(b"{\"a\": 1, \"type\": \"X\", \"b\": 2}");
+        let (_, keys) = block_on(de.entry(|[e]| async move {
+            let inner = strede::hit!(e.deserialize_map().await);
+            let mut map = TagFilteredMap::new(inner, "type");
+            let mut keys = Vec::new();
+            let claim = loop {
+                match strede::hit!(
+                    map.next_kv::<1, _, _, String>(|[ke]| async move {
+                        let (c, _k, s) = strede::hit!(
+                            ke.key((), |k: &&str, [ve]| {
+                                let s = alloc::string::String::from(*k);
+                                async move {
+                                    let c = ve.skip().await?;
+                                    Ok(Probe::Hit((c, s)))
+                                }
+                            })
+                            .await
+                        );
+                        Ok(Probe::Hit((c, s)))
+                    })
+                    .await
+                ) {
+                    strede::Chunk::Data((m, k)) => {
+                        map = m;
+                        keys.push(k);
+                    }
+                    strede::Chunk::Done(c) => break c,
+                }
+            };
+            Ok(Probe::Hit((claim, keys)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tag_filtered_map_deserializer_deserializes_struct() {
+        let de = JsonDeserializer::new(b"{\"type\": \"Point\", \"x\": 3, \"y\": 7}");
+        let (_, v) = block_on(de.entry(|[e]| async move {
+            let inner = strede::hit!(e.deserialize_map().await);
+            let facade = TagFilteredMapDeserializer::new(inner, "type");
+            let (claim, v) = strede::hit!(TagFacadePoint::deserialize(facade, ()).await);
+            Ok(Probe::Hit((claim, v)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(v, TagFacadePoint { x: 3, y: 7 });
+    }
+
+    #[test]
+    fn tag_filtered_map_deserializer_tag_only_map_is_empty_struct() {
+        let de = JsonDeserializer::new(b"{\"type\": \"Empty\"}");
+        let (_, v) = block_on(de.entry(|[e]| async move {
+            let inner = strede::hit!(e.deserialize_map().await);
+            let facade = TagFilteredMapDeserializer::new(inner, "type");
+            let (claim, v) = strede::hit!(TagFacadeEmpty::deserialize(facade, ()).await);
+            Ok(Probe::Hit((claim, v)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(v, TagFacadeEmpty {});
     }
 }

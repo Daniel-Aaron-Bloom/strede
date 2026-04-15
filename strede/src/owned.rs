@@ -19,9 +19,15 @@ use crate::{Chunk, DeserializeError, Probe};
 // ===========================================================================
 
 /// Owned counterpart to [`Deserialize`](crate::Deserialize).
-pub trait DeserializeOwned<'s>: Sized {
+///
+/// The `Extra` type parameter is side-channel context passed into
+/// [`EntryOwned::deserialize_value`], [`SeqEntryOwned::get`],
+/// [`MapKeyEntryOwned::key`], and [`MapValueEntryOwned::value`] at the call
+/// site.  Defaults to `()` for types that need no extra context.
+pub trait DeserializeOwned<'s, Extra = ()>: Sized {
     async fn deserialize<D: DeserializerOwned<'s>>(
         d: D,
+        extra: Extra,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>;
 }
 
@@ -32,12 +38,12 @@ pub trait DeserializerOwned<'s>: Sized {
     type Claim: 's;
     type Entry: EntryOwned<'s, Error = Self::Error>;
 
-    async fn next<const N: usize, F, Fut, R>(
+    async fn entry<const N: usize, F, Fut, R>(
         self,
         f: F,
     ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
-        F: FnOnce([Self::Entry; N]) -> Fut,
+        F: FnMut([Self::Entry; N]) -> Fut,
         Fut: Future<
             Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
         >;
@@ -47,7 +53,7 @@ pub trait DeserializerOwned<'s>: Sized {
 /// (the borrow-only methods); strings and bytes must be read via
 /// [`StrAccessOwned`] / [`BytesAccessOwned`].
 pub trait EntryOwned<'s>: Sized {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
 
     type StrChunks: StrAccessOwned<'s, Claim = Self::Claim, Error = Self::Error>;
@@ -75,17 +81,29 @@ pub trait EntryOwned<'s>: Sized {
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error>;
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error>;
 
-    async fn deserialize_option<T: DeserializeOwned<'s>>(
+    async fn deserialize_option<T: DeserializeOwned<'s, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error>;
 
     /// Probe for a null token.
     async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error>;
 
-    /// Delegate to `T::deserialize` from this entry handle.
-    async fn deserialize_value<T: DeserializeOwned<'s>>(
+    /// Delegate to `T::deserialize` from this entry handle, forwarding `extra`.
+    async fn deserialize_value<T: DeserializeOwned<'s, Extra>, Extra>(
         self,
+        extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+
+    /// Fork a sibling entry handle for the same item slot.
+    ///
+    /// Both `self` and the returned handle refer to the same slot.
+    /// Whichever resolves a probe first claims the slot; the other
+    /// becomes inert and may be dropped without advancing the stream.
+    fn fork(&mut self) -> Self;
+
+    /// Consume and discard the current token regardless of its type.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
 
 /// Owned counterpart to [`StrAccess`]. Takes `self` by value and a sync
@@ -94,9 +112,17 @@ pub trait EntryOwned<'s>: Sized {
 /// `Data` and the claim emerges on `Done`.
 pub trait StrAccessOwned<'s>: Sized {
     type Claim: 's;
-    type Error;
+    type Error: DeserializeError;
 
-    async fn next<R>(
+    /// Fork a sibling accessor at the same read position.
+    ///
+    /// Both `self` and the returned accessor are independent: each must be
+    /// driven to `Done` (or dropped) before the underlying buffer can
+    /// advance.  Neither reader replays data — both continue from the
+    /// current position, consuming the same remaining chunks.
+    fn fork(&mut self) -> Self;
+
+    async fn next_str<R>(
         self,
         f: impl FnOnce(&str) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
@@ -106,9 +132,17 @@ pub trait StrAccessOwned<'s>: Sized {
 /// [`StrAccessOwned`].
 pub trait BytesAccessOwned<'s>: Sized {
     type Claim: 's;
-    type Error;
+    type Error: DeserializeError;
 
-    async fn next<R>(
+    /// Fork a sibling accessor at the same read position.
+    ///
+    /// Both `self` and the returned accessor are independent: each must be
+    /// driven to `Done` (or dropped) before the underlying buffer can
+    /// advance.  Neither reader replays data — both continue from the
+    /// current position, consuming the same remaining chunks.
+    fn fork(&mut self) -> Self;
+
+    async fn next_bytes<R>(
         self,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
@@ -116,63 +150,171 @@ pub trait BytesAccessOwned<'s>: Sized {
 
 /// Owned counterpart to [`MapAccess`](crate::MapAccess).
 pub trait MapAccessOwned<'s>: Sized {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
     type KeyEntry: MapKeyEntryOwned<'s, Claim = Self::Claim, Error = Self::Error>;
 
-    async fn next<const N: usize, F, Fut, R>(
+    /// Fork a sibling accessor at the same map position.
+    ///
+    /// See [`StrAccessOwned::fork`] for general semantics.  Both forks must
+    /// consume all remaining pairs (or be dropped) before the underlying
+    /// buffer can advance.
+    fn fork(&mut self) -> Self;
+
+    async fn next_kv<const N: usize, F, Fut, R>(
         self,
         f: F,
     ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        F: FnOnce([Self::KeyEntry; N]) -> Fut,
+        F: FnMut([Self::KeyEntry; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
 /// Owned counterpart to [`MapKeyEntry`](crate::MapKeyEntry).
 pub trait MapKeyEntryOwned<'s> {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
     type ValueEntry: MapValueEntryOwned<'s, Claim = Self::Claim, Error = Self::Error>;
 
-    async fn key<K: DeserializeOwned<'s>, const N: usize, F, Fut, R>(
+    /// Fork a sibling key-entry handle for the same map pair.
+    fn fork(&mut self) -> Self
+    where
+        Self: Sized;
+
+    async fn key<K: DeserializeOwned<'s, KExtra>, KExtra, const N: usize, F, Fut, R>(
         self,
+        extra: KExtra,
         f: F,
     ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
     where
-        F: FnOnce(&K, [Self::ValueEntry; N]) -> Fut,
+        F: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
 /// Owned counterpart to [`MapValueEntry`](crate::MapValueEntry).
 pub trait MapValueEntryOwned<'s> {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
 
-    async fn value<V: DeserializeOwned<'s>>(self) -> Result<Probe<(Self::Claim, V)>, Self::Error>;
+    /// Fork a sibling value-entry handle for the same map value slot.
+    fn fork(&mut self) -> Self
+    where
+        Self: Sized;
+
+    async fn value<V: DeserializeOwned<'s, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, V)>, Self::Error>;
+
+    /// Consume and discard the value without deserializing it.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
 
 /// Owned counterpart to [`SeqAccess`](crate::SeqAccess).
 pub trait SeqAccessOwned<'s>: Sized {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
     type Elem: SeqEntryOwned<'s, Claim = Self::Claim, Error = Self::Error>;
+
+    /// Fork a sibling accessor at the same sequence position.
+    ///
+    /// See [`StrAccessOwned::fork`] for general semantics.
+    fn fork(&mut self) -> Self;
 
     async fn next<const N: usize, F, Fut, R>(
         self,
         f: F,
     ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
     where
-        F: FnOnce([Self::Elem; N]) -> Fut,
+        F: FnMut([Self::Elem; N]) -> Fut,
         Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
 }
 
 /// Owned counterpart to [`SeqEntry`](crate::SeqEntry).
 pub trait SeqEntryOwned<'s> {
-    type Error;
+    type Error: DeserializeError;
     type Claim: 's;
 
-    async fn get<T: DeserializeOwned<'s>>(self) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+    /// Fork a sibling element handle for the same sequence slot.
+    fn fork(&mut self) -> Self
+    where
+        Self: Sized;
+
+    async fn get<T: DeserializeOwned<'s, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>;
+
+    /// Consume and discard the element without deserializing it.
+    async fn skip(self) -> Result<Self::Claim, Self::Error>;
+}
+
+// ---------------------------------------------------------------------------
+// Never impls — owned family
+// ---------------------------------------------------------------------------
+
+impl<'n, 's, C: 's, E: DeserializeError> StrAccessOwned<'s> for crate::Never<'n, C, E> {
+    type Claim = C;
+    type Error = E;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next_str<R>(
+        self,
+        _f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 's, C: 's, E: DeserializeError> BytesAccessOwned<'s> for crate::Never<'n, C, E> {
+    type Claim = C;
+    type Error = E;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next_bytes<R>(
+        self,
+        _f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 's, C: 's, E: DeserializeError> SeqAccessOwned<'s> for crate::Never<'n, C, E> {
+    type Error = E;
+    type Claim = C;
+    type Elem = crate::Never<'n, C, E>;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next<const N: usize, F, Fut, R>(
+        self,
+        _f: F,
+    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    where
+        F: FnMut([Self::Elem; N]) -> Fut,
+        Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+    {
+        match self.0 {}
+    }
+}
+
+impl<'n, 's, C: 's, E: DeserializeError> SeqEntryOwned<'s> for crate::Never<'n, C, E> {
+    type Error = E;
+    type Claim = C;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn get<T: DeserializeOwned<'s, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        match self.0 {}
+    }
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        match self.0 {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +326,9 @@ macro_rules! impl_deserialize_owned_primitive {
         impl<'s> DeserializeOwned<'s> for $ty {
             async fn deserialize<D: DeserializerOwned<'s>>(
                 d: D,
+                _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                d.next(|[e]| async move { e.$method().await }).await
+                d.entry(|[e]| async { e.$method().await }).await
             }
         }
     };
@@ -206,11 +349,12 @@ impl_deserialize_owned_primitive!(f32, deserialize_f32);
 impl_deserialize_owned_primitive!(f64, deserialize_f64);
 impl_deserialize_owned_primitive!(char, deserialize_char);
 
-impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Option<T> {
+impl<'s, Extra: Copy, T: DeserializeOwned<'s, Extra>> DeserializeOwned<'s, Extra> for Option<T> {
     async fn deserialize<D: DeserializerOwned<'s>>(
         d: D,
+        extra: Extra,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        d.next(|[e]| async move { e.deserialize_option::<T>().await })
+        d.entry(|[e]| async { e.deserialize_option::<T, Extra>(extra).await })
             .await
     }
 }

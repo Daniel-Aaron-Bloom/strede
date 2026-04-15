@@ -10,5 +10,11 @@ keywords.workspace = true
 description = "Async, zero-alloc, pull-based deserialization for Rust"
 readme = "../README.md"
 
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+rc = []
+
 [dependencies]
 strede-derive = { path = "../strede-derive", version = "=0.1.0" }

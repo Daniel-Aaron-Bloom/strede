@@ -1,13 +1,6 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{Expr, Pat, Token, parse::Parse, parse::ParseStream, parse_macro_input};
-
-/// An arm in `select_probe!`: `pat = expr => body`
-struct ProbeArm {
-    pat: Pat,
-    expr: Expr,
-    body: Expr,
-}
+use quote::quote;
+use syn::{Expr, Token, parse::Parse, parse::ParseStream, parse_macro_input};
 
 /// Optional final `miss => body` arm.
 struct MissArm {
@@ -16,7 +9,7 @@ struct MissArm {
 
 struct SelectProbeInput {
     krate: syn::Path,
-    arms: Vec<ProbeArm>,
+    arms: Vec<Expr>,
     miss: Option<MissArm>,
 }
 
@@ -45,15 +38,10 @@ impl Parse for SelectProbeInput {
                 }
             }
 
-            // Regular arm: `pat = expr => body`
-            let pat = Pat::parse_multi_with_leading_vert(input)?;
-            let _: Token![=] = input.parse()?;
+            // Arm: any expression (bare probe call, async block, etc.)
             let expr: Expr = input.parse()?;
-            let _: Token![=>] = input.parse()?;
-            // Body: either a block `{ ... }` or a single expression up to `,`
-            let body: Expr = input.parse()?;
             let _ = input.parse::<Token![,]>();
-            arms.push(ProbeArm { pat, expr, body });
+            arms.push(expr);
         }
 
         Ok(SelectProbeInput { krate, arms, miss })
@@ -62,9 +50,10 @@ impl Parse for SelectProbeInput {
 
 /// Race multiple probe futures.
 ///
-/// Each arm has the form `pat = expr => body` where `expr` is a probe future
-/// (`Result<Probe<T>, E>`), `pat` is bound from the `Hit(T)` inner value, and
-/// `body` is evaluated when the arm wins.
+/// Each arm is an expression that evaluates to a future returning
+/// `Result<Probe<T>, E>`.  Arms can be bare probe calls
+/// (`e.deserialize_i64()`) or `async move { ... }` blocks for complex
+/// logic that needs `.await`.
 ///
 /// An optional final `miss => body` arm fires when every probe returned
 /// `Probe::Miss`.  Without it the macro produces `Ok(Probe::Miss)`.
@@ -72,54 +61,84 @@ impl Parse for SelectProbeInput {
 /// The macro expands to a `poll_fn` that polls all non-missed arms on each
 /// wakeup (in declaration order).  `Pending` means "waiting for data";
 /// `Miss` marks an arm done; first `Hit` wins; `Err` short-circuits.
+///
+/// A `__probe_kill_ref: &[Cell<bool>; N]` is in scope for all arm expressions.
+/// Setting `__probe_kill_ref[i].set(true)` causes arm `i` to drop its future
+/// and stop polling on the next wake-up.
 pub fn select_probe_impl(input: TokenStream) -> TokenStream {
     let SelectProbeInput { krate, arms, miss } = parse_macro_input!(input as SelectProbeInput);
 
     let n = arms.len();
 
-    // Generate per-arm variable names: __probe_fut_0, __probe_miss_0, …
-    let fut_names: Vec<_> = (0..n).map(|i| format_ident!("__probe_fut_{}", i)).collect();
-    let miss_names: Vec<_> = (0..n)
-        .map(|i| format_ident!("__probe_miss_{}", i))
+    let arm_indices: Vec<syn::Index> = (0..n).map(syn::Index::from).collect();
+
+    // Each future is stored as `pin!(Some(expr))` so its slot can be cleared to
+    // `None` when killed, dropping the future in place without moving it.
+    let fut_exprs: Vec<_> = arms
+        .iter()
+        .map(|expr| quote! { ::core::pin::pin!(::core::option::Option::Some(#expr)) })
         .collect();
 
-    let fut_inits: Vec<_> = arms
-        .iter()
-        .zip(&fut_names)
-        .map(|(arm, fut)| {
-            let expr = &arm.expr;
-            quote! { let mut #fut = ::core::pin::pin!(#expr); }
-        })
-        .collect();
+    // `Cell<bool>` is not `Copy`, so we emit one `Cell::new(false)` per arm.
+    let kill_cells = (0..n).map(|_| quote! { ::core::cell::Cell::new(false) });
 
-    let miss_inits: Vec<_> = miss_names
+    // Single kill-sweep block emitted once per poll: checks all arms under one
+    // __probe_new_kills guard, using compile-time tuple indices throughout.
+    let kill_checks: Vec<_> = arm_indices
         .iter()
-        .map(|m| {
-            quote! { let mut #m = false; }
-        })
-        .collect();
-
-    let poll_blocks: Vec<_> = arms
-        .iter()
-        .zip(&fut_names)
-        .zip(&miss_names)
-        .map(|((arm, fut), done)| {
-            let pat = &arm.pat;
-            let body = &arm.body;
+        .map(|idx| {
             quote! {
-                if !#done {
-                    match ::core::future::Future::poll(
-                        ::core::pin::Pin::as_mut(&mut #fut), __cx
-                    ) {
+                if !__probe_done[#idx] && __probe_kill_ref[#idx].get() {
+                    // SAFETY: We drop the pinned Option<F> in place (never moves F),
+                    // then reinitialize the slot to None.  The done flag prevents any
+                    // further access to this slot.
+                    unsafe {
+                        let __slot: *mut ::core::option::Option<_> =
+                            ::core::pin::Pin::get_unchecked_mut(
+                                ::core::pin::Pin::as_mut(&mut __probe_fut.#idx)
+                            );
+                        ::core::ptr::drop_in_place(__slot);
+                        ::core::ptr::write(__slot, ::core::option::Option::None);
+                    }
+                    __probe_done[#idx] = true;
+                }
+            }
+        })
+        .collect();
+
+    let kill_sweep = quote! {
+        if __probe_new_kills.get() {
+            #( #kill_checks )*
+            __probe_new_kills.set(false);
+        }
+    };
+
+    let poll_blocks: Vec<_> = arm_indices
+        .iter()
+        .map(|idx| {
+            quote! {
+                #kill_sweep
+                if !__probe_done[#idx] {
+                    // Project Pin<&mut Option<F>> → Pin<&mut F>.
+                    // Safe: slot is Some while !done, and we never move F.
+                    let __inner_pin = unsafe {
+                        ::core::pin::Pin::map_unchecked_mut(
+                            ::core::pin::Pin::as_mut(&mut __probe_fut.#idx),
+                            |__opt| __opt.as_mut().unwrap()
+                        )
+                    };
+                    match ::core::future::Future::poll(__inner_pin, __cx) {
                         ::core::task::Poll::Ready(::core::result::Result::Ok(
-                            #krate::Probe::Hit(#pat)
+                            #krate::Probe::Hit(__probe_val)
                         )) => {
-                            return ::core::task::Poll::Ready(#body);
+                            return ::core::task::Poll::Ready(
+                                ::core::result::Result::Ok(#krate::Probe::Hit(__probe_val))
+                            );
                         }
                         ::core::task::Poll::Ready(::core::result::Result::Ok(
                             #krate::Probe::Miss
                         )) => {
-                            #done = true;
+                            __probe_done[#idx] = true;
                         }
                         ::core::task::Poll::Ready(::core::result::Result::Err(__probe_err)) => {
                             return ::core::task::Poll::Ready(
@@ -133,14 +152,6 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // All-miss condition: `true && __probe_miss_0 && __probe_miss_1 && …`
-    let all_miss = if miss_names.is_empty() {
-        quote! { true }
-    } else {
-        let checks = miss_names.iter().map(|m| quote! { && #m });
-        quote! { true #( #checks )* }
-    };
-
     let miss_body = match miss {
         Some(m) => {
             let b = &m.body;
@@ -151,11 +162,24 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         {
-            #( #fut_inits )*
-            #( #miss_inits )*
+            // Kill flags: arm expressions can capture __probe_kill_ref (a Copy &-ref)
+            // and call kill!(i) to schedule a sibling arm for dropping.
+            let __probe_kill_flags = [ #( #kill_cells ),* ];
+            let __probe_kill_ref = &__probe_kill_flags;
+            let __probe_new_kills = ::core::cell::Cell::new(false);
+            let __probe_new_kills = &__probe_new_kills;
+            #[allow(unused_macros)]
+            macro_rules! kill {
+                ($i:literal) => {{
+                    __probe_kill_ref[$i].set(true);
+                    __probe_new_kills.set(true);
+                }};
+            }
+            let mut __probe_fut = ( #( #fut_exprs ,)* );
+            let mut __probe_done = [false; #n];
             ::core::future::poll_fn(|__cx| {
                 #( #poll_blocks )*
-                if #all_miss {
+                if __probe_done.iter().all(|__d| *__d) {
                     return ::core::task::Poll::Ready(#miss_body);
                 }
                 ::core::task::Poll::Pending
