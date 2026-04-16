@@ -812,6 +812,18 @@ fn expand_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<TokenStream
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
 
+    if let Some(ref tag_field) = container_attrs.tag {
+        return expand_enum_internally_tagged(
+            name,
+            &classified,
+            tag_field,
+            krate,
+            &impl_generics,
+            &ty_generics,
+            where_clause,
+        );
+    }
+
     let has_tagged_unit = classified
         .iter()
         .any(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit));
@@ -1404,4 +1416,106 @@ fn gen_enum_map_body_borrow(
         let __claim = #krate::or_miss!(__chunk.done());
         ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __enum_val)))
     }
+}
+
+/// Generate a `Deserialize` impl for an internally tagged enum (`#[strede(tag = "field")]`).
+///
+/// Phase 1: unit variants only. Non-unit variants produce a compile-time error.
+fn expand_enum_internally_tagged(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    tag_field: &str,
+    krate: &syn::Path,
+    impl_generics: impl quote::ToTokens,
+    ty_generics: impl quote::ToTokens,
+    where_clause: impl quote::ToTokens,
+) -> syn::Result<TokenStream2> {
+    let has_nonunit = classified
+        .iter()
+        .any(|cv| !matches!(cv.kind, VariantKind::Unit));
+    if has_nonunit {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[strede(tag)] with non-unit variants is not supported yet",
+        ));
+    }
+
+    let str_match = unit_str_match_arms(name, classified, krate);
+
+    let body = quote! {
+        d.entry(|[__e]| async {
+            let mut __map = #krate::hit!(__e.deserialize_map().await);
+            let mut __tag_val: ::core::option::Option<&'de str> = ::core::option::Option::None;
+
+            let __claim = loop {
+                match #krate::hit!(__map.next_kv(|[__ke]| async {
+                    let (__c, _k, __ov) = #krate::hit!(__ke.key(
+                        (),
+                        |__k: &&'de str, [__ve]| {
+                            let __k = *__k;
+                            async move {
+                                if __k == #tag_field {
+                                    let (__c, __s) = #krate::hit!(
+                                        __ve.value::<&'de str, _>(()).await
+                                    );
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((
+                                        __c,
+                                        ::core::option::Option::Some(__s),
+                                    )))
+                                } else {
+                                    let __c = __ve.skip().await?;
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((
+                                        __c,
+                                        ::core::option::Option::None::<&'de str>,
+                                    )))
+                                }
+                            }
+                        },
+                    ).await);
+                    ::core::result::Result::Ok(#krate::Probe::Hit((__c, __ov)))
+                }).await) {
+                    #krate::Chunk::Data((__map_back, ::core::option::Option::Some(__s))) => {
+                        __tag_val = ::core::option::Option::Some(__s);
+                        __map = __map_back;
+                    }
+                    #krate::Chunk::Data((__map_back, ::core::option::Option::None)) => {
+                        __map = __map_back;
+                    }
+                    #krate::Chunk::Done(__c) => break __c,
+                }
+            };
+
+            let __s = match __tag_val {
+                ::core::option::Option::Some(__s) => __s,
+                ::core::option::Option::None => {
+                    return ::core::result::Result::Ok(#krate::Probe::Miss);
+                }
+            };
+
+            #str_match
+        }).await
+    };
+
+    Ok(quote! {
+        #[allow(unreachable_code)]
+        const _: () = {
+            use #krate::{
+                DefaultValue as _, Deserialize as _, Deserializer as _, Entry as _,
+                MapAccess as _, MapKeyEntry as _, MapValueEntry as _,
+                SeqAccess as _, SeqEntry as _, StrAccess as _,
+            };
+
+            impl #impl_generics #krate::Deserialize<'de> for #name #ty_generics #where_clause {
+                async fn deserialize<__D: #krate::Deserializer<'de>>(
+                    d: __D,
+                    _extra: (),
+                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
+                where
+                    __D::Error: #krate::DeserializeError,
+                {
+                    #body
+                }
+            }
+        };
+    })
 }

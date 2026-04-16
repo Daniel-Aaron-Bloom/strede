@@ -211,6 +211,9 @@ pub struct ContainerAttrs {
     /// `#[strede(try_from = "FromType")]` — deserialize `FromType`, then call
     /// `Self::try_from(v).ok()`, returning `Probe::Miss` on failure.
     pub try_from: Option<syn::Type>,
+    /// `#[strede(tag = "field")]` — internally tagged enum; the named field in the map
+    /// is the variant discriminant.
+    pub tag: Option<String>,
 }
 
 pub struct VariantAttrs {
@@ -265,6 +268,7 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
     let mut bound: Option<Vec<syn::WherePredicate>> = None;
     let mut from: Option<syn::Type> = None;
     let mut try_from: Option<syn::Type> = None;
+    let mut tag: Option<String> = None;
     for attr in attrs {
         if !attr.path().is_ident("strede") {
             continue;
@@ -311,6 +315,11 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
                 let s: syn::LitStr = value.parse()?;
                 try_from = Some(s.parse()?);
                 Ok(())
+            } else if meta.path.is_ident("tag") {
+                let value = meta.value()?;
+                let s: syn::LitStr = value.parse()?;
+                tag = Some(s.value());
+                Ok(())
             } else {
                 Err(meta.error("unknown strede attribute"))
             }
@@ -332,6 +341,7 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
         bound,
         from,
         try_from,
+        tag,
     })
 }
 

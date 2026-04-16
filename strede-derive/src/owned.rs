@@ -935,6 +935,20 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
         quote! {}
     };
 
+    if let Some(ref tag_field) = container_attrs.tag {
+        return expand_owned_enum_internally_tagged(
+            name,
+            &classified,
+            tag_field,
+            variant_key_sentinel,
+            &variant_key_impl,
+            krate,
+            &impl_generics,
+            &ty_generics,
+            where_clause,
+        );
+    }
+
     let body = if !has_untagged {
         if has_tagged_unit && !has_tagged_nonunit {
             expand_owned_enum_unit_only(name, &classified, variant_key_sentinel, krate)?
@@ -1837,4 +1851,143 @@ fn gen_untagged_probe_chain_owned(
         arms.extend(arm);
     }
     arms
+}
+
+/// Generate a `DeserializeOwned` impl for an internally tagged enum (`#[strede(tag = "field")]`).
+///
+/// Phase 1: unit variants only. Non-unit variants produce a compile-time error.
+fn expand_owned_enum_internally_tagged(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    tag_field: &str,
+    variant_key_sentinel: usize,
+    variant_key_impl: &TokenStream2,
+    krate: &syn::Path,
+    impl_generics: impl quote::ToTokens,
+    ty_generics: impl quote::ToTokens,
+    where_clause: impl quote::ToTokens,
+) -> syn::Result<TokenStream2> {
+    let has_nonunit = classified
+        .iter()
+        .any(|cv| !matches!(cv.kind, VariantKind::Unit));
+    if has_nonunit {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[strede(tag)] with non-unit variants is not supported yet",
+        ));
+    }
+
+    // __TagKey: matches tag_field → 0, anything else → sentinel(1).
+    let tag_key_impl = gen_chunk_matcher_impl(
+        &format_ident!("__TagKey"),
+        &[(tag_field.to_string(), 0)],
+        1,
+        krate,
+    );
+
+    let unit_match_arms: Vec<_> = classified
+        .iter()
+        .filter(|cv| !cv.untagged)
+        .enumerate()
+        .filter_map(|(idx, cv)| {
+            if matches!(cv.kind, VariantKind::Unit) {
+                let vname = &cv.variant.ident;
+                Some(quote! {
+                    #idx => ::core::result::Result::Ok(
+                        #krate::Probe::Hit((__claim, #name::#vname))
+                    ),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let unit_wildcard = match other_variant(classified) {
+        Some(vname) => quote! {
+            _ => ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name::#vname))),
+        },
+        None => quote! {
+            _ => ::core::result::Result::Ok(#krate::Probe::Miss),
+        },
+    };
+
+    let body = quote! {
+        d.entry(|[__e]| async {
+            let mut __map = #krate::hit!(__e.deserialize_map().await);
+            let mut __matched = #variant_key_sentinel;
+
+            let __claim = loop {
+                match #krate::hit!(__map.next_kv(|[__ke]| async {
+                    let (__c, _k, __ov) = #krate::hit!(__ke.key(
+                        (),
+                        |__k: &__TagKey, [__ve]| {
+                            let __tag_idx = __k.0;
+                            async move {
+                                if __tag_idx == 0usize {
+                                    let (__c, __vk) = #krate::hit!(
+                                        __ve.value::<__VariantKey, _>(()).await
+                                    );
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((
+                                        __c,
+                                        ::core::option::Option::Some(__vk.0),
+                                    )))
+                                } else {
+                                    let __c = __ve.skip().await?;
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((
+                                        __c,
+                                        ::core::option::Option::None::<usize>,
+                                    )))
+                                }
+                            }
+                        },
+                    ).await);
+                    ::core::result::Result::Ok(#krate::Probe::Hit((__c, __ov)))
+                }).await) {
+                    #krate::Chunk::Data((__map_back, ::core::option::Option::Some(__idx))) => {
+                        __matched = __idx;
+                        __map = __map_back;
+                    }
+                    #krate::Chunk::Data((__map_back, ::core::option::Option::None)) => {
+                        __map = __map_back;
+                    }
+                    #krate::Chunk::Done(__c) => break __c,
+                }
+            };
+
+            match __matched {
+                #( #unit_match_arms )*
+                #unit_wildcard
+            }
+        }).await
+    };
+
+    Ok(quote! {
+        #[allow(unreachable_code)]
+        const _: () = {
+            use #krate::{
+                DefaultValue as _, DeserializeOwned as _, DeserializerOwned as _, EntryOwned as _,
+                MapAccessOwned as _, MapKeyEntryOwned as _, MapValueEntryOwned as _,
+                SeqAccessOwned as _, SeqEntryOwned as _, StrAccessOwned as _,
+            };
+
+            struct __VariantKey(usize);
+            #variant_key_impl
+
+            struct __TagKey(usize);
+            #tag_key_impl
+
+            impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
+                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    d: __D,
+                    _extra: (),
+                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
+                where
+                    __D::Error: #krate::DeserializeError,
+                {
+                    #body
+                }
+            }
+        };
+    })
 }

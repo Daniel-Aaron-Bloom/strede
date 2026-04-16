@@ -924,8 +924,8 @@ mod tests {
     use alloc::string::String;
     use alloc::{vec, vec::Vec};
     use strede::{
-        Deserialize, Deserializer, MapAccess, MapKeyEntry, MapValueEntry, Match, Probe, SeqAccess,
-        SeqEntry, StrAccess,
+        Deserialize, Deserializer, MapAccess, MapKeyEntry, MapValueEntry, Match, MatchVals, Probe,
+        SeqAccess, SeqEntry, StrAccess, UnwrapOrElse,
     };
 
     // Minimal no-op executor.  In-memory input never yields `Pending` so all
@@ -3433,6 +3433,155 @@ mod tests {
         assert!(matches!(v, Probe::Miss));
     }
 
+    // ---- MatchVals (borrow family) -------------------------------------------
+
+    #[test]
+    fn match_vals_str_hits_first() {
+        let de = JsonDeserializer::new(b"\"ok\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&str, u8); 3]>>::deserialize(
+                de,
+                [("ok", 0), ("warn", 1), ("error", 2)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, MatchVals(0)))));
+    }
+
+    #[test]
+    fn match_vals_str_hits_last() {
+        let de = JsonDeserializer::new(b"\"error\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&str, u8); 3]>>::deserialize(
+                de,
+                [("ok", 0), ("warn", 1), ("error", 2)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, MatchVals(2)))));
+    }
+
+    #[test]
+    fn match_vals_str_misses_unknown() {
+        let de = JsonDeserializer::new(b"\"unknown\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&str, u8); 3]>>::deserialize(
+                de,
+                [("ok", 0), ("warn", 1), ("error", 2)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_vals_str_hits_escaped() {
+        // "hello\nworld" contains an escape — exercises the chunks path.
+        let de = JsonDeserializer::new(b"\"hello\\nworld\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&str, u8); 2]>>::deserialize(
+                de,
+                [("other", 0), ("hello\nworld", 1)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, MatchVals(1)))));
+    }
+
+    #[test]
+    fn match_vals_bytes_hits() {
+        let de = JsonDeserializer::new(b"\"warn\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&[u8], u8); 2]>>::deserialize(
+                de,
+                [(b"ok".as_ref(), 0), (b"warn".as_ref(), 1)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, MatchVals(1)))));
+    }
+
+    #[test]
+    fn match_vals_bytes_misses() {
+        let de = JsonDeserializer::new(b"\"nope\"");
+        let v = block_on(
+            <MatchVals<u8> as Deserialize<[(&[u8], u8); 2]>>::deserialize(
+                de,
+                [(b"ok".as_ref(), 0), (b"warn".as_ref(), 1)],
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_str_array_hits_any() {
+        let de = JsonDeserializer::new(b"\"b\"");
+        let v = block_on(
+            <Match as Deserialize<[&str; 3]>>::deserialize(de, ["a", "b", "c"]),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, Match))));
+    }
+
+    #[test]
+    fn match_str_array_misses_none() {
+        let de = JsonDeserializer::new(b"\"d\"");
+        let v = block_on(
+            <Match as Deserialize<[&str; 3]>>::deserialize(de, ["a", "b", "c"]),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    #[test]
+    fn match_vals_usize_str_returns_index() {
+        let de = JsonDeserializer::new(b"\"c\"");
+        let v = block_on(
+            <MatchVals<usize> as Deserialize<[&str; 3]>>::deserialize(de, ["a", "b", "c"]),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, MatchVals(2)))));
+    }
+
+    #[test]
+    fn match_vals_usize_str_misses() {
+        let de = JsonDeserializer::new(b"\"z\"");
+        let v = block_on(
+            <MatchVals<usize> as Deserialize<[&str; 3]>>::deserialize(de, ["a", "b", "c"]),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Miss));
+    }
+
+    // ---- UnwrapOrElse (borrow family) ----------------------------------------
+
+    #[test]
+    fn unwrap_or_else_hits_inner() {
+        let de = JsonDeserializer::new(b"\"b\"");
+        let v = block_on(
+            <UnwrapOrElse<MatchVals<usize>> as Deserialize<(_, [(&str, usize); 3])>>::deserialize(
+                de,
+                (async || MatchVals(99usize), [("a", 0), ("b", 1), ("c", 2)]),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, UnwrapOrElse(MatchVals(1))))));
+    }
+
+    #[test]
+    fn unwrap_or_else_falls_back_on_miss() {
+        let de = JsonDeserializer::new(b"\"z\"");
+        let v = block_on(
+            <UnwrapOrElse<MatchVals<usize>> as Deserialize<(_, [(&str, usize); 3])>>::deserialize(
+                de,
+                (async || MatchVals(99usize), [("a", 0), ("b", 1), ("c", 2)]),
+            ),
+        )
+        .unwrap();
+        assert!(matches!(v, Probe::Hit((_, UnwrapOrElse(MatchVals(99))))));
+    }
+
     // ---- tag_facade: TagFilteredMap -------------------------------------------
 
     use strede::tag_facade::{TagFilteredMap, TagFilteredMapDeserializer};
@@ -3589,5 +3738,60 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(v, TagFacadeEmpty {});
+    }
+
+    // ---- derive: #[strede(tag)] internally tagged enum (borrow family) --------
+
+    #[derive(strede_derive::Deserialize, Debug, PartialEq)]
+    #[strede(tag = "type")]
+    enum TaggedEvent {
+        Ping,
+        Pong,
+    }
+
+    #[test]
+    fn derive_internally_tagged_unit_hits_first() {
+        let de = JsonDeserializer::new(br#"{"type": "Ping"}"#);
+        assert_eq!(
+            block_on(TaggedEvent::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TaggedEvent::Ping)),
+        );
+    }
+
+    #[test]
+    fn derive_internally_tagged_unit_hits_second() {
+        let de = JsonDeserializer::new(br#"{"type": "Pong"}"#);
+        assert_eq!(
+            block_on(TaggedEvent::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TaggedEvent::Pong)),
+        );
+    }
+
+    #[test]
+    fn derive_internally_tagged_unit_unknown_variant_misses() {
+        let de = JsonDeserializer::new(br#"{"type": "Unknown"}"#);
+        assert_eq!(
+            block_on(TaggedEvent::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    #[test]
+    fn derive_internally_tagged_unit_missing_tag_misses() {
+        let de = JsonDeserializer::new(br#"{"other": "Ping"}"#);
+        assert_eq!(
+            block_on(TaggedEvent::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Miss),
+        );
+    }
+
+    #[test]
+    fn derive_internally_tagged_unit_tag_after_other_key() {
+        // Tag is not the first key — should still be found.
+        let de = JsonDeserializer::new(br#"{"extra": "ignored", "type": "Ping"}"#);
+        assert_eq!(
+            block_on(TaggedEvent::deserialize(de, ())).map(|p| p.map(|(_, v)| v)),
+            Ok(Probe::Hit(TaggedEvent::Ping)),
+        );
     }
 }

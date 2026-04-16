@@ -119,7 +119,7 @@ impl<T, F: FnOnce() -> T> DefaultWrapper<F> {
 }
 
 // -- utility types --
-pub use impls::{Match, Skip, tag_facade};
+pub use impls::{Match, MatchVals, Skip, UnwrapOrElse, tag_facade};
 
 // -- owned family --
 pub use owned::{

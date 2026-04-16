@@ -1309,9 +1309,11 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::string::String;
+    use core::cell::Cell;
     use strede::{
         DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-        MapValueEntryOwned, Match, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
+        MapValueEntryOwned, Match, MatchVals, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
+        UnwrapOrElse,
     };
 
     // Minimal single-poll executor — in-memory input never yields `Pending`.
@@ -3757,6 +3759,130 @@ mod tests {
         assert!(matches!(probe, Probe::Miss));
     }
 
+    // ---- MatchVals (owned family) --------------------------------------------
+
+    #[test]
+    fn match_vals_str_owned_hits_middle() {
+        let (_, v) = with_chunked(b"\"warn\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <MatchVals<u8> as DeserializeOwned<[(&str, u8); 3]>>::deserialize(
+                de,
+                [("ok", 0), ("warn", 1), ("error", 2)],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(v, MatchVals(1));
+    }
+
+    #[test]
+    fn match_vals_str_owned_misses_unknown() {
+        let probe = with_chunked(b"\"nope\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <MatchVals<u8> as DeserializeOwned<[(&str, u8); 3]>>::deserialize(
+                de,
+                [("ok", 0), ("warn", 1), ("error", 2)],
+            )
+            .await
+            .unwrap()
+        });
+        assert!(matches!(probe, Probe::Miss));
+    }
+
+    #[test]
+    fn match_vals_bytes_owned_hits() {
+        let (_, v) = with_chunked(b"\"error\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <MatchVals<u8> as DeserializeOwned<[(&[u8], u8); 3]>>::deserialize(
+                de,
+                [(b"ok".as_ref(), 0), (b"warn".as_ref(), 1), (b"error".as_ref(), 2)],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(v, MatchVals(2));
+    }
+
+    #[test]
+    fn match_str_array_owned_hits_any() {
+        let (_, v) = with_chunked(b"\"b\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <Match as DeserializeOwned<[&str; 3]>>::deserialize(de, ["a", "b", "c"])
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert!(matches!(v, Match));
+    }
+
+    #[test]
+    fn match_str_array_owned_misses_none() {
+        let probe = with_chunked(b"\"d\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <Match as DeserializeOwned<[&str; 3]>>::deserialize(de, ["a", "b", "c"])
+                .await
+                .unwrap()
+        });
+        assert!(matches!(probe, Probe::Miss));
+    }
+
+    #[test]
+    fn match_vals_usize_str_owned_returns_index() {
+        let (_, v) = with_chunked(b"\"b\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize(de, ["a", "b", "c"])
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, MatchVals(1));
+    }
+
+    #[test]
+    fn match_vals_usize_str_owned_misses() {
+        let probe = with_chunked(b"\"z\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize(de, ["a", "b", "c"])
+                .await
+                .unwrap()
+        });
+        assert!(matches!(probe, Probe::Miss));
+    }
+
+    // ---- UnwrapOrElse (owned family) -----------------------------------------
+
+    #[test]
+    fn unwrap_or_else_owned_hits_inner() {
+        let (_, v) = with_chunked(b"\"b\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <UnwrapOrElse<MatchVals<usize>> as DeserializeOwned<(_, [(&str, usize); 3])>>::deserialize(
+                de,
+                (async || MatchVals(99usize), [("a", 0), ("b", 1), ("c", 2)]),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(v, UnwrapOrElse(MatchVals(1)));
+    }
+
+    #[test]
+    fn unwrap_or_else_owned_falls_back_on_miss() {
+        let (_, v) = with_chunked(b"\"z\"", eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            <UnwrapOrElse<MatchVals<usize>> as DeserializeOwned<(_, [(&str, usize); 3])>>::deserialize(
+                de,
+                (async || MatchVals(99usize), [("a", 0), ("b", 1), ("c", 2)]),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(v, UnwrapOrElse(MatchVals(99)));
+    }
+
     // ---- tag_facade: TagFilteredMapOwned -------------------------------------
 
     use strede::tag_facade::TagFilteredMapOwned;
@@ -3770,114 +3896,139 @@ mod tests {
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     struct TagFacadeEmpty {}
 
+    // Helper: drain a TagFilteredMapOwned and return the non-tag keys.
+    async fn drain_map_keys<'s, 'v, M>(
+        mut map: TagFilteredMapOwned<'s, 'v, M, strede::Skip>,
+    ) -> Result<(M::Claim, alloc::vec::Vec<String>), M::Error>
+    where
+        M: strede::MapAccessOwned<'s>,
+    {
+        let mut keys = alloc::vec::Vec::new();
+        let claim = loop {
+            let result = map
+                .next_kv(|[ke]| async move {
+                    let (c, _, s) = hit!(
+                        ke.key((), |k: &String, [ve]| {
+                            let s = k.clone();
+                            async move {
+                                let c = ve.skip().await?;
+                                Ok(Probe::Hit((c, s)))
+                            }
+                        })
+                        .await
+                    );
+                    Ok(Probe::Hit((c, s)))
+                })
+                .await?
+                .unwrap();
+            match result {
+                strede::Chunk::Data((m, s)) => {
+                    map = m;
+                    keys.push(s);
+                }
+                strede::Chunk::Done(c) => break c,
+            }
+        };
+        Ok((claim, keys))
+    }
+
     #[test]
     fn tag_filtered_map_owned_passes_non_tag_keys() {
         // {"tag": "v", "x": 1, "y": 2} — filter "tag"; only x and y pass through.
-        let result = with_chunked(b"{\"tag\": \"v\", \"x\": 1, \"y\": 2}", eof_loader(), async |shared| {
-            let de = ChunkedJsonDeserializer::new(shared);
-            let (_, keys) = de
-                .entry(|[e]| async move {
-                    let map = hit!(e.deserialize_map().await);
-                    let mut map = TagFilteredMapOwned::new_skip(map, "tag");
-                    let mut keys = alloc::vec::Vec::new();
-                    let claim = loop {
-                        match hit!(
-                            map.next_kv::<1, _, _, String>(|[ke]| async move {
-                                let (c, _, s) = hit!(
-                                    ke.key((), |k: &String, [ve]| {
-                                        let s = k.clone();
-                                        async move {
-                                            let c = ve.skip().await?;
-                                            Ok(Probe::Hit((c, s)))
-                                        }
-                                    })
-                                    .await
-                                );
-                                Ok(Probe::Hit((c, s)))
-                            })
-                            .await
-                        ) {
-                            strede::Chunk::Data((m, s)) => {
-                                map = m;
-                                keys.push(s);
-                            }
-                            strede::Chunk::Done(c) => break c,
-                        }
-                    };
-                    Ok(Probe::Hit((claim, keys)))
-                })
-                .await
-                .unwrap()
-                .unwrap();
-            keys
-        });
-        assert_eq!(result, alloc::vec!["x", "y"]);
+        let (keys, tag_set) = with_chunked(
+            b"{\"tag\": \"v\", \"x\": 1, \"y\": 2}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                let (_, (keys, tag_set)) = de
+                    .entry(|[e]| async move {
+                        let map = hit!(e.deserialize_map().await);
+                        let cell = Cell::new(None);
+                        let map = TagFilteredMapOwned::new_skip(map, "tag", &cell);
+                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
+                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (keys, tag_set)
+            },
+        );
+        assert_eq!(keys, alloc::vec!["x", "y"]);
+        assert!(tag_set, "tag cell should be set after draining");
     }
 
     #[test]
     fn tag_filtered_map_owned_skips_tag_key() {
         // {"type": "Foo", "value": 42} — "type" filtered out, only "value" seen.
-        let result = with_chunked(
+        let (keys, tag_set) = with_chunked(
             b"{\"type\": \"Foo\", \"value\": 42}",
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                let (_, keys) = de
+                let (_, (keys, tag_set)) = de
                     .entry(|[e]| async move {
                         let map = hit!(e.deserialize_map().await);
-                        let mut map = TagFilteredMapOwned::new_skip(map, "type");
-                        let mut keys = alloc::vec::Vec::new();
-                        let claim = loop {
-                            match hit!(
-                                map.next_kv::<1, _, _, String>(|[ke]| async move {
-                                    let (c, _, s) = hit!(
-                                        ke.key((), |k: &String, [ve]| {
-                                            let s = k.clone();
-                                            async move {
-                                                let c = ve.skip().await?;
-                                                Ok(Probe::Hit((c, s)))
-                                            }
-                                        })
-                                        .await
-                                    );
-                                    Ok(Probe::Hit((c, s)))
-                                })
-                                .await
-                            ) {
-                                strede::Chunk::Data((m, s)) => {
-                                    map = m;
-                                    keys.push(s);
-                                }
-                                strede::Chunk::Done(c) => break c,
-                            }
-                        };
-                        Ok(Probe::Hit((claim, keys)))
+                        let cell = Cell::new(None);
+                        let map = TagFilteredMapOwned::new_skip(map, "type", &cell);
+                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
+                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
                     })
                     .await
                     .unwrap()
                     .unwrap();
-                keys
+                (keys, tag_set)
             },
         );
-        assert_eq!(result, alloc::vec!["value"]);
+        assert_eq!(keys, alloc::vec!["value"]);
+        assert!(tag_set, "tag cell should be set after draining");
     }
 
     #[test]
     fn tag_filtered_map_owned_skips_tag_key_in_middle() {
         // {"a": 1, "type": "X", "b": 2} — "type" in the middle is skipped.
-        let result = with_chunked(
+        let (keys, tag_set) = with_chunked(
             b"{\"a\": 1, \"type\": \"X\", \"b\": 2}",
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                let (_, keys) = de
+                let (_, (keys, tag_set)) = de
                     .entry(|[e]| async move {
                         let map = hit!(e.deserialize_map().await);
-                        let mut map = TagFilteredMapOwned::new_skip(map, "type");
+                        let cell = Cell::new(None);
+                        let map = TagFilteredMapOwned::new_skip(map, "type", &cell);
+                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
+                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (keys, tag_set)
+            },
+        );
+        assert_eq!(keys, alloc::vec!["a", "b"]);
+        assert!(tag_set, "tag cell should be set after draining");
+    }
+
+    #[test]
+    fn tag_filtered_map_owned_captures_tag_with_match() {
+        use strede::Match;
+        use strede::tag_facade::TagFilteredMapOwned as TFMO;
+        // {"type": "Foo", "value": 42} — capture tag using Match<"Foo">; cell set on hit.
+        let (keys, matched) = with_chunked(
+            b"{\"type\": \"Foo\", \"value\": 42}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                let (_, (keys, matched)) = de
+                    .entry(|[e]| async move {
+                        let map = hit!(e.deserialize_map().await);
+                        let cell: Cell<Option<Match>> = Cell::new(None);
+                        let mut map = TFMO::new(map, "type", &cell, "Foo");
                         let mut keys = alloc::vec::Vec::new();
                         let claim = loop {
                             match hit!(
-                                map.next_kv::<1, _, _, String>(|[ke]| async move {
+                                map.next_kv(|[ke]| async move {
                                     let (c, _, s) = hit!(
                                         ke.key((), |k: &String, [ve]| {
                                             let s = k.clone();
@@ -3899,15 +4050,62 @@ mod tests {
                                 strede::Chunk::Done(c) => break c,
                             }
                         };
-                        Ok(Probe::Hit((claim, keys)))
+                        Ok(Probe::Hit((claim, (keys, cell.get().is_some()))))
                     })
                     .await
                     .unwrap()
                     .unwrap();
-                keys
+                (keys, matched)
             },
         );
-        assert_eq!(result, alloc::vec!["a", "b"]);
+        assert_eq!(keys, alloc::vec!["value"]);
+        assert!(matched, "Match cell should be set when tag value matches");
+    }
+
+    #[test]
+    fn tag_filtered_map_owned_match_miss_when_tag_differs() {
+        use strede::Match;
+        use strede::tag_facade::TagFilteredMapOwned as TFMO;
+        // {"type": "Bar", "value": 42} — Match for "Foo" should miss; next_kv returns Miss.
+        let missed = with_chunked(
+            b"{\"type\": \"Bar\", \"value\": 42}",
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                let probe = de
+                    .entry(|[e]| async move {
+                        let map = hit!(e.deserialize_map().await);
+                        let cell: Cell<Option<Match>> = Cell::new(None);
+                        let map = TFMO::new(map, "type", &cell, "Foo");
+                        // Attempt to read first key — tag probe for "Foo" misses on "Bar",
+                        // so next_kv returns Miss.
+                        let probe = map
+                            .next_kv(|[ke]| async move {
+                                let (c, _, ()) = hit!(
+                                    ke.key((), |_k: &String, [_ve]| async move {
+                                        panic!("Should not have reached here with bad type");
+                                    })
+                                    .await
+                                );
+                                Ok(Probe::Hit((c, true)))
+                            })
+                            .await?;
+                        // Probe::Miss means the tag key was found but value didn't match.
+                        assert!(matches!(probe, Probe::Miss));
+                        assert!(cell.get().is_none());
+
+                        Ok(Probe::<(_, ())>::Miss)
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(probe, Probe::Miss));
+                true
+            },
+        );
+        assert!(
+            missed,
+            "next_kv should return Miss when tag value doesn't match"
+        );
     }
 
     #[test]
@@ -3921,7 +4119,8 @@ mod tests {
                 let de = ChunkedJsonDeserializer::new(shared);
                 de.entry(|[e]| async move {
                     let map = hit!(e.deserialize_map().await);
-                    let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type");
+                    let _cell = Cell::new(None);
+                    let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type", &_cell);
                     TagFacadePoint::deserialize(facade, ()).await
                 })
                 .await
@@ -3940,7 +4139,8 @@ mod tests {
             let de = ChunkedJsonDeserializer::new(shared);
             de.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type");
+                let _cell = Cell::new(None);
+                let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type", &_cell);
                 TagFacadeEmpty::deserialize(facade, ()).await
             })
             .await
@@ -3948,5 +4148,66 @@ mod tests {
             .unwrap()
         });
         assert_eq!(v, TagFacadeEmpty {});
+    }
+
+    // ---- derive: #[strede(tag)] internally tagged enum (owned family) ---------
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "type")]
+    enum OwnedTaggedEvent {
+        Ping,
+        Pong,
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_unit_hits_first() {
+        let (_, v) = with_chunked(br#"{"type": "Ping"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            OwnedTaggedEvent::deserialize(de, ()).await.unwrap().unwrap()
+        });
+        assert_eq!(v, OwnedTaggedEvent::Ping);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_unit_hits_second() {
+        let (_, v) = with_chunked(br#"{"type": "Pong"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            OwnedTaggedEvent::deserialize(de, ()).await.unwrap().unwrap()
+        });
+        assert_eq!(v, OwnedTaggedEvent::Pong);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_unit_unknown_variant_misses() {
+        let missed = with_chunked(br#"{"type": "Unknown"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let probe = OwnedTaggedEvent::deserialize(de, ()).await.unwrap();
+            matches!(probe, Probe::Miss)
+        });
+        assert!(missed, "unknown variant should return Miss");
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_unit_missing_tag_misses() {
+        let missed = with_chunked(br#"{"other": "Ping"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let probe = OwnedTaggedEvent::deserialize(de, ()).await.unwrap();
+            matches!(probe, Probe::Miss)
+        });
+        assert!(missed, "missing tag field should return Miss");
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_unit_tag_after_other_key() {
+        // Tag is not the first key — should still be found.
+        let (_, v) = with_chunked(
+            br#"{"extra": "ignored", "type": "Ping"}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                OwnedTaggedEvent::deserialize(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(v, OwnedTaggedEvent::Ping);
     }
 }

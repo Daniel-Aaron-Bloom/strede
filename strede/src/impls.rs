@@ -246,6 +246,7 @@ impl<'s, T: ?Sized> DeserializeOwned<'s> for PhantomData<T> {
 ///
 /// Always returns `Probe::Hit(Skip)` on well-formed input — it never misses,
 /// since [`Entry::skip`](crate::Entry::skip) accepts any token type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Skip;
 
 impl<'de> Deserialize<'de> for Skip {
@@ -274,13 +275,378 @@ impl<'s> DeserializeOwned<'s> for Skip {
     }
 }
 
+// --- MatchVals ---
+
+/// Deserializes a string or byte token, matches it against a list of
+/// `(key, value)` pairs supplied as `Extra`, and returns the associated value
+/// for the first matching key.
+///
+/// `T` must be `Copy` because the value must be copied out of the const-generic
+/// `Extra` array (which is itself `Copy` when `T: Copy`).
+///
+/// Returns `Probe::Hit(MatchVals(t))` for the first matching key,
+/// `Probe::Miss` when no key matches or the token is the wrong type.
+///
+/// ```rust,ignore
+/// d.entry(|[e]| async {
+///     let (claim, MatchVals(status)) = hit!(
+///         e.deserialize_value::<MatchVals<u8>, [(&str, u8); 3]>([
+///             ("ok",      0),
+///             ("warn",    1),
+///             ("error",   2),
+///         ]).await
+///     );
+///     Ok(Probe::Hit((claim, status)))
+/// })
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatchVals<T>(pub T);
+
+impl<'de, 'a, T: Copy, const N: usize> Deserialize<'de, [(&'a str, T); N]> for MatchVals<T> {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [(&'a str, T); N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let str_miss = Cell::new(false);
+        let str_miss = &str_miss;
+        d.entry(async |[e1, e2]| {
+            select_probe!(
+                async move {
+                    let (claim, s) = hit!(e1.deserialize_str().await);
+                    for (key, val) in extra {
+                        if s == key {
+                            return Ok(Probe::Hit((claim, MatchVals(val))));
+                        }
+                    }
+                    str_miss.set(true);
+                    Ok(Probe::Miss)
+                },
+                async move {
+                    let mut acc = hit!(e2.deserialize_str_chunks().await);
+                    let mut remaining: [&'a str; N] = extra.map(|(k, _)| k);
+                    let mut alive = [true; N];
+                    let claim = loop {
+                        match acc
+                            .next_str(|chunk| {
+                                for i in 0..N {
+                                    if alive[i] {
+                                        if remaining[i].starts_with(chunk) {
+                                            remaining[i] = &remaining[i][chunk.len()..];
+                                        } else {
+                                            alive[i] = false;
+                                        }
+                                    }
+                                }
+                            })
+                            .await?
+                        {
+                            Chunk::Data((new_acc, ())) => {
+                                if str_miss.get() {
+                                    alive = [false; N];
+                                }
+                                acc = new_acc;
+                            }
+                            Chunk::Done(claim) => break claim,
+                        }
+                    };
+                    for i in 0..N {
+                        if alive[i] && remaining[i].is_empty() {
+                            return Ok(Probe::Hit((claim, MatchVals(extra[i].1))));
+                        }
+                    }
+                    Ok(Probe::Miss)
+                }
+            )
+        })
+        .await
+    }
+}
+
+impl<'de, 'a, T: Copy, const N: usize> Deserialize<'de, [(&'a [u8], T); N]> for MatchVals<T> {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [(&'a [u8], T); N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let bytes_miss = Cell::new(false);
+        let bytes_miss = &bytes_miss;
+        d.entry(async |[e1, e2]| {
+            select_probe!(
+                async move {
+                    let (claim, b) = hit!(e1.deserialize_bytes().await);
+                    for (key, val) in extra {
+                        if b == key {
+                            return Ok(Probe::Hit((claim, MatchVals(val))));
+                        }
+                    }
+                    bytes_miss.set(true);
+                    Ok(Probe::Miss)
+                },
+                async move {
+                    let mut acc = hit!(e2.deserialize_bytes_chunks().await);
+                    let mut remaining: [&'a [u8]; N] = extra.map(|(k, _)| k);
+                    let mut alive = [true; N];
+                    let claim = loop {
+                        match acc
+                            .next_bytes(|chunk| {
+                                for i in 0..N {
+                                    if alive[i] {
+                                        if remaining[i].starts_with(chunk) {
+                                            remaining[i] = &remaining[i][chunk.len()..];
+                                        } else {
+                                            alive[i] = false;
+                                        }
+                                    }
+                                }
+                            })
+                            .await?
+                        {
+                            Chunk::Data((new_acc, ())) => {
+                                if bytes_miss.get() {
+                                    alive = [false; N];
+                                }
+                                acc = new_acc;
+                            }
+                            Chunk::Done(claim) => break claim,
+                        }
+                    };
+                    for i in 0..N {
+                        if alive[i] && remaining[i].is_empty() {
+                            return Ok(Probe::Hit((claim, MatchVals(extra[i].1))));
+                        }
+                    }
+                    Ok(Probe::Miss)
+                }
+            )
+        })
+        .await
+    }
+}
+
+impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a str, T); N]> for MatchVals<T> {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [(&'a str, T); N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        d.entry(|[e]| async {
+            let mut acc = hit!(e.deserialize_str_chunks().await);
+            let mut remaining: [&'a str; N] = extra.map(|(k, _)| k);
+            let mut alive = [true; N];
+            let claim = loop {
+                match acc
+                    .next_str(|chunk| {
+                        for i in 0..N {
+                            if alive[i] {
+                                if remaining[i].starts_with(chunk) {
+                                    remaining[i] = &remaining[i][chunk.len()..];
+                                } else {
+                                    alive[i] = false;
+                                }
+                            }
+                        }
+                    })
+                    .await?
+                {
+                    Chunk::Data((new_acc, ())) => acc = new_acc,
+                    Chunk::Done(claim) => break claim,
+                }
+            };
+            for i in 0..N {
+                if alive[i] && remaining[i].is_empty() {
+                    return Ok(Probe::Hit((claim, MatchVals(extra[i].1))));
+                }
+            }
+            Ok(Probe::Miss)
+        })
+        .await
+    }
+}
+
+impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a [u8], T); N]> for MatchVals<T> {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [(&'a [u8], T); N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        d.entry(|[e]| async {
+            let mut acc = hit!(e.deserialize_bytes_chunks().await);
+            let mut remaining: [&'a [u8]; N] = extra.map(|(k, _)| k);
+            let mut alive = [true; N];
+            let claim = loop {
+                match acc
+                    .next_bytes(|chunk| {
+                        for i in 0..N {
+                            if alive[i] {
+                                if remaining[i].starts_with(chunk) {
+                                    remaining[i] = &remaining[i][chunk.len()..];
+                                } else {
+                                    alive[i] = false;
+                                }
+                            }
+                        }
+                    })
+                    .await?
+                {
+                    Chunk::Data((new_acc, ())) => acc = new_acc,
+                    Chunk::Done(claim) => break claim,
+                }
+            };
+            for i in 0..N {
+                if alive[i] && remaining[i].is_empty() {
+                    return Ok(Probe::Hit((claim, MatchVals(extra[i].1))));
+                }
+            }
+            Ok(Probe::Miss)
+        })
+        .await
+    }
+}
+
+impl<'de, 'a, const N: usize> Deserialize<'de, [&'a str; N]> for MatchVals<usize> {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [&'a str; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let mut i = 0usize;
+        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
+        let probe = <MatchVals<usize> as Deserialize<'de, [(&'a str, usize); N]>>::deserialize(d, pairs).await?;
+        Ok(probe)
+    }
+}
+
+impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for MatchVals<usize> {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [&'a [u8]; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let mut i = 0usize;
+        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
+        let probe = <MatchVals<usize> as Deserialize<'de, [(&'a [u8], usize); N]>>::deserialize(d, pairs).await?;
+        Ok(probe)
+    }
+}
+
+impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for MatchVals<usize> {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [&'a str; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let mut i = 0usize;
+        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
+        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a str, usize); N]>>::deserialize(d, pairs).await?;
+        Ok(probe)
+    }
+}
+
+impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for MatchVals<usize> {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [&'a [u8]; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let mut i = 0usize;
+        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
+        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a [u8], usize); N]>>::deserialize(d, pairs).await?;
+        Ok(probe)
+    }
+}
+
+// --- UnwrapOrElse ---
+
+/// Deserializes `T` normally on `Probe::Hit`, or calls a fallback on `Probe::Miss`
+/// to produce a `T` unconditionally. The fallback receives the skipped token's
+/// `Claim`, so the stream is always advanced exactly once.
+///
+/// `Extra` is `(F, InnerExtra)` where `F: AsyncFnOnce() -> T`. Sync closures
+/// can be wrapped: `async move || value`.
+///
+/// This is the building block for "match-or-default" map key dispatch: pair it
+/// with `MatchVals<usize>` to replace bespoke chunk-matcher code generation with a
+/// single call-site array of `(wire_name, index)` pairs.
+///
+/// ```rust,ignore
+/// // Returns the matched index, or SENTINEL for any unrecognized key.
+/// e.deserialize_value::<UnwrapOrElse<MatchVals<usize>>, _>(
+///     (async || MatchVals(SENTINEL), [("foo", 0usize), ("bar", 1)])
+/// )
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnwrapOrElse<T>(pub T);
+
+// Borrow family
+impl<'de, T, F, Extra> Deserialize<'de, (F, Extra)> for UnwrapOrElse<T>
+where
+    T: Deserialize<'de, Extra>,
+    F: AsyncFnOnce() -> T,
+    Extra: Copy,
+{
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        (fallback, extra): (F, Extra),
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let fallback = Cell::new(Some(fallback));
+        let fallback = &fallback;
+        d.entry(|[e1, e2]| async move {
+            select_probe!(
+                async move {
+                    Ok(e1
+                        .deserialize_value::<T, Extra>(extra)
+                        .await?
+                        .map(|(c, v)| (c, UnwrapOrElse(v))))
+                },
+                async move {
+                    let c = e2.skip().await?;
+                    let fallback = fallback.take().unwrap();
+
+                    Ok(Probe::Hit((c, UnwrapOrElse(fallback().await))))
+                }
+            )
+        })
+        .await
+    }
+}
+
+// Owned family
+impl<'s, T, F, Extra> DeserializeOwned<'s, (F, Extra)> for UnwrapOrElse<T>
+where
+    T: DeserializeOwned<'s, Extra>,
+    F: AsyncFnOnce() -> T,
+    Extra: Copy,
+{
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        (fallback, extra): (F, Extra),
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let fallback = Cell::new(Some(fallback));
+        let fallback = &fallback;
+        d.entry(|[e1, e2]| async move {
+            select_probe!(
+                async move {
+                    Ok(e1
+                        .deserialize_value::<T, Extra>(extra)
+                        .await?
+                        .map(|(c, v)| (c, UnwrapOrElse(v))))
+                },
+                async move {
+                    let c = e2.skip().await?;
+                    let fallback = fallback.take().unwrap();
+                    Ok(Probe::Hit((c, UnwrapOrElse(fallback().await))))
+                }
+            )
+        })
+        .await
+    }
+}
+
 // --- Match ---
 
 /// Deserializes a string or byte token and checks it for an exact match
 /// against a caller-supplied value passed as `Extra`.
 ///
-/// Returns `Probe::Hit(Match)` if the token's content equals `extra`,
-/// `Probe::Miss` if the token is the wrong type or the content differs.
+/// The `Extra` can be:
+/// - `&str` / `&[u8]` — single string/bytes to match.
+/// - `[&str; N]` / `[&[u8]; N]` — match any of N strings/bytes.
+///
+/// Returns `Probe::Hit(Match)` if the token's content equals `extra` (or any
+/// element of `extra`), `Probe::Miss` if the token is the wrong type or the
+/// content differs.
 ///
 /// Useful for discriminated dispatch in `select_probe!`:
 /// ```rust,ignore
@@ -290,6 +656,7 @@ impl<'s> DeserializeOwned<'s> for Skip {
 ///     miss => Ok(Probe::Miss),
 /// })
 /// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Match;
 
 impl<'de, 'a> Deserialize<'de, &'a str> for Match {
@@ -297,55 +664,8 @@ impl<'de, 'a> Deserialize<'de, &'a str> for Match {
         d: D,
         extra: &'a str,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        // Fast path: zero-copy. Compare inside closure so a mismatch returns
-        // Miss without advancing the stream.
-        let string_miss = Cell::new(false);
-        let string_miss = &string_miss;
-        d.entry(async |[e1, e2]| {
-            select_probe!(
-                async move {
-                    let (claim, s) = hit!(e1.deserialize_str().await);
-                    if s == extra {
-                        return Ok(Probe::Hit((claim, Match)));
-                    }
-                    string_miss.set(true);
-                    Ok(Probe::Miss)
-                },
-                async move {
-                    let mut acc = hit!(e2.deserialize_str_chunks().await);
-                    let mut remaining = extra;
-                    let mut matched = true;
-                    let claim = loop {
-                        match acc
-                            .next_str(|chunk| {
-                                if matched {
-                                    if remaining.starts_with(chunk) {
-                                        remaining = &remaining[chunk.len()..];
-                                    } else {
-                                        matched = false;
-                                    }
-                                }
-                            })
-                            .await?
-                        {
-                            Chunk::Data((new_acc, ())) => {
-                                if string_miss.get() {
-                                    matched = false;
-                                }
-                                acc = new_acc;
-                            }
-                            Chunk::Done(claim) => break claim,
-                        }
-                    };
-                    Ok(if matched && remaining.is_empty() {
-                        Probe::Hit((claim, Match))
-                    } else {
-                        Probe::Miss
-                    })
-                }
-            )
-        })
-        .await
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
@@ -354,53 +674,28 @@ impl<'de, 'a> Deserialize<'de, &'a [u8]> for Match {
         d: D,
         extra: &'a [u8],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let bytes_miss = Cell::new(false);
-        let bytes_miss = &bytes_miss;
-        d.entry(async |[e1, e2]| {
-            select_probe!(
-                async move {
-                    let (claim, b) = hit!(e1.deserialize_bytes().await);
-                    if b == extra {
-                        return Ok(Probe::Hit((claim, Match)));
-                    }
-                    bytes_miss.set(true);
-                    Ok(Probe::Miss)
-                },
-                async move {
-                    let mut acc = hit!(e2.deserialize_bytes_chunks().await);
-                    let mut remaining = extra;
-                    let mut matched = true;
-                    let claim = loop {
-                        match acc
-                            .next_bytes(|chunk| {
-                                if matched {
-                                    if remaining.starts_with(chunk) {
-                                        remaining = &remaining[chunk.len()..];
-                                    } else {
-                                        matched = false;
-                                    }
-                                }
-                            })
-                            .await?
-                        {
-                            Chunk::Data((new_acc, ())) => {
-                                if bytes_miss.get() {
-                                    matched = false;
-                                }
-                                acc = new_acc;
-                            }
-                            Chunk::Done(claim) => break claim,
-                        }
-                    };
-                    Ok(if matched && remaining.is_empty() {
-                        Probe::Hit((claim, Match))
-                    } else {
-                        Probe::Miss
-                    })
-                }
-            )
-        })
-        .await
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
+    }
+}
+
+impl<'de, 'a, const N: usize> Deserialize<'de, [&'a str; N]> for Match {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [&'a str; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
+    }
+}
+
+impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for Match {
+    async fn deserialize<D: Deserializer<'de>>(
+        d: D,
+        extra: [&'a [u8]; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
@@ -409,34 +704,8 @@ impl<'s, 'a> DeserializeOwned<'s, &'a str> for Match {
         d: D,
         extra: &'a str,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        d.entry(|[e]| async {
-            let mut acc = hit!(e.deserialize_str_chunks().await);
-            let mut remaining = extra;
-            let mut matched = true;
-            let claim = loop {
-                match acc
-                    .next_str(|chunk| {
-                        if matched {
-                            if remaining.starts_with(chunk) {
-                                remaining = &remaining[chunk.len()..];
-                            } else {
-                                matched = false;
-                            }
-                        }
-                    })
-                    .await?
-                {
-                    Chunk::Data((new_acc, ())) => acc = new_acc,
-                    Chunk::Done(claim) => break claim,
-                }
-            };
-            Ok(if matched && remaining.is_empty() {
-                Probe::Hit((claim, Match))
-            } else {
-                Probe::Miss
-            })
-        })
-        .await
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
@@ -445,34 +714,28 @@ impl<'s, 'a> DeserializeOwned<'s, &'a [u8]> for Match {
         d: D,
         extra: &'a [u8],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        d.entry(|[e]| async {
-            let mut acc = hit!(e.deserialize_bytes_chunks().await);
-            let mut remaining = extra;
-            let mut matched = true;
-            let claim = loop {
-                match acc
-                    .next_bytes(|chunk| {
-                        if matched {
-                            if remaining.starts_with(chunk) {
-                                remaining = &remaining[chunk.len()..];
-                            } else {
-                                matched = false;
-                            }
-                        }
-                    })
-                    .await?
-                {
-                    Chunk::Data((new_acc, ())) => acc = new_acc,
-                    Chunk::Done(claim) => break claim,
-                }
-            };
-            Ok(if matched && remaining.is_empty() {
-                Probe::Hit((claim, Match))
-            } else {
-                Probe::Miss
-            })
-        })
-        .await
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
+    }
+}
+
+impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for Match {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [&'a str; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
+    }
+}
+
+impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for Match {
+    async fn deserialize<D: DeserializerOwned<'s>>(
+        d: D,
+        extra: [&'a [u8]; N],
+    ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
@@ -1902,12 +2165,16 @@ mod std_impls {
 pub mod tag_facade {
     use super::Match;
     use crate::{
-        Chunk, Probe, Skip, borrow::{Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry}, hit, or_miss, owned::{
+        Chunk, Probe, Skip,
+        borrow::{Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry},
+        hit, or_miss,
+        owned::{
             DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
             MapValueEntryOwned,
-        }
+        },
     };
     use core::{array, cell::RefCell, future::Future, marker::PhantomData};
+    use std::cell::Cell;
 
     // -----------------------------------------------------------------------
     // Borrow family
@@ -2536,29 +2803,44 @@ pub mod tag_facade {
     }
 
     /// Owned counterpart to `TagFilteredMap`.
-    pub struct TagFilteredMapOwned<'s, M: MapAccessOwned<'s>, V = Skip> {
-        inner: M,
-        tag_key: &'static str,
-        _marker: core::marker::PhantomData<fn() -> (&'s (), V)>,
+    pub struct TagFilteredMapOwned<'s, 'v, M: MapAccessOwned<'s>, V = Skip, TagExtra: Copy = ()> {
+        pub inner: M,
+        pub tag_key: &'static str,
+        pub tag_value: &'v Cell<Option<V>>,
+        pub extra: TagExtra,
+        pub _marker: core::marker::PhantomData<fn() -> &'s ()>,
     }
 
-    impl<'s, M: MapAccessOwned<'s>, V> TagFilteredMapOwned<'s, M, V> {
-        pub fn new(inner: M, tag_key: &'static str) -> Self {
+    impl<'s, 'v, M: MapAccessOwned<'s>, V, TagExtra: Copy> TagFilteredMapOwned<'s, 'v, M, V, TagExtra> {
+        pub fn new(
+            inner: M,
+            tag_key: &'static str,
+            tag_value: &'v Cell<Option<V>>,
+            extra: TagExtra,
+        ) -> Self {
             Self {
                 inner,
                 tag_key,
+                tag_value,
+                extra,
                 _marker: core::marker::PhantomData,
             }
         }
     }
 
-    impl<'s, M: MapAccessOwned<'s>> TagFilteredMapOwned<'s, M, Skip> {
-        pub fn new_skip(inner: M, tag_key: &'static str) -> Self {
-            Self::new(inner, tag_key)
+    impl<'s, 'v, M: MapAccessOwned<'s>> TagFilteredMapOwned<'s, 'v, M, Skip, ()> {
+        pub fn new_skip(
+            inner: M,
+            tag_key: &'static str,
+            tag_value: &'v Cell<Option<Skip>>,
+        ) -> Self {
+            Self::new(inner, tag_key, tag_value, ())
         }
     }
 
-    impl<'s, M: MapAccessOwned<'s>, V: DeserializeOwned<'s>> MapAccessOwned<'s> for TagFilteredMapOwned<'s, M, V> {
+    impl<'s, 'v, M: MapAccessOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
+        MapAccessOwned<'s> for TagFilteredMapOwned<'s, 'v, M, V, TagExtra>
+    {
         type Error = M::Error;
         type Claim = M::Claim;
         type KeyEntry = M::KeyEntry;
@@ -2567,6 +2849,8 @@ pub mod tag_facade {
             Self {
                 inner: self.inner.fork(),
                 tag_key: self.tag_key,
+                tag_value: self.tag_value,
+                extra: self.extra,
                 _marker: core::marker::PhantomData,
             }
         }
@@ -2581,21 +2865,27 @@ pub mod tag_facade {
         {
             let f = RefCell::new(f);
             let f = &f;
+            let extra = self.extra;
             // If we're only looking for the tag we have to do a special case
             if N == 0 {
                 let tag_key = self.tag_key;
-                let result = hit!(self.inner.next_kv(async |[ke]| {
-                    let (c, _, ()) = hit!(
-                        ke.key(tag_key, |_: &Match, [ve]| async move {
-                            let (c, _v) = hit!(ve.value::<V, ()>(()).await);
-                            Ok(Probe::Hit((c, ())))
+                let result = hit!(
+                    self.inner
+                        .next_kv(async |[ke]| {
+                            let (c, _, v) = hit!(
+                                ke.key(tag_key, |_: &Match, [ve]| async move {
+                                    let (c, v) = hit!(ve.value::<V, TagExtra>(extra).await);
+                                    Ok(Probe::Hit((c, v)))
+                                })
+                                .await
+                            );
+                            Ok(Probe::Hit((c, v)))
                         })
                         .await
-                    );
-                    Ok(Probe::Hit((c, ())))
-                }).await);
+                );
+                let (next_inner, v) = or_miss!(result.data());
                 self.tag_key = "";
-                let (next_inner, ()) = or_miss!(result.data());
+                self.tag_value.set(Some(v));
                 self.inner = next_inner;
             }
 
@@ -2605,48 +2895,52 @@ pub mod tag_facade {
                 let result = hit!(self.inner.next_kv(|mut keys| async move {
                     let ke = keys[0].fork();
                     let f_fut = f.borrow_mut()(keys);
-                    let (c, v) = hit!(crate::select_probe! {
+                    let (c, outcome) = hit!(crate::select_probe! {
                         // Arm 0: check if this key is the tag on a fork.
                         async move {
-                            let (c, _, ()) = hit!(ke.key(tag_key, |_: &Match, [ve]| async move {
+                            let (c, _, v) = hit!(ke.key(tag_key, |_: &Match, [ve]| async move {
                                 kill!(1);
-                                let (c, _v) = hit!(ve.value::<V, ()>(()).await);
-                                Ok(Probe::Hit((c, ())))
+                                let (c, v) = hit!(ve.value::<V, TagExtra>(extra).await);
+                                Ok(Probe::Hit((c, v)))
                             }).await);
-                            Ok(Probe::Hit((c, None)))
+                            Ok(Probe::Hit((c, (Some(v), None::<R>))))
                         },
                         // Arm 1: delegate to f.
                         async move {
                             let (c, r) = hit!(f_fut.await);
-                            Ok(Probe::Hit((c, Some(r))))
+                            Ok(Probe::Hit((c, (None::<V>, Some(r)))))
                         },
                     });
-                    Ok(Probe::Hit((c, v)))
+                    Ok(Probe::Hit((c, outcome)))
                 }).await);
-                match or_miss!(result.data()) { // Miss if no tag found
-                    (next_inner, None) => {
+                match or_miss!(result.data()) {
+                    (next_inner, (Some(v), None)) => {
                         self.tag_key = "";
+                        self.tag_value.set(Some(v));
                         self.inner = next_inner;
                     }
-                    (next_inner, Some(r)) => {
+                    (next_inner, (None, Some(r))) => {
                         self.inner = next_inner;
                         return Ok(Probe::Hit(Chunk::Data((self, r))));
                     }
+                    _ => unreachable!(),
                 }
-                continue;
             }
 
-            // Read everything else normally
+            // Read everything else normally; extract tag_value before consuming self.
             let tag_key = self.tag_key;
+            let tag_value = self.tag_value;
             return self
                 .inner
                 .next_kv(|keys| f.borrow_mut()(keys))
                 .await
                 .map(|p| match p {
                     Probe::Hit(Chunk::Data((new_inner, r))) => Probe::Hit(Chunk::Data((
-                        TagFilteredMapOwned {
+                        Self {
                             inner: new_inner,
                             tag_key,
+                            tag_value,
+                            extra,
                             _marker: PhantomData,
                         },
                         r,
@@ -2660,28 +2954,49 @@ pub mod tag_facade {
     /// Wraps a `TagFilteredMapOwned` as a `DeserializerOwned` so that variant
     /// struct impls can call `T::deserialize_owned` against an already-opened,
     /// tag-filtered map.
-    pub struct TagFilteredMapDeserializerOwned<'s, M: MapAccessOwned<'s>, V = Skip> {
-        pub map: TagFilteredMapOwned<'s, M, V>,
+    pub struct TagFilteredMapDeserializerOwned<
+        's,
+        'v,
+        M: MapAccessOwned<'s>,
+        V = Skip,
+        TagExtra: Copy = (),
+    > {
+        map: TagFilteredMapOwned<'s, 'v, M, V, TagExtra>,
     }
 
-    impl<'s, M: MapAccessOwned<'s>, V> TagFilteredMapDeserializerOwned<'s, M, V> {
-        pub fn new(inner: M, tag_key: &'static str) -> Self {
-            Self { map: TagFilteredMapOwned::new(inner, tag_key) }
+    impl<'s, 'v, M: MapAccessOwned<'s>, V, TagExtra: Copy>
+        TagFilteredMapDeserializerOwned<'s, 'v, M, V, TagExtra>
+    {
+        pub fn new(
+            inner: M,
+            tag_key: &'static str,
+            tag_value: &'v Cell<Option<V>>,
+            extra: TagExtra,
+        ) -> Self {
+            Self {
+                map: TagFilteredMapOwned::new(inner, tag_key, tag_value, extra),
+            }
         }
     }
 
-    impl<'s, M: MapAccessOwned<'s>> TagFilteredMapDeserializerOwned<'s, M, Skip> {
-        pub fn new_skip(inner: M, tag_key: &'static str) -> Self {
-            Self { map: TagFilteredMapOwned::new_skip(inner, tag_key) }
+    impl<'s, 'v, M: MapAccessOwned<'s>> TagFilteredMapDeserializerOwned<'s, 'v, M, Skip, ()> {
+        pub fn new_skip(
+            inner: M,
+            tag_key: &'static str,
+            tag_value: &'v Cell<Option<Skip>>,
+        ) -> Self {
+            Self {
+                map: TagFilteredMapOwned::new_skip(inner, tag_key, tag_value),
+            }
         }
     }
 
-    impl<'s, M: MapAccessOwned<'s>, V: DeserializeOwned<'s>> DeserializerOwned<'s>
-        for TagFilteredMapDeserializerOwned<'s, M, V>
+    impl<'s, 'v, M: MapAccessOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
+        DeserializerOwned<'s> for TagFilteredMapDeserializerOwned<'s, 'v, M, V, TagExtra>
     {
         type Error = M::Error;
         type Claim = M::Claim;
-        type Entry = TagFilteredMapEntryOwned<'s, M, V>;
+        type Entry = TagFilteredMapEntryOwned<'s, 'v, M, V, TagExtra>;
 
         async fn entry<const N: usize, F, Fut, R>(
             self,
@@ -2706,51 +3021,101 @@ pub mod tag_facade {
         }
     }
 
-    pub struct TagFilteredMapEntryOwned<'s, M: MapAccessOwned<'s>, V = Skip> {
-        map: TagFilteredMapOwned<'s, M, V>,
+    pub struct TagFilteredMapEntryOwned<
+        's,
+        'v,
+        M: MapAccessOwned<'s>,
+        V = Skip,
+        TagExtra: Copy = (),
+    > {
+        map: TagFilteredMapOwned<'s, 'v, M, V, TagExtra>,
     }
 
-    impl<'s, M: MapAccessOwned<'s>, V: DeserializeOwned<'s>> EntryOwned<'s>
-        for TagFilteredMapEntryOwned<'s, M, V>
+    impl<'s, 'v, M: MapAccessOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
+        EntryOwned<'s> for TagFilteredMapEntryOwned<'s, 'v, M, V, TagExtra>
     {
         type Error = M::Error;
         type Claim = M::Claim;
         type StrChunks = crate::Never<'s, M::Claim, M::Error>;
         type BytesChunks = crate::Never<'s, M::Claim, M::Error>;
-        type Map = TagFilteredMapOwned<'s, M, V>;
+        type Map = TagFilteredMapOwned<'s, 'v, M, V, TagExtra>;
         type Seq = crate::Never<'s, M::Claim, M::Error>;
 
-        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> { Ok(Probe::Miss) }
+        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
+            Ok(Probe::Miss)
+        }
         async fn deserialize_option<T: DeserializeOwned<'s, Extra>, Extra>(
-            self, _extra: Extra,
-        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> { Ok(Probe::Miss) }
+            self,
+            _extra: Extra,
+        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
         async fn deserialize_value<T: DeserializeOwned<'s, Extra>, Extra>(
-            self, _extra: Extra,
-        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> { Ok(Probe::Miss) }
+            self,
+            _extra: Extra,
+        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
 
         async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
             Ok(Probe::Hit(self.map))
         }
 
         fn fork(&mut self) -> Self {
-            Self { map: self.map.fork() }
+            Self {
+                map: self.map.fork(),
+            }
         }
 
         async fn skip(mut self) -> Result<Self::Claim, Self::Error> {
@@ -2770,7 +3135,9 @@ pub mod tag_facade {
                     .await?
                 {
                     Probe::Hit(Chunk::Done(c)) => return Ok(c),
-                    Probe::Hit(Chunk::Data((new_m, ()))) => { self.map = new_m; }
+                    Probe::Hit(Chunk::Data((new_m, ()))) => {
+                        self.map = new_m;
+                    }
                     Probe::Miss => panic!("unexpected Miss draining map"),
                 }
             }
