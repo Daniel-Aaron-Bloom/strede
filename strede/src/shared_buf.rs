@@ -140,6 +140,7 @@ impl WaiterNode {
 // LoadState
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LoadState<F> {
     /// Current buffer is valid; no load needed or in progress.  Holds the
     /// loader closure.
@@ -152,23 +153,6 @@ enum LoadState<F> {
     /// waiters that wake up must not advance until this transitions back
     /// to Idle.
     Loading,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
-    Idle,
-    NeedsLoad,
-    Loading,
-}
-
-impl<F> LoadState<F> {
-    fn phase(&self) -> Phase {
-        match self {
-            LoadState::Idle(_) => Phase::Idle,
-            LoadState::NeedsLoad(_) => Phase::NeedsLoad,
-            LoadState::Loading => Phase::Loading,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +176,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for LoaderGuard<'s, B, F> {
                 // Hand the baton to another queued waiter so it can drive
                 // the load; otherwise the remaining waiters would sit on
                 // stale wakers forever.  If no waiter remains, the last
-                // WaitFuture's drop (prev_next == null, Phase::NeedsLoad
+                // WaitFuture's drop (prev_next == null, LoadState::NeedsLoad
                 // arm) will revert the state to Idle.
                 self.shared.wake_one();
             } else {
@@ -342,9 +326,15 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<B, F> {
 
     /// Current load phase, ignoring the loader payload.
     #[inline]
-    fn phase(&self) -> Phase {
+    fn phase(&self) -> LoadState<()> {
+        // This gets compiled down to a single CMP instruction, so there really isn't a window
+        // where the intermediary state is visible.
         let state = self.load_state.replace(LoadState::Loading);
-        let phase = state.phase();
+        let phase = match state {
+            LoadState::Idle(_) => LoadState::Idle(()),
+            LoadState::NeedsLoad(_) => LoadState::NeedsLoad(()),
+            LoadState::Loading => LoadState::Loading,
+        };
         self.load_state.set(state);
         phase
     }
@@ -397,7 +387,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<B, F> {
     }
 
     fn fork_helper(&self) -> Handle<'_, B, F> {
-        assert_eq!(self.phase(), Phase::Idle);
+        assert_eq!(self.phase(), LoadState::Idle(()));
         self.remaining.set(self.remaining.get() + 1);
         self.total.set(self.total.get() + 1);
         let id = self.handle_id.get();
@@ -471,7 +461,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
             // Last handle: call the loader, install the new buffer, wake all
             // waiters.  We are the only caller right now (remaining just hit
             // 0, no other Handle is active).
-            assert_eq!(shared.phase(), Phase::Idle);
+            assert_eq!(shared.phase(), LoadState::Idle(()));
             shared.run_loader().await;
             shared.epoch.set(shared.epoch.get() + 1);
             shared.wake_all();
@@ -497,7 +487,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
             // a sibling next() loaded), the state is NeedsLoad and we must
             // drive the load ourselves.  Claim the transition here so siblings
             // woken later see Loading/Idle and don't try to re-load.
-            if shared.phase() == Phase::NeedsLoad {
+            if shared.phase() == LoadState::NeedsLoad(()) {
                 shared.run_loader().await;
                 shared.epoch.set(shared.epoch.get() + 1);
                 // We were the single waiter woken by Handle::drop's wake_one;
@@ -586,7 +576,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
         // First poll: check whether the loader has already fired since this
         // WaitFuture was created, or a drop-triggered needs-load is pending.
         let phase = this.shared.phase();
-        if this.shared.epoch.get() > this.epoch || phase == Phase::NeedsLoad {
+        if this.shared.epoch.get() > this.epoch || phase == LoadState::NeedsLoad(()) {
             return Poll::Ready(this.shared);
         }
 
@@ -610,7 +600,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for WaitFuture<'s, B, F> {
         if self.node.prev_next.is_null() {
             // Was woken (prev_next cleared) but dropped before being re-polled.
             match self.shared.phase() {
-                Phase::NeedsLoad => {
+                LoadState::NeedsLoad(()) => {
                     // We were the wake_one'd waiter for a drop-triggered load
                     // but never re-polled to claim it.  Hand the baton to
                     // another waiter; if none remains, revert to Idle — the
@@ -624,9 +614,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for WaitFuture<'s, B, F> {
                         self.shared.load_state.set(LoadState::Idle(loader));
                     }
                 }
-                Phase::Loading => {
+                LoadState::Loading => {
                     // Should be unreachable: the only waiter that can observe
-                    // Phase::Loading here is the one actively driving the load,
+                    // LoadState::Loading here is the one actively driving the load,
                     // and that waiter's WaitFuture has `resolved = true,
                     // waiting = false` (set when poll returned Ready to the
                     // outer Handle::next), so its Drop exits via the early
@@ -638,7 +628,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for WaitFuture<'s, B, F> {
                         "WaitFuture::drop: Phase::Loading should be unreachable"
                     );
                 }
-                Phase::Idle => {
+                LoadState::Idle(()) => {
                     // Normal next()-driven wakeup: the new cycle's remaining
                     // already counts us; decrement it now since we aren't actually
                     // remaining and no Handle exists yet
@@ -663,22 +653,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for WaitFuture<'s, B, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-
-    // -----------------------------------------------------------------------
-    // Minimal waker infrastructure
-    // -----------------------------------------------------------------------
-
-    /// A no-op waker for futures that complete in a single poll.
-    fn noop_waker() -> Waker {
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
-    }
 
     /// Poll a pinned future once with the noop waker.
     fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
-        let w = noop_waker();
+        let w = strede_test_util::noop_waker();
         let mut cx = Context::from_waker(&w);
         f.poll(&mut cx)
     }

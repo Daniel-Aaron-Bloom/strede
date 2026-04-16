@@ -928,20 +928,7 @@ mod tests {
         SeqAccess, SeqEntry, StrAccess, UnwrapOrElse,
     };
 
-    // Minimal no-op executor.  In-memory input never yields `Pending` so all
-    // futures complete in a single poll.
-    fn block_on<F: core::future::Future>(f: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = core::pin::pin!(f);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("future pending — unexpected for in-memory input"),
-        }
-    }
+    use strede_test_util::block_on;
 
     // Local Deserialize impls for test-only newtypes.
     struct U32(u32);
@@ -3584,7 +3571,8 @@ mod tests {
 
     // ---- tag_facade: TagFilteredMap -------------------------------------------
 
-    use strede::tag_facade::{TagFilteredMap, TagFilteredMapDeserializer};
+    use strede::map_facade::MapDeserializer;
+    use strede::tag_facade::TagFilteredMap;
 
     #[derive(strede_derive::Deserialize, Debug, PartialEq)]
     struct TagFacadePoint {
@@ -3717,7 +3705,7 @@ mod tests {
         let de = JsonDeserializer::new(b"{\"type\": \"Point\", \"x\": 3, \"y\": 7}");
         let (_, v) = block_on(de.entry(|[e]| async move {
             let inner = strede::hit!(e.deserialize_map().await);
-            let facade = TagFilteredMapDeserializer::new(inner, "type");
+            let facade = MapDeserializer::new(TagFilteredMap::new(inner, "type"));
             let (claim, v) = strede::hit!(TagFacadePoint::deserialize(facade, ()).await);
             Ok(Probe::Hit((claim, v)))
         }))
@@ -3731,7 +3719,7 @@ mod tests {
         let de = JsonDeserializer::new(b"{\"type\": \"Empty\"}");
         let (_, v) = block_on(de.entry(|[e]| async move {
             let inner = strede::hit!(e.deserialize_map().await);
-            let facade = TagFilteredMapDeserializer::new(inner, "type");
+            let facade = MapDeserializer::new(TagFilteredMap::new(inner, "type"));
             let (claim, v) = strede::hit!(TagFacadeEmpty::deserialize(facade, ()).await);
             Ok(Probe::Hit((claim, v)))
         }))

@@ -176,16 +176,10 @@ mod tests {
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn noop_waker() -> Waker {
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
-        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
-    }
+    use core::task::{Context, Poll};
 
     fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
-        let w = noop_waker();
+        let w = strede_test_util::noop_waker();
         let mut cx = Context::from_waker(&w);
         f.poll(&mut cx)
     }

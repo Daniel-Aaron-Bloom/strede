@@ -62,7 +62,7 @@ use core::{convert::Infallible, marker::PhantomData};
 
 // -- proc-macros --
 #[doc(hidden)]
-pub use strede_derive::select_probe_inner;
+pub use strede_derive::{declare_comms_inner, select_probe_inner};
 pub use strede_derive::{Deserialize, DeserializeOwned};
 
 // -- shared types --
@@ -119,7 +119,34 @@ impl<T, F: FnOnce() -> T> DefaultWrapper<F> {
 }
 
 // -- utility types --
-pub use impls::{Match, MatchVals, Skip, UnwrapOrElse, tag_facade};
+pub use impls::{Match, MatchVals, Skip, UnwrapOrElse, key_facade, map_facade, tag_facade};
+
+/// Declare one or more [`key_facade::FutureComms`] channels from closures that
+/// produce the inner futures.
+///
+/// Each closure receives `&FutureCommsStorage<…>` and returns a future that
+/// will be pinned in place.  The resulting `FutureComms` value (or tuple of
+/// them) is bound to the given name.
+///
+/// ```rust,ignore
+/// // Single channel:
+/// declare_comms! { let comms = |c| Point::deserialize(KeyDeserializer::new(c), ()) }
+///
+/// // Multiple simultaneous channels:
+/// declare_comms! {
+///     let comms = (
+///         |c| Point2::deserialize(KeyDeserializer::new(c), ()),
+///         |c| Point3::deserialize(KeyDeserializer::new(c), ()),
+///     )
+/// }
+/// // comms is now a tuple (FutureComms<…>, FutureComms<…>)
+/// ```
+#[macro_export]
+macro_rules! declare_comms {
+    ($($tt:tt)*) => {
+        $crate::declare_comms_inner!(@$crate $($tt)*)
+    };
+}
 
 // -- owned family --
 pub use owned::{

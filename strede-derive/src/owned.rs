@@ -455,13 +455,6 @@ fn expand_owned_struct(
             pairs
         })
         .collect();
-    let de_candidate_strs: Vec<&str> = de_field_candidates
-        .iter()
-        .map(|(s, _)| s.as_str())
-        .collect();
-    let de_candidate_dispatch: Vec<usize> =
-        de_field_candidates.iter().map(|(_, idx)| *idx).collect();
-    let de_candidate_count = de_field_candidates.len();
 
     // For deserialize_owned_with / from / try_from: compute value types and conversions.
     let de_classified: Vec<_> = classified_fields
@@ -532,8 +525,6 @@ fn expand_owned_struct(
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
 
-    // sentinel value for unknown field
-    let sentinel = de_field_count;
 
     let known_field_arms: Vec<TokenStream2> = de_field_indices
         .iter()
@@ -612,6 +603,10 @@ fn expand_owned_struct(
         }
     };
 
+    let field_key_sentinel = if allow_unknown_fields { Some(de_field_count) } else { None };
+    let (field_key_type, field_key_extra, field_key_idx) =
+        key_matcher_tokens(&de_field_candidates, field_key_sentinel, krate);
+
     Ok(quote! {
         #[allow(unreachable_code)]
         const _: () = {
@@ -622,59 +617,6 @@ fn expand_owned_struct(
             };
 
             #de_with_wrappers
-
-            // Per-struct field key matcher
-            struct __FieldKey(usize);
-
-            impl<'s> #krate::DeserializeOwned<'s> for __FieldKey {
-                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
-                    d: __D,
-                    _extra: (),
-                ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error> {
-                    d.entry(|[__e]| async {
-                        let mut __chunks = #krate::hit!(__e.deserialize_str_chunks().await);
-
-                        let mut __remaining: [::core::option::Option<&str>; #de_candidate_count] = [
-                            #( ::core::option::Option::Some(#de_candidate_strs), )*
-                        ];
-
-                        let __claim = loop {
-                            match __chunks.next_str(|__chunk| {
-                                let mut __i = 0usize;
-                                while __i < #de_candidate_count {
-                                    if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                        if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
-                                            __remaining[__i] =
-                                                ::core::option::Option::Some(__rest);
-                                        } else {
-                                            __remaining[__i] = ::core::option::Option::None;
-                                        }
-                                    }
-                                    __i += 1;
-                                }
-                            }).await? {
-                                #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
-                                #krate::Chunk::Done(__c) => break __c,
-                            }
-                        };
-
-                        let __dispatch: [usize; #de_candidate_count] = [ #( #de_candidate_dispatch, )* ];
-                        let mut __matched = #sentinel;
-                        let mut __i = 0usize;
-                        while __i < #de_candidate_count {
-                            if let ::core::option::Option::Some("") = __remaining[__i] {
-                                __matched = __dispatch[__i];
-                                break;
-                            }
-                            __i += 1;
-                        }
-
-                        ::core::result::Result::Ok(
-                            #krate::Probe::Hit((__claim, __FieldKey(__matched)))
-                        )
-                    }).await
-                }
-            }
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
                 async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
@@ -700,9 +642,9 @@ fn expand_owned_struct(
                         let __claim = loop {
                             match #krate::hit!(__map.next_kv(|[__ke]| async {
                                 let (__c, _k, __field) = #krate::hit!(__ke.key(
-                                    (),
-                                    |__k: &__FieldKey, [__ve]| {
-                                        let __idx = __k.0;
+                                    #field_key_extra,
+                                    |__k: &#field_key_type, [__ve]| {
+                                        let __idx = #field_key_idx;
                                         async move {
                                             match __idx {
                                                 #( #known_field_arms )*
@@ -924,24 +866,13 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
         })
         .collect();
 
-    let variant_key_impl = if variant_count > 0 {
-        gen_chunk_matcher_impl(
-            &format_ident!("__VariantKey"),
-            &variant_candidates,
-            variant_key_sentinel,
-            krate,
-        )
-    } else {
-        quote! {}
-    };
-
     if let Some(ref tag_field) = container_attrs.tag {
         return expand_owned_enum_internally_tagged(
             name,
             &classified,
             tag_field,
+            &variant_candidates,
             variant_key_sentinel,
-            &variant_key_impl,
             krate,
             &impl_generics,
             &ty_generics,
@@ -953,21 +884,19 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
         if has_tagged_unit && !has_tagged_nonunit {
             expand_owned_enum_unit_only(name, &classified, variant_key_sentinel, krate)?
         } else if !has_tagged_unit && has_tagged_nonunit {
-            expand_owned_enum_map_only(name, &classified, variant_key_sentinel, krate)?
+            expand_owned_enum_map_only(name, &classified, &variant_candidates, variant_key_sentinel, krate)?
         } else {
-            expand_owned_enum_mixed(name, &classified, variant_key_sentinel, krate)?
+            expand_owned_enum_mixed(name, &classified, &variant_candidates, variant_key_sentinel, krate)?
         }
     } else if !has_tagged_unit && !has_tagged_nonunit {
         expand_owned_enum_untagged_only(name, &classified, krate)?
     } else {
-        expand_owned_enum_with_untagged(name, &classified, variant_key_sentinel, krate)?
+        expand_owned_enum_with_untagged(name, &classified, &variant_candidates, variant_key_sentinel, krate)?
     };
 
     // For tuple variants, generate per-variant __TupleVariantOwnedN types.
     let tuple_variant_helpers = gen_tuple_variant_helpers_owned(&classified, krate);
-    // For struct variants, generate per-variant __FieldKeyN and __VariantOwnedN types.
-    let struct_variant_field_keys =
-        gen_struct_variant_field_keys(&classified, krate, container_attrs.rename_all);
+    // For struct variants, generate per-variant __VariantOwnedN types.
     let struct_variant_helpers =
         gen_struct_variant_helpers_owned(&classified, krate, container_attrs.rename_all);
 
@@ -980,11 +909,7 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
                 SeqAccessOwned as _, SeqEntryOwned as _, StrAccessOwned as _,
             };
 
-            struct __VariantKey(usize);
-            #variant_key_impl
-
             #tuple_variant_helpers
-            #struct_variant_field_keys
             #struct_variant_helpers
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
@@ -1002,69 +927,45 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
     })
 }
 
-/// Generate a chunk-matching DeserializeOwned impl for a newtype(usize) key matcher.
+/// Build tokens for using `MatchVals<usize>` / `UnwrapOrElse<MatchVals<usize>>` as a key
+/// deserializer at a `.key()` or `deserialize_value` call site.
 ///
-/// `candidates` is a list of `(wire_name, dispatch_index)` pairs. Multiple candidates
-/// may share the same dispatch index (aliases). The returned `type_name.0` will be the
-/// dispatch index of the first matched candidate, or `sentinel` if none matched.
-fn gen_chunk_matcher_impl(
-    type_name: &syn::Ident,
+/// Returns `(key_type, extra_expr, idx_access)`:
+/// - `key_type`  — the type to annotate `__k` with in the closure
+/// - `extra_expr` — the extra value to pass as the first arg to `.key()`
+/// - `idx_access` — how to extract the matched `usize` from `__k` in the closure body
+///
+/// If `sentinel` is `None`, an unknown string produces `Probe::Miss` (via `MatchVals`).
+/// If `sentinel` is `Some(s)`, an unknown string produces `s` (via `UnwrapOrElse`).
+fn key_matcher_tokens(
     candidates: &[(String, usize)],
-    sentinel: usize,
+    sentinel: Option<usize>,
     krate: &syn::Path,
-) -> TokenStream2 {
-    let candidate_strs: Vec<&str> = candidates.iter().map(|(s, _)| s.as_str()).collect();
-    let dispatch_indices: Vec<usize> = candidates.iter().map(|(_, idx)| *idx).collect();
-    let candidate_count = candidates.len();
-    quote! {
-        impl<'s> #krate::DeserializeOwned<'s> for #type_name {
-            async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
-                d: __D,
-                _extra: (),
-            ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error> {
-                d.entry(|[__e]| async {
-                    let mut __chunks = #krate::hit!(__e.deserialize_str_chunks().await);
+) -> (TokenStream2, TokenStream2, TokenStream2) {
+    let keys: Vec<&str> = candidates.iter().map(|(s, _)| s.as_str()).collect();
+    let indices: Vec<usize> = candidates.iter().map(|(_, i)| *i).collect();
+    let indices_lit: Vec<proc_macro2::Literal> = indices.iter().map(|i| proc_macro2::Literal::usize_suffixed(*i)).collect();
+    let count = proc_macro2::Literal::usize_suffixed(candidates.len());
+    let array_expr = quote! {
+        {
+            let __arr: [(&'static str, usize); #count] = [ #( (#keys, #indices_lit), )* ];
+            __arr
+        }
+    };
 
-                    let mut __remaining: [::core::option::Option<&str>; #candidate_count] = [
-                        #( ::core::option::Option::Some(#candidate_strs), )*
-                    ];
-
-                    let __claim = loop {
-                        match __chunks.next_str(|__chunk| {
-                            let mut __i = 0usize;
-                            while __i < #candidate_count {
-                                if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
-                                        __remaining[__i] =
-                                            ::core::option::Option::Some(__rest);
-                                    } else {
-                                        __remaining[__i] = ::core::option::Option::None;
-                                    }
-                                }
-                                __i += 1;
-                            }
-                        }).await? {
-                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            #krate::Chunk::Done(__c) => break __c,
-                        }
-                    };
-
-                    let __dispatch: [usize; #candidate_count] = [ #( #dispatch_indices, )* ];
-                    let mut __matched = #sentinel;
-                    let mut __i = 0usize;
-                    while __i < #candidate_count {
-                        if let ::core::option::Option::Some("") = __remaining[__i] {
-                            __matched = __dispatch[__i];
-                            break;
-                        }
-                        __i += 1;
-                    }
-
-                    ::core::result::Result::Ok(
-                        #krate::Probe::Hit((__claim, #type_name(__matched)))
-                    )
-                }).await
-            }
+    match sentinel {
+        None => (
+            quote! { #krate::MatchVals<usize> },
+            array_expr,
+            quote! { __k.0 },
+        ),
+        Some(s) => {
+            let s_lit = proc_macro2::Literal::usize_suffixed(s);
+            (
+                quote! { #krate::UnwrapOrElse<#krate::MatchVals<usize>> },
+                quote! { (async || #krate::MatchVals(#s_lit), #array_expr) },
+                quote! { __k.0.0 },
+            )
         }
     }
 }
@@ -1137,52 +1038,13 @@ fn gen_tuple_variant_helpers_owned(
     tokens
 }
 
-/// Generate __FieldKeyN structs and impls for each struct variant.
-fn gen_struct_variant_field_keys(
-    classified: &[ClassifiedVariant],
-    krate: &syn::Path,
-    rename_all: Option<crate::common::RenameAll>,
-) -> TokenStream2 {
-    let mut tokens = TokenStream2::new();
-    for cv in classified.iter() {
-        if let VariantKind::Struct(fields) = &cv.kind {
-            let key_name = format_ident!("__FieldKey{}", cv.index);
-            let cf = match classify_fields(fields, rename_all) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let field_count = cf.len();
-            let sentinel = field_count;
-            let field_candidates: Vec<(String, usize)> = cf
-                .iter()
-                .enumerate()
-                .flat_map(|(idx, f)| {
-                    let mut pairs = vec![(f.wire_name.clone(), idx)];
-                    for alias in &f.aliases {
-                        pairs.push((alias.clone(), idx));
-                    }
-                    pairs
-                })
-                .collect();
-
-            let struct_def = quote! { struct #key_name(usize); };
-            let impl_block = gen_chunk_matcher_impl(&key_name, &field_candidates, sentinel, krate);
-
-            tokens.extend(struct_def);
-            tokens.extend(impl_block);
-        }
-    }
-    tokens
-}
 
 fn expand_owned_enum_unit_only(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
-    _variant_key_sentinel: usize,
+    variant_key_sentinel: usize,
     krate: &syn::Path,
 ) -> syn::Result<TokenStream2> {
-    let variant_count: usize = classified.iter().filter(|cv| !cv.untagged).count();
-
     let candidates: Vec<(String, usize)> = classified
         .iter()
         .filter(|cv| !cv.untagged)
@@ -1195,9 +1057,10 @@ fn expand_owned_enum_unit_only(
             pairs
         })
         .collect();
-    let candidate_strs: Vec<&str> = candidates.iter().map(|(s, _)| s.as_str()).collect();
-    let candidate_dispatch: Vec<usize> = candidates.iter().map(|(_, idx)| *idx).collect();
-    let candidate_count = candidates.len();
+
+    let has_other = other_variant(classified).is_some();
+    let sentinel = if has_other { Some(variant_key_sentinel) } else { None };
+    let (key_type, key_extra, key_idx) = key_matcher_tokens(&candidates, sentinel, krate);
 
     let unit_match_arms: Vec<_> = classified
         .iter()
@@ -1228,43 +1091,10 @@ fn expand_owned_enum_unit_only(
 
     Ok(quote! {
         d.entry(|[__e]| async {
-            let mut __chunks = #krate::hit!(__e.deserialize_str_chunks().await);
-
-            let mut __remaining: [::core::option::Option<&str>; #candidate_count] = [
-                #( ::core::option::Option::Some(#candidate_strs), )*
-            ];
-
-            let __claim = loop {
-                match __chunks.next_str(|__chunk| {
-                    let mut __i = 0usize;
-                    while __i < #candidate_count {
-                        if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                            if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
-                                __remaining[__i] =
-                                    ::core::option::Option::Some(__rest);
-                            } else {
-                                __remaining[__i] = ::core::option::Option::None;
-                            }
-                        }
-                        __i += 1;
-                    }
-                }).await? {
-                    #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
-                    #krate::Chunk::Done(__c) => break __c,
-                }
-            };
-
-            let __dispatch: [usize; #candidate_count] = [ #( #candidate_dispatch, )* ];
-            let mut __matched = #variant_count; // sentinel
-            let mut __i = 0usize;
-            while __i < #candidate_count {
-                if let ::core::option::Option::Some("") = __remaining[__i] {
-                    __matched = __dispatch[__i];
-                    break;
-                }
-                __i += 1;
-            }
-
+            let (__claim, __k) = #krate::hit!(
+                __e.deserialize_value::<#key_type, _>(#key_extra).await
+            );
+            let __matched = #key_idx;
             match __matched {
                 #( #unit_match_arms )*
                 #unit_wildcard
@@ -1276,10 +1106,11 @@ fn expand_owned_enum_unit_only(
 fn expand_owned_enum_map_only(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
+    variant_candidates: &[(String, usize)],
     variant_key_sentinel: usize,
     krate: &syn::Path,
 ) -> syn::Result<TokenStream2> {
-    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
+    let map_body = gen_owned_enum_map_body(name, classified, variant_candidates, variant_key_sentinel, krate);
     Ok(quote! {
         d.entry(|[__e]| async {
             let mut __map = #krate::hit!(__e.deserialize_map().await);
@@ -1291,15 +1122,16 @@ fn expand_owned_enum_map_only(
 fn expand_owned_enum_mixed(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
+    variant_candidates: &[(String, usize)],
     variant_key_sentinel: usize,
     krate: &syn::Path,
 ) -> syn::Result<TokenStream2> {
-    // Build the string chunk-match for tagged unit variant names.
+    // Build candidates for known unit str variants only (no sentinel — unknown strings
+    // are handled by a dedicated arm below when has_other is true).
     let tagged_units: Vec<_> = classified
         .iter()
-        .filter(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit))
+        .filter(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit) && !cv.other)
         .collect();
-    let unit_count = tagged_units.len();
 
     let unit_candidates: Vec<(String, usize)> = tagged_units
         .iter()
@@ -1312,9 +1144,10 @@ fn expand_owned_enum_mixed(
             pairs
         })
         .collect();
-    let unit_candidate_strs: Vec<&str> = unit_candidates.iter().map(|(s, _)| s.as_str()).collect();
-    let unit_candidate_dispatch: Vec<usize> = unit_candidates.iter().map(|(_, idx)| *idx).collect();
-    let unit_candidate_count = unit_candidates.len();
+    // No sentinel — plain MatchVals; if the token is not a matching str it returns Miss
+    // and the next arm handles it.
+    let (unit_key_type, unit_key_extra, unit_key_idx) =
+        key_matcher_tokens(&unit_candidates, None, krate);
 
     let unit_match_arms: Vec<_> = tagged_units
         .iter()
@@ -1323,105 +1156,107 @@ fn expand_owned_enum_mixed(
             let vname = &cv.variant.ident;
             quote! {
                 #local_idx => {
-                    return ::core::result::Result::Ok(
+                    ::core::result::Result::Ok(
                         #krate::Probe::Hit((__unit_claim, #name::#vname))
-                    );
+                    )
                 }
             }
         })
         .collect();
 
-    let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
+    let map_body = gen_owned_enum_map_body(name, classified, variant_candidates, variant_key_sentinel, krate);
 
-    let mixed_str_wildcard = match other_variant(classified) {
-        Some(vname) => quote! {
-            _ => {
-                return ::core::result::Result::Ok(
-                    #krate::Probe::Hit((__unit_claim, #name::#vname))
-                );
-            }
-        },
-        None => quote! {
-            _ => {
-                return ::core::result::Result::Ok(#krate::Probe::Miss);
-            }
-        },
-    };
+    let has_other = other_variant(classified).is_some();
 
-    // Sequential probing: try str_chunks first (unit variants), then map.
-    Ok(quote! {
-        d.entry(|[__e1, __e2]| async {
-            // Try string first (unit variants).
-            match __e1.deserialize_str_chunks().await? {
-                #krate::Probe::Hit(__chunks) => {
-                    let mut __chunks = __chunks;
-                    let mut __remaining: [::core::option::Option<&str>; #unit_candidate_count] = [
-                        #( ::core::option::Option::Some(#unit_candidate_strs), )*
-                    ];
-
-                    let __unit_claim = loop {
-                        match __chunks.next_str(|__chunk| {
-                            let mut __i = 0usize;
-                            while __i < #unit_candidate_count {
-                                if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
-                                        __remaining[__i] =
-                                            ::core::option::Option::Some(__rest);
-                                    } else {
-                                        __remaining[__i] = ::core::option::Option::None;
-                                    }
+    if has_other {
+        let other_vname = other_variant(classified).unwrap();
+        // 3 arms: known str, unknown str drain → other, map
+        Ok(quote! {
+            d.entry(|[__e1, __e2, __e3]| async {
+                #krate::select_probe! {
+                    // Arm 1: known unit str variants
+                    async move {
+                        match __e1.deserialize_value::<#unit_key_type, _>(#unit_key_extra).await? {
+                            #krate::Probe::Hit((__unit_claim, __k)) => {
+                                let __matched = #unit_key_idx;
+                                match __matched {
+                                    #( #unit_match_arms, )*
+                                    _ => unreachable!(),
                                 }
-                                __i += 1;
                             }
-                        }).await? {
-                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            #krate::Chunk::Done(__c) => break __c,
+                            #krate::Probe::Miss => ::core::result::Result::Ok(#krate::Probe::Miss),
                         }
-                    };
-
-                    let __dispatch: [usize; #unit_candidate_count] = [ #( #unit_candidate_dispatch, )* ];
-                    let mut __matched = #unit_count; // sentinel
-                    let mut __i = 0usize;
-                    while __i < #unit_candidate_count {
-                        if let ::core::option::Option::Some("") = __remaining[__i] {
-                            __matched = __dispatch[__i];
-                            break;
-                        }
-                        __i += 1;
-                    }
-
-                    match __matched {
-                        #( #unit_match_arms )*
-                        #mixed_str_wildcard
-                    }
+                    },
+                    // Arm 2: drain any remaining string → other
+                    async move {
+                        let mut __str_acc = #krate::hit!(__e2.deserialize_str_chunks().await);
+                        let __claim = loop {
+                            match __str_acc.next_str(|_| {}).await? {
+                                #krate::Chunk::Data((__c, ())) => { __str_acc = __c; }
+                                #krate::Chunk::Done(__c) => break __c,
+                            }
+                        };
+                        ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name::#other_vname)))
+                    },
+                    // Arm 3: map (non-unit variants)
+                    async move {
+                        let mut __map = #krate::hit!(__e3.deserialize_map().await);
+                        #map_body
+                    },
+                    miss => ::core::result::Result::Ok(#krate::Probe::Miss),
                 }
-                #krate::Probe::Miss => {}
-            }
-
-            // Try map (non-unit variants).
-            let mut __map = #krate::hit!(__e2.deserialize_map().await);
-            #map_body
-        }).await
-    })
+            }).await
+        })
+    } else {
+        // 2 arms: known str, map
+        Ok(quote! {
+            d.entry(|[__e1, __e2]| async {
+                #krate::select_probe! {
+                    // Arm 1: known unit str variants
+                    async move {
+                        match __e1.deserialize_value::<#unit_key_type, _>(#unit_key_extra).await? {
+                            #krate::Probe::Hit((__unit_claim, __k)) => {
+                                let __matched = #unit_key_idx;
+                                match __matched {
+                                    #( #unit_match_arms, )*
+                                    _ => unreachable!(),
+                                }
+                            }
+                            #krate::Probe::Miss => ::core::result::Result::Ok(#krate::Probe::Miss),
+                        }
+                    },
+                    // Arm 2: map (non-unit variants)
+                    async move {
+                        let mut __map = #krate::hit!(__e2.deserialize_map().await);
+                        #map_body
+                    },
+                    miss => ::core::result::Result::Ok(#krate::Probe::Miss),
+                }
+            }).await
+        })
+    }
 }
 
 /// Generate the body that reads a single-key map for non-unit variant dispatch (owned family).
 fn gen_owned_enum_map_body(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
+    variant_candidates: &[(String, usize)],
     variant_key_sentinel: usize,
     krate: &syn::Path,
 ) -> TokenStream2 {
     let value_dispatch_arms =
         gen_owned_value_dispatch_arms(name, classified, variant_key_sentinel, krate);
+    let (variant_key_type, variant_key_extra, variant_key_idx) =
+        key_matcher_tokens(variant_candidates, Some(variant_key_sentinel), krate);
 
     quote! {
         // Read the single key-value pair.
         let __chunk = #krate::hit!(__map.next_kv(|[__ke]| async {
             let (__c, _k, __v) = #krate::hit!(__ke.key(
-                (),
-                |__k: &__VariantKey, [__ve]| {
-                    let __idx = __k.0;
+                #variant_key_extra,
+                |__k: &#variant_key_type, [__ve]| {
+                    let __idx = #variant_key_idx;
                     async move {
                         #value_dispatch_arms
                     }
@@ -1516,7 +1351,6 @@ fn gen_struct_variant_helpers_owned(
     for cv in classified.iter() {
         if let VariantKind::Struct(fields) = &cv.kind {
             let helper_name = format_ident!("__VariantOwned{}", cv.index);
-            let field_key_name = format_ident!("__FieldKey{}", cv.index);
             let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
             let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
             let cf = match classify_fields(fields, rename_all) {
@@ -1531,6 +1365,20 @@ fn gen_struct_variant_helpers_owned(
                 .map(|n| format_ident!("__f_{}", n))
                 .collect();
             let field_finalizers = gen_field_finalizers(&field_names, &acc_names, &cf, krate);
+            // No sentinel: struct variant fields don't allow unknown, unknown = Miss
+            let field_candidates: Vec<(String, usize)> = cf
+                .iter()
+                .enumerate()
+                .flat_map(|(idx, f)| {
+                    let mut pairs = vec![(f.wire_name.clone(), idx)];
+                    for alias in &f.aliases {
+                        pairs.push((alias.clone(), idx));
+                    }
+                    pairs
+                })
+                .collect();
+            let (field_key_type, field_key_extra, field_key_idx) =
+                key_matcher_tokens(&field_candidates, None, krate);
 
             tokens.extend(quote! {
                 #[allow(non_camel_case_types)]
@@ -1557,9 +1405,9 @@ fn gen_struct_variant_helpers_owned(
                             let __claim = loop {
                                 match #krate::hit!(__map.next_kv(|[__ke]| async {
                                     let (__c, _k, __fv) = #krate::hit!(__ke.key(
-                                        (),
-                                        |__k: &#field_key_name, [__ve]| {
-                                            let __fidx = __k.0;
+                                        #field_key_extra,
+                                        |__k: &#field_key_type, [__ve]| {
+                                            let __fidx = #field_key_idx;
                                             async move {
                                                 match __fidx {
                                                     #(
@@ -1633,6 +1481,7 @@ fn expand_owned_enum_untagged_only(
 fn expand_owned_enum_with_untagged(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
+    variant_candidates: &[(String, usize)],
     variant_key_sentinel: usize,
     krate: &syn::Path,
 ) -> syn::Result<TokenStream2> {
@@ -1667,17 +1516,24 @@ fn expand_owned_enum_with_untagged(
 
     // Tagged str section (unit variants via str_chunks).
     let str_section = if let Some(h) = &str_handle {
-        let unit_variant_strs: Vec<_> = classified
-            .iter()
-            .filter(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit))
-            .map(|cv| cv.wire_name.clone())
-            .collect();
-        let unit_count = unit_variant_strs.len();
-
         let tagged_units: Vec<_> = classified
             .iter()
             .filter(|cv| !cv.untagged && matches!(cv.kind, VariantKind::Unit))
             .collect();
+        let unit_candidates: Vec<(String, usize)> = tagged_units
+            .iter()
+            .enumerate()
+            .flat_map(|(local_idx, cv)| {
+                let mut pairs = vec![(cv.wire_name.clone(), local_idx)];
+                for alias in &cv.aliases {
+                    pairs.push((alias.clone(), local_idx));
+                }
+                pairs
+            })
+            .collect();
+        // No other variant in the with_untagged case — unknown string = Miss
+        let (unit_key_type, unit_key_extra, unit_key_idx) =
+            key_matcher_tokens(&unit_candidates, None, krate);
         let unit_match_arms: Vec<_> = tagged_units
             .iter()
             .enumerate()
@@ -1694,40 +1550,9 @@ fn expand_owned_enum_with_untagged(
             .collect();
 
         quote! {
-            match #h.deserialize_str_chunks().await? {
-                #krate::Probe::Hit(__chunks) => {
-                    let mut __chunks = __chunks;
-                    let mut __remaining: [::core::option::Option<&str>; #unit_count] = [
-                        #( ::core::option::Option::Some(#unit_variant_strs), )*
-                    ];
-                    let __unit_claim = loop {
-                        match __chunks.next_str(|__chunk| {
-                            let mut __i = 0usize;
-                            while __i < #unit_count {
-                                if let ::core::option::Option::Some(__s) = __remaining[__i] {
-                                    if let ::core::option::Option::Some(__rest) = __s.strip_prefix(__chunk) {
-                                        __remaining[__i] =
-                                            ::core::option::Option::Some(__rest);
-                                    } else {
-                                        __remaining[__i] = ::core::option::Option::None;
-                                    }
-                                }
-                                __i += 1;
-                            }
-                        }).await? {
-                            #krate::Chunk::Data((__c, ())) => { __chunks = __c; }
-                            #krate::Chunk::Done(__c) => break __c,
-                        }
-                    };
-                    let mut __matched = #unit_count;
-                    let mut __i = 0usize;
-                    while __i < #unit_count {
-                        if let ::core::option::Option::Some("") = __remaining[__i] {
-                            __matched = __i;
-                            break;
-                        }
-                        __i += 1;
-                    }
+            match #h.deserialize_value::<#unit_key_type, _>(#unit_key_extra).await? {
+                #krate::Probe::Hit((__unit_claim, __k)) => {
+                    let __matched = #unit_key_idx;
                     match __matched {
                         #( #unit_match_arms )*
                         _ => {
@@ -1744,7 +1569,7 @@ fn expand_owned_enum_with_untagged(
 
     // Tagged map section.
     let map_section = if let Some(h) = &map_handle {
-        let map_body = gen_owned_enum_map_body(name, classified, variant_key_sentinel, krate);
+        let map_body = gen_owned_enum_map_body(name, classified, variant_candidates, variant_key_sentinel, krate);
         quote! {
             match #h.deserialize_map().await? {
                 #krate::Probe::Hit(mut __map) => {
@@ -1860,8 +1685,8 @@ fn expand_owned_enum_internally_tagged(
     name: &syn::Ident,
     classified: &[ClassifiedVariant],
     tag_field: &str,
+    variant_candidates: &[(String, usize)],
     variant_key_sentinel: usize,
-    variant_key_impl: &TokenStream2,
     krate: &syn::Path,
     impl_generics: impl quote::ToTokens,
     ty_generics: impl quote::ToTokens,
@@ -1878,12 +1703,11 @@ fn expand_owned_enum_internally_tagged(
     }
 
     // __TagKey: matches tag_field → 0, anything else → sentinel(1).
-    let tag_key_impl = gen_chunk_matcher_impl(
-        &format_ident!("__TagKey"),
-        &[(tag_field.to_string(), 0)],
-        1,
-        krate,
-    );
+    let tag_candidates = vec![(tag_field.to_string(), 0usize)];
+    let (tag_key_type, tag_key_extra, tag_key_idx) =
+        key_matcher_tokens(&tag_candidates, Some(1), krate);
+    let (variant_key_type, variant_key_extra, variant_key_idx) =
+        key_matcher_tokens(variant_candidates, Some(variant_key_sentinel), krate);
 
     let unit_match_arms: Vec<_> = classified
         .iter()
@@ -1920,17 +1744,17 @@ fn expand_owned_enum_internally_tagged(
             let __claim = loop {
                 match #krate::hit!(__map.next_kv(|[__ke]| async {
                     let (__c, _k, __ov) = #krate::hit!(__ke.key(
-                        (),
-                        |__k: &__TagKey, [__ve]| {
-                            let __tag_idx = __k.0;
+                        #tag_key_extra,
+                        |__k: &#tag_key_type, [__ve]| {
+                            let __tag_idx = #tag_key_idx;
                             async move {
                                 if __tag_idx == 0usize {
-                                    let (__c, __vk) = #krate::hit!(
-                                        __ve.value::<__VariantKey, _>(()).await
+                                    let (__c, __k) = #krate::hit!(
+                                        __ve.value::<#variant_key_type, _>(#variant_key_extra).await
                                     );
                                     ::core::result::Result::Ok(#krate::Probe::Hit((
                                         __c,
-                                        ::core::option::Option::Some(__vk.0),
+                                        ::core::option::Option::Some(#variant_key_idx),
                                     )))
                                 } else {
                                     let __c = __ve.skip().await?;
@@ -1970,12 +1794,6 @@ fn expand_owned_enum_internally_tagged(
                 MapAccessOwned as _, MapKeyEntryOwned as _, MapValueEntryOwned as _,
                 SeqAccessOwned as _, SeqEntryOwned as _, StrAccessOwned as _,
             };
-
-            struct __VariantKey(usize);
-            #variant_key_impl
-
-            struct __TagKey(usize);
-            #tag_key_impl
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
                 async fn deserialize<__D: #krate::DeserializerOwned<'s>>(

@@ -4,6 +4,7 @@ use syn::{DeriveInput, parse_macro_input};
 
 mod borrow;
 mod common;
+mod declare_comms;
 mod owned;
 mod select_probe;
 
@@ -18,6 +19,11 @@ pub fn derive_deserialize(input: TokenStream) -> TokenStream {
     borrow::expand(input)
         .unwrap_or_else(|e| e.into_compile_error())
         .into()
+}
+
+#[proc_macro]
+pub fn declare_comms_inner(input: TokenStream) -> TokenStream {
+    declare_comms::declare_comms_impl(input)
 }
 
 #[proc_macro_derive(DeserializeOwned, attributes(strede))]

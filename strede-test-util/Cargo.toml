@@ -1,0 +1,9 @@
+[package]
+name = "strede-test-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Test helpers for strede crates (noop waker, block_on executors)"
+publish = false

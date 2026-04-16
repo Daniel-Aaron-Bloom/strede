@@ -30,7 +30,6 @@ use strede::{
     MapAccessOwned, MapKeyEntryOwned, MapValueEntryOwned, Probe, SeqAccessOwned, SeqEntryOwned,
     SharedBuf, StrAccessOwned, hit,
 };
-
 use crate::JsonError;
 use crate::token::{self, SimpleToken, StrChunk, Token, Tokenizer};
 
@@ -1309,26 +1308,15 @@ mod tests {
     extern crate alloc;
     use super::*;
     use alloc::string::String;
+    use strede::key_facade::KeyDeserializer;
     use core::cell::Cell;
     use strede::{
         DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
         MapValueEntryOwned, Match, MatchVals, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
-        UnwrapOrElse,
+        UnwrapOrElse, declare_comms, Chunk
     };
 
-    // Minimal single-poll executor — in-memory input never yields `Pending`.
-    fn block_on<F: core::future::Future>(f: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = core::pin::pin!(f);
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => v,
-            Poll::Pending => panic!("future pending — unexpected for in-memory input"),
-        }
-    }
+    use strede_test_util::{block_on, block_on_loop};
 
     /// Run a chunked deserialization with `input` loaded as a single chunk.
     /// The loader returns an empty slice on the second call (EOF).
@@ -1338,6 +1326,16 @@ mod tests {
         f: impl AsyncFnOnce(&mut SharedBuf<&[u8], L>) -> R,
     ) -> R {
         block_on(SharedBuf::with_async(input, loader, f))
+    }
+
+    /// Like `with_chunked` but uses a spin-loop executor for tests that involve
+    /// cooperative `Pending` yields (e.g. `key_facade`).
+    fn with_chunked_spin<L: AsyncFnMut(&mut &[u8]), R>(
+        input: &[u8],
+        loader: L,
+        f: impl AsyncFnOnce(&mut SharedBuf<&[u8], L>) -> R,
+    ) -> R {
+        block_on_loop(SharedBuf::with_async(input, loader, f))
     }
 
     fn eof_loader() -> impl AsyncFnMut(&mut &[u8]) {
@@ -4110,7 +4108,8 @@ mod tests {
 
     #[test]
     fn tag_filtered_map_owned_deserializes_struct() {
-        use strede::tag_facade::TagFilteredMapDeserializerOwned;
+        use strede::map_facade::MapDeserializerOwned;
+        use strede::tag_facade::TagFilteredMapOwned;
 
         let (_, v) = with_chunked(
             b"{\"type\": \"Point\", \"x\": 3, \"y\": 7}",
@@ -4120,7 +4119,8 @@ mod tests {
                 de.entry(|[e]| async move {
                     let map = hit!(e.deserialize_map().await);
                     let _cell = Cell::new(None);
-                    let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type", &_cell);
+                    let facade =
+                        MapDeserializerOwned::new(TagFilteredMapOwned::new_skip(map, "type", &_cell));
                     TagFacadePoint::deserialize(facade, ()).await
                 })
                 .await
@@ -4133,14 +4133,16 @@ mod tests {
 
     #[test]
     fn tag_filtered_map_owned_tag_only_map_is_empty_struct() {
-        use strede::tag_facade::TagFilteredMapDeserializerOwned;
+        use strede::map_facade::MapDeserializerOwned;
+        use strede::tag_facade::TagFilteredMapOwned;
 
         let (_, v) = with_chunked(b"{\"type\": \"Empty\"}", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
             de.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let _cell = Cell::new(None);
-                let facade = TagFilteredMapDeserializerOwned::new_skip(map, "type", &_cell);
+                let facade =
+                    MapDeserializerOwned::new(TagFilteredMapOwned::new_skip(map, "type", &_cell));
                 TagFacadeEmpty::deserialize(facade, ()).await
             })
             .await
@@ -4209,5 +4211,165 @@ mod tests {
             },
         );
         assert_eq!(v, OwnedTaggedEvent::Ping);
+    }
+
+    // =========================================================================
+    // key_facade tests
+    // =========================================================================
+    //
+    // The key_facade interleaves two futures (outer loop + inner Foo), so we
+    // need a loop-until-ready executor instead of the single-poll one above.
+
+    // Hand-written struct deserialization using MatchVals for key dispatch.
+    #[derive(Debug, PartialEq)]
+    struct Point2 {
+        x: u32,
+        y: u32,
+    }
+
+    impl<'s> DeserializeOwned<'s> for Point2 {
+        async fn deserialize<D: DeserializerOwned<'s>>(
+            d: D,
+            _extra: (),
+        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+            use strede::Chunk;
+            d.entry(|[e]| async {
+                let mut map = match e.deserialize_map().await? {
+                    Probe::Hit(m) => m,
+                    Probe::Miss => return Ok(Probe::Miss),
+                };
+                let mut x: Option<u32> = None;
+                let mut y: Option<u32> = None;
+                loop {
+                    let result = map
+                        .next_kv::<1, _, _, Option<(bool, u32)>>(|[ke]| async {
+                            let (c, key_idx, v) = hit!(
+                                ke.key::<MatchVals<usize>, _, 1, _, _, Option<u32>>(
+                                    ["x", "y"],
+                                    |_k, [ve]| {
+                                        async move {
+                                            let (c, val) = hit!(ve.value::<U32, _>(()).await);
+                                            Ok(Probe::Hit((c, Some(val.0))))
+                                        }
+                                    }
+                                )
+                                .await
+                            );
+                            Ok(Probe::Hit((c, Some((key_idx.0 == 0, v.unwrap())))))
+                        })
+                        .await?;
+                    match result {
+                        Probe::Hit(Chunk::Done(c)) => {
+                            let (x, y) = match (x, y) {
+                                (Some(x), Some(y)) => (x, y),
+                                _ => return Ok(Probe::Miss),
+                            };
+                            return Ok(Probe::Hit((c, Point2 { x, y })));
+                        }
+                        Probe::Hit(Chunk::Data((m, Some((true, v))))) => {
+                            x = Some(v);
+                            map = m;
+                        }
+                        Probe::Hit(Chunk::Data((m, Some((false, v))))) => {
+                            y = Some(v);
+                            map = m;
+                        }
+                        Probe::Hit(Chunk::Data((m, None))) => {
+                            map = m;
+                        }
+                        Probe::Miss => return Ok(Probe::Miss),
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    /// Use `key_facade` to feed `{"x": 10, "y": 20}` into `Point2` by driving
+    /// it as if its map entries came from a real outer map.
+    #[test]
+    fn key_facade_basic_struct() {
+        let result = with_chunked_spin(
+            br#"{"x": 10, "y": 20}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                de.entry(|[e]| async {
+                    let mut map = match e.deserialize_map().await? {
+                        Probe::Hit(m) => m,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+
+                    declare_comms! { 
+                        let comms = |c| Point2::deserialize(KeyDeserializer::new(c), ())
+                    }
+
+                    loop {
+                        match map
+                            .next_kv(|[ke]| async {
+                                let claim =
+                                    hit!(comms.input(ke).await);
+                                Ok(Probe::Hit((claim, ())))
+                            })
+                            .await?
+                        {
+                            Probe::Hit(Chunk::Data((m, ()))) => map = m,
+                            Probe::Hit(Chunk::Done(real_claim)) => {
+                                return comms.finish(real_claim).await;
+                            }
+                            Probe::Miss => return Ok(Probe::Miss),
+                        }
+                    }
+                })
+                .await
+            },
+        );
+
+        let (_, point) = result.unwrap().unwrap();
+        assert_eq!(point, Point2 { x: 10, y: 20 });
+    }
+
+    /// key_facade with an empty map `{}` — inner future should see Done immediately
+    /// and return Miss (required fields absent).
+    #[test]
+    fn key_facade_empty_map_returns_miss() {
+        let result = with_chunked_spin(
+            br#"{}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                de.entry(|[e]| async {
+                    let mut map = match e.deserialize_map().await? {
+                        Probe::Hit(m) => m,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+
+                    declare_comms! { 
+                        let comms = |c| Point2::deserialize(KeyDeserializer::new(c), ())
+                    }
+
+                    loop {
+                        match map
+                            .next_kv(|[ke]| async {
+                                let claim =
+                                    hit!(comms.input(ke).await);
+                                Ok(Probe::Hit((claim, ())))
+                            })
+                            .await?
+                        {
+                            Probe::Hit(Chunk::Data((m, ()))) => map = m,
+                            Probe::Hit(Chunk::Done(real_claim)) => {
+                                return comms.finish(real_claim).await;
+                            }
+                            Probe::Miss => return Ok(Probe::Miss),
+                        }
+                    }
+                })
+                .await
+            },
+        );
+
+        // Point2 requires both x and y — empty map must produce Miss.
+        assert!(matches!(result, Ok(Probe::Miss)));
     }
 }

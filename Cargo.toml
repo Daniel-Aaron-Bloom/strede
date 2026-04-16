@@ -3,8 +3,12 @@ members = [
     "strede",
     "strede-derive",
     "strede-json",
+    "strede-test-util",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
 
 [workspace.package]
 version = "0.1.0"

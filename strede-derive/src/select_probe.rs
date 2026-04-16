@@ -89,17 +89,7 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
         .map(|idx| {
             quote! {
                 if !__probe_done[#idx] && __probe_kill_ref[#idx].get() {
-                    // SAFETY: We drop the pinned Option<F> in place (never moves F),
-                    // then reinitialize the slot to None.  The done flag prevents any
-                    // further access to this slot.
-                    unsafe {
-                        let __slot: *mut ::core::option::Option<_> =
-                            ::core::pin::Pin::get_unchecked_mut(
-                                ::core::pin::Pin::as_mut(&mut __probe_fut.#idx)
-                            );
-                        ::core::ptr::drop_in_place(__slot);
-                        ::core::ptr::write(__slot, ::core::option::Option::None);
-                    }
+                    __probe_fut.#idx.as_mut().set(None);
                     __probe_done[#idx] = true;
                 }
             }
@@ -119,14 +109,9 @@ pub fn select_probe_impl(input: TokenStream) -> TokenStream {
             quote! {
                 #kill_sweep
                 if !__probe_done[#idx] {
-                    // Project Pin<&mut Option<F>> → Pin<&mut F>.
-                    // Safe: slot is Some while !done, and we never move F.
-                    let __inner_pin = unsafe {
-                        ::core::pin::Pin::map_unchecked_mut(
-                            ::core::pin::Pin::as_mut(&mut __probe_fut.#idx),
-                            |__opt| __opt.as_mut().unwrap()
-                        )
-                    };
+                    let __inner_pin = ::core::pin::Pin::as_mut(&mut __probe_fut.#idx)
+                        .as_pin_mut()
+                        .unwrap_or_else(|| panic!("probe slot is Some while !done"));
                     match ::core::future::Future::poll(__inner_pin, __cx) {
                         ::core::task::Poll::Ready(::core::result::Result::Ok(
                             #krate::Probe::Hit(__probe_val)
