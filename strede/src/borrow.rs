@@ -175,7 +175,7 @@ pub trait Entry<'de>: Sized {
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
     /// Begin reading a map.  The [`Entry::Claim`] is returned by
-    /// [`MapAccess::next`] when the map is exhausted.
+    /// [`MapAccess::next_kv`] when the map is exhausted.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error>;
     /// Begin reading a sequence.  The [`Entry::Claim`] is returned by
@@ -362,7 +362,7 @@ pub trait MapAccess<'de>: Sized {
 
 /// Owned handle for reading the key of one map pair.
 ///
-/// `key` follows the same lambda pattern as [`Deserializer::next`]: the closure
+/// `key` follows the same lambda pattern as [`Deserializer::entry`]: the closure
 /// receives `(&K, [ValueEntry; N])` — a reference to the decoded key and `N`
 /// owned [`MapValueEntry`] handles — so it can inspect the key and read the
 /// value, returning `Ok(Probe::Hit((ValueClaim, R)))` or `Ok(Probe::Miss)` for
@@ -423,7 +423,7 @@ pub trait MapValueEntry<'de> {
 
     /// Deserialize the value as `V`, forwarding `extra` into `V::deserialize`.
     /// Returns `Ok(Probe::Hit((claim, value)))`; the claim must be threaded out
-    /// through [`MapKeyEntry::key`] and back to [`MapAccess::next`] to advance
+    /// through [`MapKeyEntry::key`] and back to [`MapAccess::next_kv`] to advance
     /// the stream.  `Ok(Probe::Miss)` if `V::deserialize` misses; `Err` on
     /// fatal format error only.
     async fn value<V: Deserialize<'de, Extra>, Extra>(

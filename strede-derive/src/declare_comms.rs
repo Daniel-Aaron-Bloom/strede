@@ -7,8 +7,9 @@ use syn::{
     parse_macro_input,
 };
 
-/// One closure arm: `|ident| expr`
+/// One closure arm: optionally `&`-prefixed expression
 struct CommsArm {
+    by_ref: bool,
     expr: Expr,
 }
 
@@ -17,17 +18,24 @@ enum CommsBody {
     Tuple(Vec<CommsArm>),
 }
 
+enum Binding {
+    Single(Ident),
+    Tuple(Vec<Ident>),
+}
+
 struct DeclareCommsInput {
     krate: syn::Path,
-    binding: Ident,
+    binding: Binding,
     body: CommsBody,
 }
 
 fn parse_arm(input: ParseStream) -> syn::Result<CommsArm> {
-    // Accept any expression — the user is responsible for it being a closure
-    // or callable that accepts &FutureCommsStorage.
+    let by_ref = input.peek(Token![&]);
+    if by_ref {
+        let _: Token![&] = input.parse()?;
+    }
     let expr: Expr = input.parse()?;
-    Ok(CommsArm { expr })
+    Ok(CommsArm { by_ref, expr })
 }
 
 impl Parse for DeclareCommsInput {
@@ -37,7 +45,17 @@ impl Parse for DeclareCommsInput {
         let krate: syn::Path = input.parse()?;
 
         let _: Token![let] = input.parse()?;
-        let binding: Ident = input.parse()?;
+
+        // Binding is either a parenthesized tuple of idents or a single ident.
+        let binding = if input.peek(syn::token::Paren) {
+            let content;
+            syn::parenthesized!(content in input);
+            let idents = content.parse_terminated(Ident::parse, Token![,])?;
+            Binding::Tuple(idents.into_iter().collect())
+        } else {
+            Binding::Single(input.parse()?)
+        };
+
         let _: Token![=] = input.parse()?;
 
         // Body is either a parenthesized tuple of closures or a single closure.
@@ -76,6 +94,7 @@ pub fn declare_comms_impl(input: TokenStream) -> TokenStream {
         .map(|i| Ident::new(&format!("__comms_fut_{i}"), Span::call_site()))
         .collect();
 
+    let by_refs: Vec<bool> = arms.iter().map(|a| a.by_ref).collect();
     let arm_exprs: Vec<&Expr> = arms.iter().map(|a| &a.expr).collect();
 
     // Declare all storages first (they must outlive the FutureComms values).
@@ -95,24 +114,47 @@ pub fn declare_comms_impl(input: TokenStream) -> TokenStream {
         },
     );
 
-    // Build the FutureComms values.
-    let comms_exprs = storage_idents.iter().zip(fut_idents.iter()).map(|(s, f)| {
-        quote! {
-            #krate::key_facade::FutureComms::new_unsafe(&#s, &#f)
-        }
-    });
+    // Build the FutureComms values — each gets its own let binding so we can
+    // reference or move them independently.
+    let comms_idents: Vec<Ident> = (0..n)
+        .map(|i| Ident::new(&format!("__comms_val_{i}"), Span::call_site()))
+        .collect();
 
-    let binding_rhs = if n == 1 {
-        let ce = comms_exprs.collect::<Vec<_>>();
-        quote! { #(#ce)* }
-    } else {
-        quote! { ( #( #comms_exprs ),* ) }
+    let comms_lets = comms_idents.iter().zip(storage_idents.iter()).zip(fut_idents.iter()).map(
+        |((c, s), f)| {
+            quote! {
+                let #c = #krate::key_facade::FutureComms::new_unsafe(&#s, &#f);
+            }
+        },
+    );
+
+    let comms_refs: Vec<_> = comms_idents.iter().zip(by_refs.iter()).map(|(c, &by_ref)| {
+        if by_ref {
+            quote! { &#c }
+        } else {
+            quote! { #c }
+        }
+    }).collect();
+
+    let binding_stmt = match binding {
+        Binding::Single(ident) => {
+            let rhs = if n == 1 {
+                quote! { #(#comms_refs)* }
+            } else {
+                quote! { ( #( #comms_refs ),* ) }
+            };
+            quote! { let #ident = #rhs; }
+        }
+        Binding::Tuple(idents) => {
+            quote! { let ( #( #idents ),* ) = ( #( #comms_refs ),* ); }
+        }
     };
 
     let expanded = quote! {
         #( #storage_decls )*
         #( #fut_decls )*
-        let #binding = #binding_rhs;
+        #( #comms_lets )*
+        #binding_stmt
     };
 
     expanded.into()

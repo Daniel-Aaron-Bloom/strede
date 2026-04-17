@@ -39,7 +39,7 @@ impl<'de> Deserialize<'de> for () {
 }
 
 impl<'s> DeserializeOwned<'s> for () {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -94,7 +94,7 @@ impl<'de> Deserialize<'de> for isize {
 }
 
 impl<'s> DeserializeOwned<'s> for usize {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -114,7 +114,7 @@ impl<'s> DeserializeOwned<'s> for usize {
 }
 
 impl<'s> DeserializeOwned<'s> for isize {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -149,7 +149,7 @@ impl<'de, T: ?Sized> Deserialize<'de> for PhantomData<T> {
 }
 
 impl<'s, T: ?Sized> DeserializeOwned<'s> for PhantomData<T> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -184,7 +184,7 @@ impl<'de> Deserialize<'de> for Skip {
 }
 
 impl<'s> DeserializeOwned<'s> for Skip {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -344,7 +344,7 @@ impl<'de, 'a, T: Copy, const N: usize> Deserialize<'de, [(&'a [u8], T); N]> for 
 }
 
 impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a str, T); N]> for MatchVals<T> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [(&'a str, T); N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -383,7 +383,7 @@ impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a str, T); N]> fo
 }
 
 impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a [u8], T); N]> for MatchVals<T> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [(&'a [u8], T); N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -446,25 +446,25 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for MatchVals<usiz
 }
 
 impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for MatchVals<usize> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
         let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a str, usize); N]>>::deserialize(d, pairs).await?;
+        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a str, usize); N]>>::deserialize_owned(d, pairs).await?;
         Ok(probe)
     }
 }
 
 impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for MatchVals<usize> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
         let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a [u8], usize); N]>>::deserialize(d, pairs).await?;
+        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a [u8], usize); N]>>::deserialize_owned(d, pairs).await?;
         Ok(probe)
     }
 }
@@ -531,7 +531,7 @@ where
     F: AsyncFnOnce() -> T,
     Extra: Copy,
 {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         (fallback, extra): (F, Extra),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -621,41 +621,41 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for Match {
 }
 
 impl<'s, 'a> DeserializeOwned<'s, &'a str> for Match {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: &'a str,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); 1]>>::deserialize_owned(d, [(extra, Match)]).await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
 impl<'s, 'a> DeserializeOwned<'s, &'a [u8]> for Match {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: &'a [u8],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); 1]>>::deserialize_owned(d, [(extra, Match)]).await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
 impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for Match {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); N]>>::deserialize_owned(d, extra.map(|k| (k, Match))).await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
 impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for Match {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); N]>>::deserialize_owned(d, extra.map(|k| (k, Match))).await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
@@ -674,11 +674,11 @@ macro_rules! impl_newtype_wrapper {
         }
 
         impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for $wrapper<T> {
-            async fn deserialize<D: DeserializerOwned<'s>>(
+            async fn deserialize_owned<D: DeserializerOwned<'s>>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                Ok(T::deserialize(d, ()).await?.map(|(c, v)| (c, $wrapper(v))))
+                Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, $wrapper(v))))
             }
         }
     };
@@ -700,11 +700,11 @@ impl<'de, T: Deserialize<'de> + Copy> Deserialize<'de> for Cell<T> {
 }
 
 impl<'s, T: DeserializeOwned<'s> + Copy> DeserializeOwned<'s> for Cell<T> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        Ok(T::deserialize(d, ()).await?.map(|(c, v)| (c, Cell::new(v))))
+        Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, Cell::new(v))))
     }
 }
 
@@ -722,11 +722,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for RefCell<T> {
 }
 
 impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for RefCell<T> {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        Ok(T::deserialize(d, ())
+        Ok(T::deserialize_owned(d, ())
             .await?
             .map(|(c, v)| (c, RefCell::new(v))))
     }
@@ -754,7 +754,7 @@ macro_rules! impl_nonzero {
         }
 
         impl<'s> DeserializeOwned<'s> for $nonzero {
-            async fn deserialize<D: DeserializerOwned<'s>>(
+            async fn deserialize_owned<D: DeserializerOwned<'s>>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -800,14 +800,14 @@ impl<'de> Deserialize<'de> for NonZeroUsize {
 }
 
 impl<'s> DeserializeOwned<'s> for NonZeroUsize {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
     where
         D::Error: DeserializeError,
     {
-        let (claim, v) = hit!(<usize as DeserializeOwned>::deserialize(d, ()).await);
+        let (claim, v) = hit!(<usize as DeserializeOwned>::deserialize_owned(d, ()).await);
         let nz = or_miss!(Self::new(v));
         Ok(Probe::Hit((claim, nz)))
     }
@@ -828,14 +828,14 @@ impl<'de> Deserialize<'de> for NonZeroIsize {
 }
 
 impl<'s> DeserializeOwned<'s> for NonZeroIsize {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
     where
         D::Error: DeserializeError,
     {
-        let (claim, v) = hit!(<isize as DeserializeOwned>::deserialize(d, ()).await);
+        let (claim, v) = hit!(<isize as DeserializeOwned>::deserialize_owned(d, ()).await);
         let nz = or_miss!(Self::new(v));
         Ok(Probe::Hit((claim, nz)))
     }
@@ -869,7 +869,7 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for [T; N] {
 }
 
 impl<'s, T: DeserializeOwned<'s>, const N: usize> DeserializeOwned<'s> for [T; N] {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -921,7 +921,7 @@ macro_rules! impl_tuple {
         }
 
         impl<'s, $($T: DeserializeOwned<'s>),+> DeserializeOwned<'s> for ($($T,)+) {
-            async fn deserialize<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
+            async fn deserialize_owned<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
             where
                 D::Error: DeserializeError,
             {
@@ -1010,7 +1010,7 @@ macro_rules! impl_from_str {
         }
 
         impl<'s> DeserializeOwned<'s> for $ty {
-            async fn deserialize<D: DeserializerOwned<'s>>(
+            async fn deserialize_owned<D: DeserializerOwned<'s>>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1078,7 +1078,7 @@ impl<'de> Deserialize<'de> for core::time::Duration {
 }
 
 impl<'s> DeserializeOwned<'s> for core::time::Duration {
-    async fn deserialize<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned<'s>>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1086,7 +1086,7 @@ impl<'s> DeserializeOwned<'s> for core::time::Duration {
         D::Error: DeserializeError,
     {
         let (claim, Duration { secs, nanos }) =
-            hit!(<Duration as DeserializeOwned>::deserialize(d, ()).await);
+            hit!(<Duration as DeserializeOwned>::deserialize_owned(d, ()).await);
         Ok(Probe::Hit((claim, Self::new(secs, nanos))))
     }
 }
@@ -1140,7 +1140,7 @@ mod alloc_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for String {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1195,7 +1195,7 @@ mod alloc_impls {
     }
 
     impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Vec<T> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1234,11 +1234,11 @@ mod alloc_impls {
     }
 
     impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Box<T> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(T::deserialize(d, ()).await?.map(|(c, v)| (c, Box::new(v))))
+            Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, Box::new(v))))
         }
     }
 
@@ -1254,11 +1254,11 @@ mod alloc_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for Box<str> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<String as DeserializeOwned>::deserialize(d, ())
+            Ok(<String as DeserializeOwned>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, s)| (c, s.into_boxed_str())))
         }
@@ -1279,14 +1279,14 @@ mod alloc_impls {
     }
 
     impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Box<[T]> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
         where
             D::Error: DeserializeError,
         {
-            Ok(Vec::<T>::deserialize(d, ())
+            Ok(Vec::<T>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, v)| (c, v.into_boxed_slice())))
         }
@@ -1318,7 +1318,7 @@ mod alloc_impls {
             }
 
             impl<'s, $T: DeserializeOwned<'s> $($(+ $bound)+)?> DeserializeOwned<'s> for $ty<$T> {
-                async fn deserialize<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
+                async fn deserialize_owned<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
                 where
                     D::Error: DeserializeError,
                 {
@@ -1379,7 +1379,7 @@ mod alloc_impls {
     impl<'s, K: DeserializeOwned<'s> + Ord, V: DeserializeOwned<'s>> DeserializeOwned<'s>
         for BTreeMap<K, V>
     {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1440,11 +1440,11 @@ mod alloc_impls {
     where
         T::Owned: DeserializeOwned<'s>,
     {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(T::Owned::deserialize(d, ())
+            Ok(T::Owned::deserialize_owned(d, ())
                 .await?
                 .map(|(c, v)| (c, Cow::Owned(v))))
         }
@@ -1477,7 +1477,7 @@ mod alloc_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for CString {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1643,7 +1643,7 @@ mod std_impls {
         V: DeserializeOwned<'s>,
         S: BuildHasher + Default,
     {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1715,7 +1715,7 @@ mod std_impls {
         T: DeserializeOwned<'s> + Eq + Hash,
         S: BuildHasher + Default,
     {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1756,11 +1756,11 @@ mod std_impls {
     }
 
     impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for std::sync::Mutex<T> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(T::deserialize(d, ())
+            Ok(T::deserialize_owned(d, ())
                 .await?
                 .map(|(c, v)| (c, std::sync::Mutex::new(v))))
         }
@@ -1778,11 +1778,11 @@ mod std_impls {
     }
 
     impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for std::sync::RwLock<T> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(T::deserialize(d, ())
+            Ok(T::deserialize_owned(d, ())
                 .await?
                 .map(|(c, v)| (c, std::sync::RwLock::new(v))))
         }
@@ -1802,11 +1802,11 @@ mod std_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for std::path::PathBuf {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<String as DeserializeOwned>::deserialize(d, ())
+            Ok(<String as DeserializeOwned>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, s)| (c, std::path::PathBuf::from(s))))
         }
@@ -1824,11 +1824,11 @@ mod std_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for std::ffi::OsString {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<String as DeserializeOwned>::deserialize(d, ())
+            Ok(<String as DeserializeOwned>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, s)| (c, std::ffi::OsString::from(s))))
         }
@@ -1848,11 +1848,11 @@ mod std_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for Box<std::path::Path> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<std::path::PathBuf as DeserializeOwned>::deserialize(d, ())
+            Ok(<std::path::PathBuf as DeserializeOwned>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, p)| (c, p.into_boxed_path())))
         }
@@ -1870,11 +1870,11 @@ mod std_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for Box<std::ffi::OsStr> {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<std::ffi::OsString as DeserializeOwned>::deserialize(d, ())
+            Ok(<std::ffi::OsString as DeserializeOwned>::deserialize_owned(d, ())
                 .await?
                 .map(|(c, s)| (c, s.into_boxed_os_str())))
         }
@@ -1964,7 +1964,7 @@ mod std_impls {
     }
 
     impl<'s> DeserializeOwned<'s> for std::time::SystemTime {
-        async fn deserialize<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned<'s>>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -2042,11 +2042,11 @@ mod std_impls {
             }
 
             impl<'s> DeserializeOwned<'s> for $atomic {
-                async fn deserialize<D: DeserializerOwned<'s>>(
+                async fn deserialize_owned<D: DeserializerOwned<'s>>(
                     d: D,
                     _extra: (),
                 ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                    Ok(<$inner as DeserializeOwned>::deserialize(d, ())
+                    Ok(<$inner as DeserializeOwned>::deserialize_owned(d, ())
                         .await?
                         .map(|(c, v)| (c, <$atomic>::new(v))))
                 }
@@ -2606,14 +2606,10 @@ pub mod key_facade {
             self.killed.set(true);
         }
 
-        /// Feed one real `KE` into the inner future and wait for the inner
-        /// future to consume it and return a `Claim`.
-        ///
-        /// Drive `fut` forward on each poll (it is the pinned inner future).
-        /// Returns the `Claim` produced by the inner `next_kv` arm, which
-        /// the outer caller should thread back to the real `next_kv`.
         /// Returns `true` if [`kill`] was called and the future has been dropped
         /// (or is about to be).
+        /// 
+        /// [`Self::input`] checks this and returns a miss if true.
         pub fn is_killed(&self) -> bool {
             self.killed.get()
         }
@@ -2622,6 +2618,12 @@ pub mod key_facade {
             self.fut.borrow_mut().as_mut().set(None);
         }
 
+        /// Feed one real `KE` into the inner future and wait for the inner
+        /// future to consume it and return a `Claim`.
+        ///
+        /// Drive `fut` forward on each poll (it is the pinned inner future).
+        /// Returns the `Claim` produced by the inner `next_kv` arm, which
+        /// the outer caller should thread back to the real `next_kv`.
         pub async fn input<R, E>(
             &self,
             ke: KE,

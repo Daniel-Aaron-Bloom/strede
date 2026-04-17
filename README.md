@@ -17,7 +17,7 @@ A `Claim` token threads proof-of-consumption back to the deserializer:
 
 ```rust
 // Advance the stream, racing two type probes
-let value = d.next(|[e1, e2]| async {
+let value = d.entry(|[e1, e2]| async {
     select_probe! {
         async move {
             let (claim, f) = hit!(e1.deserialize_f32().await);
@@ -34,7 +34,7 @@ let value = d.next(|[e1, e2]| async {
 
 Probe results:
 
-- `Ok(Probe::Hit((Claim, T)))` — token matched; thread `Claim` back to `next`.
+- `Ok(Probe::Hit((Claim, T)))` — token matched; thread `Claim` back to `entry`.
 - `Ok(Probe::Miss)` — type mismatch; stream was **not** consumed.
 - `Err(e)` — fatal format error (malformed data, I/O failure).
 - `Pending` — no data available yet (I/O backpressure only, never a type mismatch).
@@ -47,10 +47,10 @@ Probe results:
 ### Borrow family (`'de` — zero-copy)
 
 ```
-Deserialize<'de>      T::deserialize(&mut d, ()) → Result<Probe<T>, Error>
+Deserialize<'de>      T::deserialize(d, ()) → Result<Probe<(Claim, T)>, Error>
 
-Deserializer<'de>     d.next(|[e1, ..eN]| async { Ok(Probe::Hit((claim, r))) })
-                        → Result<Probe<R>, Error>
+Deserializer<'de>     d.entry(|[e1, ..eN]| async { Ok(Probe::Hit((claim, r))) })
+                        → Result<Probe<(Claim, R)>, Error>
 
 Entry<'de>            e.deserialize_bool()         → Result<Probe<(Claim, bool)>, Error>
                       e.deserialize_u8/u16/u32/u64/u128()
@@ -69,13 +69,13 @@ Entry<'de>            e.deserialize_bool()         → Result<Probe<(Claim, bool
 
 Chunk<Data, Done>     Data(item) | Done(claim)
 
-StrAccess             chunks.next() → Result<Chunk<&str, Claim>, Error>
+StrAccess             chunks.next_str(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                       chunks.fork() → Self
-BytesAccess           chunks.next() → Result<Chunk<&[u8], Claim>, Error>
+BytesAccess           chunks.next_bytes(|&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                       chunks.fork() → Self
 
-MapAccess             map.next(|[ke]| async { Ok(Probe::Hit((claim, r))) })
-                        → Result<Probe<Chunk<R, Claim>>, Error>
+MapAccess             map.next_kv(|[ke]| async { Ok(Probe::Hit((claim, r))) })
+                        → Result<Probe<Chunk<(Self, R), Claim>>, Error>
                       map.fork() → Self
 
 MapKeyEntry           ke.key::<K, N, ..>(|&k, [ve; N]| async { Ok(Probe::Hit((claim, r))) })
@@ -85,7 +85,7 @@ MapValueEntry         ve.value::<V, ()>(()) → Result<Probe<(Claim, V)>, Error>
                       ve.skip()     → Result<Claim, Error>
 
 SeqAccess             seq.next(|[e]| async { Ok(Probe::Hit((claim, r))) })
-                        → Result<Probe<Chunk<R, Claim>>, Error>
+                        → Result<Probe<Chunk<(Self, R), Claim>>, Error>
                       seq.fork() → Self
 
 SeqEntry              e.get::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
@@ -94,20 +94,20 @@ SeqEntry              e.get::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
 
 ### Owned family (`'s` — streaming/chunked, no zero-copy borrows)
 
-Mirrors the borrow family but `next` takes `self` by value. Drops
-`deserialize_str` / `deserialize_bytes`; strings/bytes must go through chunks.
-`StrAccessOwned::next` / `BytesAccessOwned::next` take `self` + a sync closure
-`FnOnce(&str) -> R` to map the short-lived borrow to an owned value.
+Mirrors the borrow family but drops `deserialize_str` / `deserialize_bytes`;
+strings/bytes must go through chunks. `StrAccessOwned::next_str` /
+`BytesAccessOwned::next_bytes` take `self` + a sync closure `FnOnce(&str) -> R`
+to map the short-lived borrow to an owned value.
 
 ```
-DeserializeOwned<'s>       T::deserialize(d, ()) → Result<Probe<(Claim, T)>, Error>
-DeserializerOwned<'s>      d.next(self, closure) → Result<Probe<(Claim, R)>, Error>
+DeserializeOwned<'s>       T::deserialize_owned(d, ()) → Result<Probe<(Claim, T)>, Error>
+DeserializerOwned<'s>      d.entry(self, closure) → Result<Probe<(Claim, R)>, Error>
 EntryOwned<'s>             (same probes minus deserialize_str/bytes, plus skip)
-StrAccessOwned<'s>         chunks.next(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
+StrAccessOwned<'s>         chunks.next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                            chunks.fork() → Self
-BytesAccessOwned<'s>       chunks.next(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
+BytesAccessOwned<'s>       chunks.next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                            chunks.fork() → Self
-MapAccessOwned<'s>         map.next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
+MapAccessOwned<'s>         map.next_kv(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
                            map.fork() → Self
 MapKeyEntryOwned<'s>       ke.key(self, closure) → Result<Probe<(Claim, K, R)>, Error>
 MapValueEntryOwned<'s>     ve.value(self, ()) → Result<Probe<(Claim, V)>, Error>
@@ -123,9 +123,23 @@ The two families are independent — no supertrait relationship, no blanket impl
 The `Claim` for maps, sequences, and streaming strings/bytes is returned via
 the `Done(claim)` variant of `Chunk` — not from the initial probe.
 
-In the borrow family, stream advancement (`next`) takes `&mut self` — explicitly
-sequential. Type probes consume `self` — pass `N > 1` handles to `next` to race
+In the borrow family, stream advancement (`entry`) takes `self` — explicitly
+sequential. Type probes consume `self` — pass `N > 1` handles to `entry` to race
 them with `select_probe!` without borrow conflicts.
+
+### Owned family — parallel scanning
+
+The owned family reads from a streaming source where data arrives
+incrementally. When `entry` passes multiple handles, or when you `fork` an
+accessor, the resulting readers share the same underlying buffer.
+
+**You must drive all forked readers concurrently** — typically via
+`select_probe!`. Sequentially awaiting one reader to completion before
+polling another will deadlock: the first reader may block waiting for buffer
+data that cannot arrive until all sibling readers have consumed the current
+chunk. This is safe to do: forked readers never interfere with each other,
+and every reader is automatically suspended and resumed as new data becomes
+available, provided all readers are being polled.
 
 ## Deriving
 
@@ -146,7 +160,7 @@ enum Message {
 }
 ```
 
-The derive macro generates a `Deserialize` impl that calls `d.next()`, enters
+The derive macro generates a `Deserialize` impl that calls `d.entry()`, enters
 the map, and dispatches on each string key to fill the struct fields.
 Tuple structs (e.g. `struct Pair(u32, u32)`) deserialize from JSON arrays.
 For enums, unit variants are encoded as bare strings, and non-unit variants as
@@ -345,7 +359,7 @@ advanced). Use with `deserialize_value` inside `select_probe!` for string-tag
 dispatch:
 
 ```rust
-d.next(|[e1, e2]| select_probe! {
+d.entry(|[e1, e2]| select_probe! {
     e1.deserialize_value::<Match, &str>("ok"),
     e2.deserialize_value::<Match, &str>("err"),
     miss => Ok(Probe::Miss),
@@ -354,7 +368,7 @@ d.next(|[e1, e2]| select_probe! {
 
 The borrow-family str/bytes impls race the zero-copy probe against the chunked
 fallback (N=2 entry handles) so escaped strings are handled without a separate
-`d.next` call.
+`d.entry` call.
 
 ## Status
 

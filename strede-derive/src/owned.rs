@@ -59,14 +59,14 @@ fn gen_container_from_owned(
             use #krate::{DeserializeOwned as _, DeserializerOwned as _};
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
                     _extra: (),
                 ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                 where
                     __D::Error: #krate::DeserializeError,
                 {
-                    let (__c, __v) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await);
+                    let (__c, __v) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await);
                     ::core::result::Result::Ok(#krate::Probe::Hit((__c, #convert)))
                 }
             }
@@ -114,7 +114,7 @@ fn expand_owned_struct(
                         use #krate::{DefaultValue as _, DeserializerOwned as _, EntryOwned as _};
 
                         impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                            async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                            async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                                 d: __D,
                                 _extra: (),
                             ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -213,19 +213,19 @@ fn expand_owned_struct(
         } else if let Some(from_ty) = &transparent_cf.from {
             quote! {
                 {
-                    let (__c, __tmp) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await);
+                    let (__c, __tmp) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await);
                     (__c, <#transparent_ty as ::core::convert::From<#from_ty>>::from(__tmp))
                 }
             }
         } else if let Some(try_from_ty) = &transparent_cf.try_from {
             quote! {
                 {
-                    let (__c, __tmp) = #krate::hit!(<#try_from_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await);
+                    let (__c, __tmp) = #krate::hit!(<#try_from_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await);
                     (__c, #krate::or_miss!(<#transparent_ty as ::core::convert::TryFrom<#try_from_ty>>::try_from(__tmp).ok()))
                 }
             }
         } else {
-            quote! { #krate::hit!(<#transparent_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await) }
+            quote! { #krate::hit!(<#transparent_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await) }
         };
 
         // Generate default expressions for all fields.
@@ -261,7 +261,7 @@ fn expand_owned_struct(
                 use #krate::{DefaultValue as _, DeserializeOwned as _, DeserializerOwned as _};
 
                 impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -376,7 +376,7 @@ fn expand_owned_struct(
                 };
 
                 impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -619,7 +619,7 @@ fn expand_owned_struct(
             #de_with_wrappers
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
                     _extra: (),
                 ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -735,7 +735,7 @@ fn gen_deserialize_with_wrappers_owned(
                 #[allow(non_camel_case_types)]
                 struct #wrapper(#ty);
                 impl<'s> #krate::DeserializeOwned<'s> for #wrapper {
-                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -755,14 +755,14 @@ fn gen_deserialize_with_wrappers_owned(
                 impl<'s> #krate::DeserializeOwned<'s> for #wrapper
                 where #from_ty: #krate::DeserializeOwned<'s>
                 {
-                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                     where
                         __D::Error: #krate::DeserializeError,
                     {
-                        let (__c, __v) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await);
+                        let (__c, __v) = #krate::hit!(<#from_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await);
                         ::core::result::Result::Ok(#krate::Probe::Hit((__c, Self(
                             <#ty as ::core::convert::From<#from_ty>>::from(__v)
                         ))))
@@ -777,14 +777,14 @@ fn gen_deserialize_with_wrappers_owned(
                 impl<'s> #krate::DeserializeOwned<'s> for #wrapper
                 where #try_from_ty: #krate::DeserializeOwned<'s>
                 {
-                    async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                         d: __D,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                     where
                         __D::Error: #krate::DeserializeError,
                     {
-                        let (__c, __v) = #krate::hit!(<#try_from_ty as #krate::DeserializeOwned<'s>>::deserialize(d, ()).await);
+                        let (__c, __v) = #krate::hit!(<#try_from_ty as #krate::DeserializeOwned<'s>>::deserialize_owned(d, ()).await);
                         ::core::result::Result::Ok(#krate::Probe::Hit((__c, Self(
                             #krate::or_miss!(<#ty as ::core::convert::TryFrom<#try_from_ty>>::try_from(__v).ok())
                         ))))
@@ -913,7 +913,7 @@ fn expand_owned_enum(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
             #struct_variant_helpers
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
                     _extra: (),
                 ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
@@ -1008,7 +1008,7 @@ fn gen_tuple_variant_helpers_owned(
                 where
                     #( #field_types: #krate::DeserializeOwned<'s>, )*
                 {
-                    async fn deserialize<__D2: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D2: #krate::DeserializerOwned<'s>>(
                         d: __D2,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D2::Claim, Self)>, __D2::Error>
@@ -1390,7 +1390,7 @@ fn gen_struct_variant_helpers_owned(
                 where
                     #( #field_types: #krate::DeserializeOwned<'s>, )*
                 {
-                    async fn deserialize<__D2: #krate::DeserializerOwned<'s>>(
+                    async fn deserialize_owned<__D2: #krate::DeserializerOwned<'s>>(
                         d: __D2,
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(__D2::Claim, Self)>, __D2::Error>
@@ -1796,7 +1796,7 @@ fn expand_owned_enum_internally_tagged(
             };
 
             impl #impl_generics #krate::DeserializeOwned<'s> for #name #ty_generics #where_clause {
-                async fn deserialize<__D: #krate::DeserializerOwned<'s>>(
+                async fn deserialize_owned<__D: #krate::DeserializerOwned<'s>>(
                     d: __D,
                     _extra: (),
                 ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>

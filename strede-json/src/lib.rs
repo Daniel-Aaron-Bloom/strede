@@ -41,8 +41,8 @@ use strede::{
 // ---------------------------------------------------------------------------
 
 /// Carries the post-consumption tokenizer and source state.
-/// Returned from every probe method and threaded back to [`Deserializer::next`]
-/// (or [`MapAccess::next`] / [`SeqAccess::next`]) to advance the stream.
+/// Returned from every probe method and threaded back to [`Deserializer::entry`]
+/// (or [`MapAccess::next_kv`] / [`SeqAccess::next`]) to advance the stream.
 pub struct JsonClaim<'de> {
     tokenizer: Tokenizer,
     src: &'de [u8],

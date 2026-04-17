@@ -4,7 +4,7 @@
 //!
 //! Stream advancement and type probing are separated:
 //!
-//! - [`Deserializer::next`] (`&mut self`) — the *only* way to advance the
+//! - [`Deserializer::entry`] (`self`) — the *only* way to advance the
 //!   stream; passes `N` owned entry handles to an async closure and returns
 //!   whatever the closure produces.
 //! - [`Entry`] probe methods (`self`) — consume the entry; resolve to
@@ -14,11 +14,11 @@
 //!
 //! Use `N > 1` to obtain multiple handles for the same slot and race them
 //! via [`select_probe!`].  The winning arm returns `Ok(Probe::Hit((claim, value)))`;
-//! the claim is forwarded to `next` as proof of consumption, and `next` returns
+//! the claim is forwarded to `entry` as proof of consumption, and `entry` returns
 //! the value:
 //!
 //! ```rust,ignore
-//! let v = d.next(|[e1, e2, e3]| async {
+//! let v = d.entry(|[e1, e2, e3]| async {
 //!     select_probe! {
 //!         async move {
 //!             let (claim, f) = hit!(e1.deserialize_f32().await);

@@ -141,14 +141,14 @@ macro_rules! select_probe {
     };
 }
 
-/// Yielded by streaming accessors ([`StrAccess::next`](crate::StrAccess::next),
-/// [`BytesAccess::next`](crate::BytesAccess::next),
-/// [`MapAccess::next`](crate::MapAccess::next),
+/// Yielded by streaming accessors ([`StrAccess::next_str`](crate::StrAccess::next_str),
+/// [`BytesAccess::next_bytes`](crate::BytesAccess::next_bytes),
+/// [`MapAccess::next_kv`](crate::MapAccess::next_kv),
 /// [`SeqAccess::next`](crate::SeqAccess::next)).
 ///
 /// - `Data(item)` — another item of data.
 /// - `Done(claim)` — the stream is exhausted; thread `claim` back to the
-///   outer [`Deserializer::next`](crate::Deserializer::next) as proof-of-consumption.
+///   outer [`Deserializer::entry`](crate::Deserializer::entry) as proof-of-consumption.
 pub enum Chunk<Data, Done> {
     Data(Data),
     Done(Done),
