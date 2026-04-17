@@ -73,14 +73,14 @@ fn new_offset(buf: &[u8], src: &[u8]) -> usize {
 /// per `next()`. Claim is `()` — the top-level is consumed and produces
 /// nothing the caller needs to thread back.
 pub struct ChunkedJsonDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    shared: &'s mut SharedBuf<B, F>,
+    shared: SharedBuf<'s, B, F>,
     tokenizer: Tokenizer,
     offset: usize,
     pending_tok: Option<Token>,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonDeserializer<'s, B, F> {
-    pub fn new(shared: &'s mut SharedBuf<B, F>) -> Self {
+    pub fn new(shared: SharedBuf<'s, B, F>) -> Self {
         Self {
             shared,
             tokenizer: Tokenizer::new(),
@@ -1323,7 +1323,7 @@ mod tests {
     fn with_chunked<L: AsyncFnMut(&mut &[u8]), R>(
         input: &[u8],
         loader: L,
-        f: impl AsyncFnOnce(&mut SharedBuf<&[u8], L>) -> R,
+        f: impl AsyncFnOnce(SharedBuf<'_, &[u8], L>) -> R,
     ) -> R {
         block_on(SharedBuf::with_async(input, loader, f))
     }
@@ -1333,7 +1333,7 @@ mod tests {
     fn with_chunked_spin<L: AsyncFnMut(&mut &[u8]), R>(
         input: &[u8],
         loader: L,
-        f: impl AsyncFnOnce(&mut SharedBuf<&[u8], L>) -> R,
+        f: impl AsyncFnOnce(SharedBuf<'_, &[u8], L>) -> R,
     ) -> R {
         block_on_loop(SharedBuf::with_async(input, loader, f))
     }

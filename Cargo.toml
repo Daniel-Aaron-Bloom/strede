@@ -5,6 +5,7 @@ members = [
     "strede-json",
     "strede-test-util",
 ]
+exclude = ["pin-list.rs"]
 resolver = "2"
 
 [workspace.dependencies]
