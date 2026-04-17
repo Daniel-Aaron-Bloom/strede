@@ -21,10 +21,9 @@
 //! [`Handle::fork`] takes `&mut self` on a [`Handle`], which can only exist
 //! when `remaining > 0`.  Together these make the only callable `fork` paths
 //! exactly the ones in which the load state is `Idle` — no waiter or
-//! drop-triggered `NeedsLoad`/`Loading` state can race with `fork`.  To keep
-//! that invariant, the last `WaitFuture` to drop in the `NeedsLoad` phase
-//! reverts the state to `Idle`: with no waiters left, the signal that a load
-//! is needed is stale, and the current buffer is still valid.
+//! drop-triggered `Loading` state can race with `fork`.  The `remaining == 0`
+//! condition signals that a load is needed; once all waiters drop, `remaining`
+//! is already 0 and the current buffer is still valid.
 
 use core::{
     cell::{Cell, UnsafeCell},
@@ -34,7 +33,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use std::cell::RefCell;
-use pin_list::{PinList, id::Unchecked};
+use pin_list::{InitializedNode, NodeData, PinList, id::Unchecked};
 use pin_project::{pin_project, pinned_drop};
 
 // ---------------------------------------------------------------------------
@@ -77,52 +76,14 @@ type WaiterTypes = dyn pin_list::Types<
     Id = Unchecked,
     Protected = Waker,
     Removed = (),
-    Unprotected = (),
+    Unprotected = usize,
 >;
 
 // ---------------------------------------------------------------------------
 // List — safe Cell wrapper around PinList
 // ---------------------------------------------------------------------------
 
-/// Wraps two `PinList`s in `RefCell`s so they can be mutated through `&self`.
-struct WakerLists {
-    active: RefCell<PinList<WaiterTypes>>,
-    clear: RefCell<PinList<WaiterTypes>>,
-}
-
-impl WakerLists {
-    /// # Safety
-    ///
-    /// Each `List` must be used by exactly one `SharedBuf`.  The `Unchecked`
-    /// ID is safe as long as nodes from different lists are never mixed —
-    /// guaranteed here because the `PinList` is private and only accessed
-    /// through `SharedBuf` methods.
-    const unsafe fn new() -> Self {
-        // SAFETY: Unchecked::new requires that the returned ID is never
-        // compared against IDs from a different call.  We ensure this by
-        // keeping the PinList private to a single SharedBuf instance.
-        Self {
-            active: RefCell::new(PinList::new(unsafe {
-                Unchecked::new()
-            })),
-            clear: RefCell::new(PinList::new(unsafe {
-                Unchecked::new()
-            })),
-        }
-    }
-
-    #[inline]
-    fn with_active<R>(&self, f: impl FnOnce(&mut PinList<WaiterTypes>) -> R) -> R {
-        f(&mut *self.active.borrow_mut())
-    }
-
-    fn with_clear<R>(&self, f: impl FnOnce(&mut PinList<WaiterTypes>) -> R) -> R {
-        f(&mut *self.clear.borrow_mut())
-    }
-    fn swap(&self) {
-        self.active.swap(&self.clear);
-    }
-}
+// WakerLists was here — fields inlined into SharedBufData.
 
 // ---------------------------------------------------------------------------
 // LoadState
@@ -131,11 +92,9 @@ impl WakerLists {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LoadState<F> {
     /// Current buffer is valid; no load needed or in progress.  Holds the
-    /// loader closure.
+    /// loader closure.  When `remaining == 0`, a waiter must trigger a load
+    /// before returning its handle.
     Idle(F),
-    /// All handles dropped without next(); a waiter must trigger the load.
-    /// Still holds the loader closure.
-    NeedsLoad(F),
     /// A waiter (or last-handle next()) is currently awaiting the loader
     /// future.  The loader has been moved out onto that task's stack; other
     /// waiters that wake up must not advance until this transitions back
@@ -148,27 +107,24 @@ enum LoadState<F> {
 // ---------------------------------------------------------------------------
 
 /// Holds the loader while it is checked out of `load_state`.  On drop,
-/// puts it back as `NeedsLoad` so the buffer is never permanently wedged.
+/// puts it back as `Idle` so the buffer is never permanently wedged.
+/// If `remaining == 0` (the load was triggered by all handles dropping),
+/// wakes one waiter to hand off the baton.
 struct LoaderGuard<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     shared: &'s SharedBufData<B, F>,
     loader: Option<F>,
-    was_needs_load: bool,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for LoaderGuard<'s, B, F> {
     fn drop(&mut self) {
         if let Some(loader) = self.loader.take() {
-            if self.was_needs_load {
-                self.shared.load_state.set(LoadState::NeedsLoad(loader));
-                // The waiter that claimed NeedsLoad was cancelled mid-load.
+            self.shared.load_state.set(LoadState::Idle(loader));
+            if self.shared.remaining.get() == 0 {
+                // The waiter driving the load was cancelled mid-load.
                 // Hand the baton to another queued waiter so it can drive
                 // the load; otherwise the remaining waiters would sit on
-                // stale wakers forever.  If no waiter remains, the last
-                // WaitFuture's drop (Removed arm with NeedsLoad phase)
-                // will revert the state to Idle.
+                // stale wakers forever.
                 self.shared.wake_one();
-            } else {
-                self.shared.load_state.set(LoadState::Idle(loader));
             }
         }
     }
@@ -201,7 +157,10 @@ struct SharedBufData<B: Buffer, F: AsyncFnMut(&mut B)> {
     /// Tracks the loading lifecycle for the current cycle, and owns the
     /// loader closure when not actively running.
     load_state: Cell<LoadState<F>>,
-    lists: WakerLists,
+    /// Active waiter list.  Wrapped in `RefCell` for interior mutability.
+    active: RefCell<PinList<WaiterTypes>>,
+    /// Cleared list, swapped with `active` during wake_all.
+    clear: RefCell<PinList<WaiterTypes>>,
 }
 /// Shared coordination state.  Stack-allocated; all derived types hold a
 /// `&'s SharedBuf` borrow, so Rust prevents it from being moved or dropped
@@ -221,21 +180,30 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Copy for SharedBuf<'s, B, F> {
 // SAFETY: single-threaded use enforced by !Sync.
 unsafe impl<B: Send + Buffer, F: Send + AsyncFnMut(&mut B)> Send for SharedBufData<B, F> {}
 
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
-    /// Run `f` with a shared buffer state initialized with `initial`.  The
-    /// loader fires whenever the last handle calls [`Handle::next`], mutating
-    /// the buffer in place.
-    pub fn with<R>(initial: B, loader: F, f: impl FnOnce(SharedBuf<'_, B, F>) -> R) -> R {
-        let shared = SharedBufData {
+impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
+    fn new(initial: B, loader: F) -> Self {
+        Self {
             buf: UnsafeCell::new(initial),
             remaining: Cell::new(0),
             total: Cell::new(0),
             epoch: Cell::new(1),
             handle_id: Cell::new(0),
             load_state: Cell::new(LoadState::Idle(loader)),
-            // SAFETY: see List::new
-            lists: unsafe { WakerLists::new() },
-        };
+            // SAFETY: Unchecked::new requires that the returned ID is never
+            // compared against IDs from a different call.  We ensure this by
+            // keeping each PinList private to a single SharedBuf instance.
+            active: RefCell::new(PinList::new(unsafe { Unchecked::new() })),
+            clear: RefCell::new(PinList::new(unsafe { Unchecked::new() })),
+        }
+    }
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
+    /// Run `f` with a shared buffer state initialized with `initial`.  The
+    /// loader fires whenever the last handle calls [`Handle::next`], mutating
+    /// the buffer in place.
+    pub fn with<R>(initial: B, loader: F, f: impl FnOnce(SharedBuf<'_, B, F>) -> R) -> R {
+        let shared = SharedBufData::new(initial, loader);
         f(SharedBuf(&shared))
     }
 
@@ -249,16 +217,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
         loader: F,
         f: impl AsyncFnOnce(SharedBuf<'_, B, F>) -> R,
     ) -> R {
-        let shared = SharedBufData {
-            buf: UnsafeCell::new(initial),
-            remaining: Cell::new(0),
-            total: Cell::new(0),
-            epoch: Cell::new(1),
-            handle_id: Cell::new(0),
-            load_state: Cell::new(LoadState::Idle(loader)),
-            // SAFETY: see List::new
-            lists: unsafe { WakerLists::new() },
-        };
+        let shared = SharedBufData::new(initial, loader);
         f(SharedBuf(&shared)).await
     }
 
@@ -285,14 +244,9 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     /// a waiter was woken, `false` if the list was empty.
     #[inline]
     fn wake_one(&self) -> bool {
-        let waker = self.lists.with_active(|list| {
-            let mut cursor = list.cursor_front_mut();
-            cursor.remove_current(()).ok()
-        });
-        match waker {
-            Some(w) => { w.wake(); true }
-            None => false,
-        }
+        let Some(waker) = self.remove_active_front() else { return false };
+        waker.wake();
+        true
     }
 
     /// Run the loader, bump the epoch, reset `remaining` to `total`, and
@@ -300,20 +254,32 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     async fn load_and_wake(&self) {
         self.run_loader().await;
         self.epoch.set(self.epoch.get() + 1);
-
-        self.lists.swap();
+        // The list is swapped out so waker.wake() cannot re-enter and append to the list
+        self.active.swap(&self.clear);
         self.remaining.set(self.total.get());
-        // Drain wakers in batches — the list is swapped out during each batch
-        // so waker.wake() cannot re-enter while we hold a &mut PinList.
-        self.lists.with_clear(|list| {
-            loop {
-                let mut cursor = list.cursor_front_mut();
-                match cursor.remove_current(()) {
-                    Ok(waker) => waker.wake(),
-                    Err(()) => break,
-                }
-            }
-        });
+        // Drain wakers —
+        while let Some(waker) = self.remove_clear_front() {
+            waker.wake();
+        }
+    }
+
+    fn needs_load(&self) -> bool {
+        self.remaining.get() == 0
+    }
+
+    fn remove_active_front(&self) -> Option<Waker> {
+        self.active.borrow_mut().cursor_front_mut().remove_current(()).ok()
+    }
+    fn remove_clear_front(&self) -> Option<Waker> {
+        self.clear.borrow_mut().cursor_front_mut().remove_current(()).ok()
+    }
+
+    fn reset_node<'a, 'b: 'c, 'c>(&'a self, initialized: Pin<&'b mut InitializedNode<'c, WaiterTypes>>) -> (NodeData<WaiterTypes>, usize) {
+        if *initialized.unprotected() == self.epoch.get() {
+            initialized.reset(&mut *self.active.borrow_mut())
+        } else {
+            initialized.reset(&mut *self.clear.borrow_mut())
+        }
     }
 
     /// Current load phase, ignoring the loader payload.
@@ -324,7 +290,6 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
         let state = self.load_state.replace(LoadState::Loading);
         let phase = match state {
             LoadState::Idle(_) => LoadState::Idle(()),
-            LoadState::NeedsLoad(_) => LoadState::NeedsLoad(()),
             LoadState::Loading => LoadState::Loading,
         };
         self.load_state.set(state);
@@ -335,15 +300,13 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     /// puts it back on drop.  Panics if the state is already `Loading`.
     fn checkout_loader(&self) -> LoaderGuard<'_, B, F> {
         let prev = self.load_state.replace(LoadState::Loading);
-        let was_needs_load = matches!(&prev, LoadState::NeedsLoad(_));
         let loader = match prev {
-            LoadState::Idle(f) | LoadState::NeedsLoad(f) => f,
+            LoadState::Idle(f) => f,
             LoadState::Loading => unreachable!("loader checked out twice"),
         };
         LoaderGuard {
             shared: self,
             loader: Some(loader),
-            was_needs_load,
         }
     }
 
@@ -368,7 +331,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     }
 
     fn fork_helper(&self) -> Handle<'_, B, F> {
-        assert_eq!(self.phase(), LoadState::Idle(()));
+        debug_assert_eq!(self.phase(), LoadState::Idle(()));
         self.remaining.set(self.remaining.get() + 1);
         self.total.set(self.total.get() + 1);
         let id = self.handle_id.get();
@@ -442,25 +405,18 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
             // Last handle: call the loader, install the new buffer, wake all
             // waiters.  We are the only caller right now (remaining just hit
             // 0, no other Handle is active).
-            assert_eq!(shared.phase(), LoadState::Idle(()));
+            debug_assert_eq!(shared.phase(), LoadState::Idle(()));
             shared.load_and_wake().await;
             Handle { shared, id }
         } else {
             // Not the last handle: create an internal WaitFuture and suspend
             // until the last handle calls the loader and wakes us.
-            let shared = WaitFuture {
-                shared,
-                node: pin_list::Node::new(),
-                epoch: shared.epoch.get(),
-                waiting: false,
-            }
-            .await;
+            let shared = WaitFuture::wait(shared).await;
             // If we were woken because all handles dropped (rather than because
-            // a sibling next() loaded), the state is NeedsLoad and we must
-            // drive the load ourselves.  Claim the transition here so siblings
-            // woken later see Loading/Idle and don't try to re-load.
-            if shared.phase() == LoadState::NeedsLoad(()) {
-                assert_eq!(shared.remaining.get(), 0);
+            // a sibling next() loaded), remaining is 0 and we must drive the
+            // load ourselves.
+            if shared.remaining.get() == 0 {
+                debug_assert_eq!(shared.phase(), LoadState::Idle(()));
                 shared.load_and_wake().await;
             }
             Handle { shared, id }
@@ -483,18 +439,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for Handle<'s, B, F> {
         debug_assert_ne!(total, 0);
         self.shared.total.set(total.saturating_sub(1));
         if remaining == 0 && self.shared.total.get() > 0 {
-            // WaitFutures are still alive.  Flag that the first one to
-            // re-poll must call the loader before returning its Handle.
-            // Wake only ONE — the loader takes time (async) and we don't
-            // want other waiters to race ahead and observe a stale buffer
-            // before the load completes.  After the load, wake_all is
-            // called from Handle::next.
-            // Transition Idle(F) → NeedsLoad(F), preserving the loader.
-            let loader = match self.shared.load_state.replace(LoadState::Loading) {
-                LoadState::Idle(f) | LoadState::NeedsLoad(f) => f,
-                _ => unreachable!("drop-triggered while loading, shouldn't be possible"),
-            };
-            self.shared.load_state.set(LoadState::NeedsLoad(loader));
+            // WaitFutures are still alive.  The first one to re-poll will
+            // see remaining == 0 and drive the load.  Wake only ONE — the
+            // loader takes time (async) and we don't want other waiters to
+            // race ahead and observe a stale buffer before the load
+            // completes.  After the load, wake_all is called from
+            // Handle::next.
             self.shared.wake_one();
         }
     }
@@ -515,10 +465,15 @@ struct WaitFuture<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     shared: &'s SharedBufData<B, F>,
     #[pin]
     node: pin_list::Node<WaiterTypes>,
-    /// `Inner::epoch` at the time this future was created.  If `inner.epoch`
-    /// exceeds this on first poll, the loader has already fired.
-    epoch: usize,
-    waiting: bool,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> WaitFuture<'s, B, F> {
+    async fn wait(shared: &'s SharedBufData<B, F>) -> &'s SharedBufData<B, F> {
+        WaitFuture {
+            shared,
+            node: pin_list::Node::new(),
+        }.await
+    }
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
@@ -527,42 +482,37 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
-        if *this.waiting {
+        if !this.node.is_initial() {
             // Re-poll path.  The node is initialized (linked or removed).
             // If it was removed by wake_one/wake_all, we were genuinely woken.
             // If still linked, this is a spurious re-poll — refresh the waker.
             let initialized = this.node.initialized_mut().expect("node must be initialized when waiting");
-            return this.shared.lists.with_active(|list| {
-                match initialized.take_removed(list) {
-                    Ok((_removed, ())) => {
-                        // Was woken (node removed from list by wake_one/wake_all).
-                        *this.waiting = false;
-                        Poll::Ready(*this.shared)
-                    }
-                    Err(still_linked) => {
-                        // Spurious re-poll; refresh the waker.
-                        *still_linked.protected_mut(list).unwrap() =
-                            cx.waker().clone();
-                        Poll::Pending
-                    }
+            let list = &mut *this.shared.active.borrow_mut();
+            return match initialized.take_removed(list) {
+                Ok((_removed, _epoch)) => {
+                    // Was woken (node removed from list by wake_one/wake_all).
+                    Poll::Ready(*this.shared)
                 }
-            });
+                Err(still_linked) => {
+                    // Spurious re-poll; refresh the waker.
+                    *still_linked.protected_mut(list).unwrap() =
+                        cx.waker().clone();
+                    Poll::Pending
+                }
+            };
         }
 
         // First poll: check whether the loader has already fired since this
         // WaitFuture was created, or a drop-triggered needs-load is pending.
-        let phase = this.shared.phase();
-        if this.shared.epoch.get() > *this.epoch || phase == LoadState::NeedsLoad(()) {
-            assert_ne!(phase, LoadState::NeedsLoad(()));
+        let epoch = this.shared.epoch.get();
+        if this.shared.remaining.get() == 0 {
             return Poll::Ready(*this.shared);
         }
 
         // Insert into the waiter list and store the waker.
         // push_front = head insertion = LIFO order, matching original behavior.
-        this.shared.lists.with_active(|list| {
-            list.push_front(this.node, cx.waker().clone(), ());
-        });
-        *this.waiting = true;
+        let waker = cx.waker().clone();
+        this.shared.active.borrow_mut().push_front(this.node, waker, epoch);
         Poll::Pending
     }
 }
@@ -572,8 +522,8 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> PinnedDrop for WaitFuture<'s, B, F> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
 
-        if !*this.waiting {
-            // Completed normally or never polled — nothing to clean up.
+        if this.node.is_initial() {
+            // Finished normally or never polled — nothing to clean up.
             return;
         }
 
@@ -581,52 +531,37 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> PinnedDrop for WaitFuture<'s, B, F> {
         // or is still linked (not yet woken).
         let initialized = this.node.initialized_mut().expect("node must be initialized when waiting");
 
-        match this.shared.lists.with_active(|list| initialized.reset(list)) {
-            (pin_list::NodeData::Removed(()), ()) => {
-                // Was woken (removed from list) but dropped before being
-                // re-polled.
-                match this.shared.phase() {
-                    LoadState::NeedsLoad(()) => {
-                        assert_eq!(this.shared.remaining.get(), 0);
-                        // We were the wake_one'd waiter for a drop-triggered
-                        // load but never re-polled to claim it.  Hand the
-                        // baton to another waiter; if none remains, revert to
-                        // Idle — the "need a load" signal was only meaningful
-                        // while someone was waiting, and the current buffer is
-                        // still valid.
-                        if !this.shared.wake_one() {
-                            let loader =
-                                match this.shared.load_state.replace(LoadState::Loading) {
-                                    LoadState::NeedsLoad(f) => f,
-                                    _ => unreachable!("phase was NeedsLoad a moment ago"),
-                                };
-                            this.shared.load_state.set(LoadState::Idle(loader));
-                        }
-                    }
-                    LoadState::Loading => {
-                        // Should be unreachable: the only waiter that can
-                        // observe Loading here is the one actively driving
-                        // the load, and that waiter's WaitFuture has
-                        // waiting = false (set when poll returned Ready),
-                        // so its Drop exits via the early return above.
-                        debug_assert!(
-                            false,
-                            "WaitFuture::drop: Phase::Loading should be unreachable"
-                        );
-                    }
-                    LoadState::Idle(()) => {
-                        // Normal next()-driven wakeup: the new cycle's
-                        // remaining already counts us; decrement it now since
-                        // we aren't actually remaining and no Handle exists yet.
-                        let remaining = this.shared.remaining.get();
-                        debug_assert_ne!(remaining, 0);
-                        this.shared.remaining.set(remaining.saturating_sub(1));
-                    }
-                }
+        match this.shared.reset_node(initialized) {
+            // Were in the list, but never woken: `reset` unlinked us.
+            // We've never been "alive", so not yet counted in the new epoch's remaining.
+            (pin_list::NodeData::Linked(_waker), epoch) if epoch == this.shared.epoch.get() => {},
+            // Were in the list, epoch has switch so we were about to be woken up,
+            // but we dropped for some reason before our time. We were counted in remaining since
+            // we were in the list at wake time. Decrement remaining since no Handle will be created.
+            (pin_list::NodeData::Linked(_waker), _epoch) => {
+                let remaining = this.shared.remaining.get();
+                debug_assert_ne!(remaining, 0);
+                this.shared.remaining.set(remaining.saturating_sub(1));
             }
-            (pin_list::NodeData::Linked(_waker), ()) => {
-                // Still in the list (not yet woken): `reset` already unlinked
-                // us.  We were not yet counted in the new cycle's remaining.
+            // Removed from list by wake-one
+            (pin_list::NodeData::Removed(()), _epoch) if this.shared.needs_load() => {
+                debug_assert_eq!(_epoch, this.shared.epoch.get());
+                // We were responsible for loading the next epoch, but we're gonna die
+                // before we do that. Hand the baton to another waiter. We're still in
+                // the old epoch, so no need to decrement remaining.
+                this.shared.wake_one();
+            }
+            // Removed from list by a wake-all
+            (pin_list::NodeData::Removed(()), _epoch) => {
+                debug_assert_ne!(
+                    this.shared.phase(), LoadState::Loading,
+                    "WaitFuture::drop: Phase::Loading should be unreachable"
+                );
+                // We're counted in the new epoch; decrement it now since
+                // we're dying and no Handle will ever be created.
+                let remaining = this.shared.remaining.get();
+                debug_assert_ne!(remaining, 0);
+                this.shared.remaining.set(remaining.saturating_sub(1));
             }
         }
     }
@@ -997,11 +932,11 @@ mod tests {
                 assert!(matches!(poll_once(fut0.as_mut()), Poll::Pending));
                 assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
-                // Drop h2 without next → remaining=0, NeedsLoad set, wake_one
-                // wakes only the head of the list (fut1).
+                // Drop h2 without next → remaining=0, wake_one wakes only
+                // the head of the list (fut1).
                 drop(h2);
 
-                // fut1 was woken; polling it claims NeedsLoad and starts the
+                // fut1 was woken; polling it sees remaining==0 and starts the
                 // loader.  The loader yields once, so fut1 returns Pending.
                 assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
@@ -1027,10 +962,9 @@ mod tests {
         );
     }
 
-    /// Regression for #1: all waiters are dropped after `NeedsLoad` was set,
-    /// leaving `load_state = NeedsLoad` with no handles and no waiters.  A
-    /// subsequent `fork()` should succeed (the current buffer is still valid
-    /// and usable), not panic the `phase == Idle` assert in `fork_helper`.
+    /// Regression for #1: all waiters are dropped after all handles dropped
+    /// (remaining == 0).  A subsequent `fork()` should succeed (the current
+    /// buffer is still valid and usable), not panic.
     #[test]
     fn fork_after_all_waiters_drop_during_needs_load() {
         let bufs: &[&[u8]] = &[b"initial", b"loaded"];
@@ -1061,38 +995,35 @@ mod tests {
                         assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
                         // Drop h2 (the sole remaining Handle) without next().
-                        // This flips load_state → NeedsLoad and wake_ones fut1.
+                        // remaining hits 0, wake_one wakes fut1.
                         drop(h2);
 
                         // Leaving this scope drops fut1 then fut0 (reverse
-                        // declaration order).  fut1's drop sees NeedsLoad and
-                        // wake_one's fut0.  fut0's drop sees NeedsLoad, calls
-                        // wake_one (no-op, list empty).  Both decrement total.
+                        // declaration order).  fut1's drop sees remaining==0
+                        // and wake_one's fut0.  fut0's drop sees remaining==0,
+                        // calls wake_one (no-op, list empty).  Both decrement
+                        // total.
                     }
                 }
 
                 // At this point: no handles, no waiters, load_state =
-                // NeedsLoad(f).  Accounting invariant: total = remaining = 0.
+                // Idle(f).  Accounting invariant: total = remaining = 0.
                 assert_eq!(shared.inner().total.get(), 0, "total leaked waiter slots");
                 assert_eq!(shared.inner().remaining.get(), 0);
 
                 // Now fork a fresh handle.  The existing buffer is still
                 // perfectly valid (bufs[0] = b"initial"), so this should
-                // return a Handle pointing at it.  Before the fix, this panics
-                // because fork_helper asserts phase == Idle but phase is
-                // NeedsLoad.
+                // return a Handle pointing at it.
                 let h = shared.fork();
                 assert_eq!(h.buf(), b"initial");
             },
         );
     }
 
-    /// Regression: a waiter is woken for `NeedsLoad`, re-polls and enters
-    /// `run_loader`, but is cancelled mid-load.  `LoaderGuard` restores
-    /// `NeedsLoad`, but the *baton* needs to be passed to another queued
-    /// waiter — otherwise remaining waiters deadlock (their stored waker is
-    /// never fired again), and if they too are cancelled the state is stuck
-    /// in `NeedsLoad` so a subsequent `fork()` panics.
+    /// Regression: a waiter is woken because remaining==0, re-polls and enters
+    /// `run_loader`, but is cancelled mid-load.  `LoaderGuard` restores `Idle`
+    /// and hands the baton to another queued waiter — otherwise remaining
+    /// waiters deadlock (their stored waker is never fired again).
     #[test]
     fn cancelled_waiter_during_needs_load_hands_off_to_next_waiter() {
         let bufs: &[&[u8]] = &[b"initial", b"loaded"];
@@ -1117,26 +1048,19 @@ mod tests {
                     let mut fut1 = core::pin::pin!(h1.next());
                     assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
-                    // Drop h2 → state = NeedsLoad, wake_one wakes fut1 (head).
+                    // Drop h2 → remaining=0, wake_one wakes fut1 (head).
                     drop(h2);
 
-                    // fut1 claims NeedsLoad, enters run_loader; loader yields.
+                    // fut1 sees remaining==0, enters run_loader; loader yields.
                     assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
                     // End of scope: fut1 dropped mid-load.  LoaderGuard
-                    // reinstates NeedsLoad.  Without the fix, fut0's waker is
-                    // never fired — the baton is lost.
+                    // reinstates Idle and wake_one's fut0.
                 }
 
-                // fut0 must now be able to claim the pending NeedsLoad and
-                // complete the load itself.  Pre-fix, this sits Pending forever.
-                // Poll once: first poll should see phase=NeedsLoad and return
-                // Ready(shared) immediately (either because we were wake_one'd,
-                // prev_next cleared → Ready, OR because first-poll path checks
-                // phase == NeedsLoad — but we already polled once, so we're on
-                // the re-poll branch that needs prev_next == null).
-                // Bounded to avoid hanging on regression — the loader only
-                // yields once, so completion needs at most 2 polls here.
+                // fut0 must now be able to see remaining==0 and complete the
+                // load itself.  Bounded to avoid hanging on regression — the
+                // loader only yields once, so completion needs at most 2 polls.
                 let mut h0_new = None;
                 for _ in 0..8 {
                     if let Poll::Ready(h) = poll_once(fut0.as_mut()) {
@@ -1147,6 +1071,234 @@ mod tests {
                 let h0_new =
                     h0_new.expect("fut0 deadlocked: baton not handed off after fut1 cancel");
                 assert_eq!(h0_new.buf(), b"loaded");
+            },
+        );
+    }
+
+    /// Dropping a WaitFuture whose node was inserted in a previous epoch
+    /// (i.e. it was woken by wake_all but never re-polled) must reset against
+    /// the `clear` list, not `active`.  This exercises the else branch of
+    /// `reset_node` where the node's epoch differs from the current epoch.
+    #[test]
+    fn drop_stale_epoch_waiter_resets_against_clear_list() {
+        let bufs: &[&[u8]] = &[b"initial", b"loaded"];
+        let mut i = 0usize;
+        SharedBuf::with(
+            bufs[0],
+            async |b: &mut &[u8]| {
+                i += 1;
+                *b = bufs[i];
+            },
+            |shared| {
+                let mut h0 = shared.fork();
+                let mut h1 = h0.fork();
+                let h2 = h1.fork();
+
+                // fut0 and fut1 pend; both inserted into active list with epoch=1.
+                // List after both: [fut1, fut0] (push_front).
+                let mut fut0 = core::pin::pin!(h0.next());
+                let mut fut1 = core::pin::pin!(h1.next());
+                assert!(matches!(poll_once(fut0.as_mut()), Poll::Pending));
+                assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
+
+                // fut2 is the last handle (remaining hits 0): loads, bumps
+                // epoch to 2, swaps active↔clear, wakes fut1 and fut0.
+                let mut fut2 = core::pin::pin!(h2.next());
+                let _h2_new = match poll_once(fut2.as_mut()) {
+                    Poll::Ready(h) => h,
+                    Poll::Pending => panic!("h2 should be Ready (last handle)"),
+                };
+
+                // Poll fut1 — it was woken (removed from list), returns Ready.
+                let _h1_new = match poll_once(fut1.as_mut()) {
+                    Poll::Ready(h) => h,
+                    Poll::Pending => panic!("fut1 should be Ready after wake"),
+                };
+
+                // Drop fut0 without re-polling.  Its node has epoch=1 but
+                // current epoch is 2, so reset_node must use the clear list.
+                // (banana — Removed, needs_load false)
+                drop(fut0);
+            },
+        );
+    }
+
+    /// Same stale-epoch scenario as above, but all sibling handles are dropped
+    /// after the load so that `remaining == 0` when fut0 is dropped.  This
+    /// exercises the mango (Removed + needs_load) branch on the clear list.
+    #[test]
+    fn drop_stale_epoch_waiter_needs_load_hands_off_baton() {
+        let bufs: &[&[u8]] = &[b"initial", b"loaded", b"third"];
+        let mut i = 0usize;
+        SharedBuf::with(
+            bufs[0],
+            async |b: &mut &[u8]| {
+                i += 1;
+                *b = bufs[i];
+            },
+            |shared| {
+                let mut h0 = shared.fork();
+                let mut h1 = h0.fork();
+                let h2 = h1.fork();
+
+                let mut fut0 = core::pin::pin!(h0.next());
+                let mut fut1 = core::pin::pin!(h1.next());
+                assert!(matches!(poll_once(fut0.as_mut()), Poll::Pending));
+                assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
+
+                // h2 is last → loads, epoch 1→2, wakes fut1 and fut0.
+                let mut fut2 = core::pin::pin!(h2.next());
+                let h2_new = match poll_once(fut2.as_mut()) {
+                    Poll::Ready(h) => h,
+                    Poll::Pending => panic!("h2 should be Ready"),
+                };
+
+                // Poll fut1 → Ready (node removed).
+                let h1_new = match poll_once(fut1.as_mut()) {
+                    Poll::Ready(h) => h,
+                    Poll::Pending => panic!("fut1 should be Ready"),
+                };
+
+                // Drop both returned handles → remaining hits 0.
+                drop(h1_new);
+                drop(h2_new);
+
+                // Drop fut0: stale epoch, Removed, needs_load → mango branch.
+                // Must wake_one (no-op here since no other waiters).
+                drop(fut0);
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-entrant waker helpers
+    // -----------------------------------------------------------------------
+
+    /// A waker backed by a `Cell<Option<RawAction>>`.  When woken it takes
+    /// the stored action and calls it.  The action is a type-erased `FnOnce()`
+    /// stored as a raw pointer + caller pair, sidestepping `'static` bounds.
+    ///
+    /// SAFETY contract: the action must be consumed or dropped before the
+    /// captured data goes out of scope.  All uses in these tests fire
+    /// synchronously inside `load_and_wake`, which returns before the
+    /// captured pinned futures are dropped.
+    struct RawAction {
+        data: *mut (),
+        call: unsafe fn(*mut ()),
+    }
+    // SAFETY: single-threaded tests only.
+    unsafe impl Send for RawAction {}
+
+    impl RawAction {
+        /// Create from a concrete `FnOnce()`.  Caller must ensure `f` is
+        /// not dropped before `call` is invoked (or the RawAction is
+        /// discarded).
+        fn new<F: FnOnce()>(f: F) -> Self {
+            let boxed = Box::into_raw(Box::new(f));
+            RawAction {
+                data: boxed as *mut (),
+                call: |ptr| unsafe { Box::from_raw(ptr as *mut F)() },
+            }
+        }
+    }
+
+    fn reentrant_waker(slot: &Cell<Option<RawAction>>) -> Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+
+        let ptr = slot as *const Cell<Option<RawAction>> as *const ();
+        unsafe fn clone(ptr: *const ()) -> RawWaker { RawWaker::new(ptr, &VTABLE) }
+        unsafe fn wake(ptr: *const ()) {
+            let cell = unsafe { &*(ptr as *const Cell<Option<RawAction>>) };
+            if let Some(action) = cell.take() { unsafe { (action.call)(action.data) }; }
+        }
+        unsafe fn wake_ref(ptr: *const ()) {
+            let cell = unsafe { &*(ptr as *const Cell<Option<RawAction>>) };
+            if let Some(action) = cell.take() { unsafe { (action.call)(action.data) }; }
+        }
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_ref, drop);
+        unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
+    }
+
+    /// Re-entrant wake during `load_and_wake`'s drain of the clear list.
+    /// fut1 is at the head (pushed last via push_front).  Its re-entrant
+    /// waker synchronously polls fut1 to Ready, then drops fut0 — which is
+    /// still linked in `clear` (not yet drained).  This exercises the apple
+    /// branch (Linked + stale epoch) on the clear list.
+    #[test]
+    fn reentrant_wake_drops_linked_stale_node() {
+        let bufs: &[&[u8]] = &[b"initial", b"loaded"];
+        let mut i = 0usize;
+        SharedBuf::with(
+            bufs[0],
+            async |b: &mut &[u8]| {
+                i += 1;
+                *b = bufs[i];
+            },
+            |shared| {
+                let mut h0 = shared.fork();
+                let mut h1 = h0.fork();
+                let h2 = h1.fork();
+
+                // We need raw pointers to the pinned futures so the re-entrant
+                // waker can poll fut1 and drop fut0 during the wake call.
+                // SAFETY: both futures are pinned on the stack and outlive the
+                // waker usage (the waker fires synchronously inside this scope).
+                let fut0_storage: Cell<Option<RawAction>> = Cell::new(None);
+                let _fut1_storage: Cell<Option<RawAction>> = Cell::new(None);
+
+                // Poll fut1 with noop waker first (pushed first → tail of list).
+                // Wrapped in ManuallyDrop so the re-entrant drop_in_place
+                // doesn't cause a double-drop when the stack frame exits.
+                let mut fut1 = core::pin::pin!(mem::ManuallyDrop::new(h1.next()));
+                // SAFETY: projecting Pin<&mut ManuallyDrop<F>> → Pin<&mut F>.
+                macro_rules! fut1_pin {
+                    ($f:expr) => {
+                        unsafe { $f.as_mut().map_unchecked_mut(|md| &mut **md) }
+                    };
+                }
+                assert!(matches!(poll_once(fut1_pin!(fut1)), Poll::Pending));
+
+                // Poll fut0 with the re-entrant waker (pushed second → head).
+                // When woken, the closure will drop fut1 (still linked at tail).
+                let mut fut0 = core::pin::pin!(h0.next());
+                {
+                    let w = reentrant_waker(&fut0_storage);
+                    let mut cx = Context::from_waker(&w);
+                    assert!(matches!(fut0.as_mut().poll(&mut cx), Poll::Pending));
+                }
+
+                // Capture the unnameable future type via a phantom token,
+                // then erase to a raw pointer + drop fn pair.
+                fn type_token<T>(_: &T) -> core::marker::PhantomData<fn(*const T)> {
+                    core::marker::PhantomData
+                }
+                fn drop_erased<T>(_: core::marker::PhantomData<fn(*const T)>, ptr: *mut ()) {
+                    unsafe { core::ptr::drop_in_place(ptr as *mut T) };
+                }
+                let token = type_token(unsafe { &**fut1.as_mut().get_unchecked_mut() });
+                let fut1_raw: *mut () = unsafe { &mut **fut1.as_mut().get_unchecked_mut() }
+                    as *mut _ as *mut ();
+                // SAFETY: the raw pointer targets a pinned stack future that
+                // is alive when the re-entrant waker fires (synchronously
+                // during load_and_wake, before this scope exits).
+                fut0_storage.set(Some(RawAction::new(move || {
+                    drop_erased(token, fut1_raw);
+                })));
+
+                // h2 is the last handle → load_and_wake fires, drains clear
+                // list.  fut1 (head) is woken first → re-entrant closure fires,
+                // polls fut1 to Ready, drops fut0 (still linked in clear).
+                let mut fut2 = core::pin::pin!(h2.next());
+                let _h2_new = match poll_once(fut2.as_mut()) {
+                    Poll::Ready(h) => h,
+                    Poll::Pending => panic!("h2 should be Ready (last handle)"),
+                };
+
+                // fut1 was already drop_in_place'd inside the re-entrant
+                // wake.  ManuallyDrop prevents a second drop at scope exit.
+                // fut0 is still alive — its waker fired but it was never
+                // polled to Ready.  Let it drop normally.
             },
         );
     }
