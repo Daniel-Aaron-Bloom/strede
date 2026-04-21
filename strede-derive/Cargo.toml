@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "Derive macros for strede"
+readme = "../README.md"
 
 [lib]
 proc-macro = true

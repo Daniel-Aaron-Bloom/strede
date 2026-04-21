@@ -672,12 +672,10 @@ fn expand_struct(
                     })
                     .collect();
                 quote! { #next_cont_name { #( #next_cell_args, )* } }
+            } else if use_boxed {
+                quote! { #krate::FlattenTerminalBoxed }
             } else {
-                if use_boxed {
-                    quote! { #krate::FlattenTerminaloxed }
-                } else {
-                    quote! { #krate::FlattenTerminal }
-                }
+                quote! { #krate::FlattenTerminal }
             };
 
             let next_extra_cell = if i + 1 < flatten_fields.len() - 1 {
@@ -760,7 +758,7 @@ fn expand_struct(
         let first_flat_ty = flatten_fields[0].1;
 
         let terminal_expr = if use_boxed {
-            quote! { #krate::FlattenTerminaloxed }
+            quote! { #krate::FlattenTerminalBoxed }
         } else {
             quote! { #krate::FlattenTerminal }
         };
