@@ -25,6 +25,7 @@ pub enum Probe<T> {
 
 impl<T> Probe<T> {
     /// Unwrap a `Hit`, panicking on `Miss`.
+    #[inline(always)]
     pub fn unwrap(self) -> T {
         match self {
             Probe::Hit(v) => v,
@@ -33,6 +34,7 @@ impl<T> Probe<T> {
     }
 
     /// Convert to `Result`, treating `Miss` as an error via the provided closure.
+    #[inline(always)]
     pub fn require<E>(self, on_miss: impl FnOnce() -> E) -> Result<T, E> {
         match self {
             Probe::Hit(v) => Ok(v),
@@ -40,14 +42,17 @@ impl<T> Probe<T> {
         }
     }
 
+    #[inline(always)]
     pub fn is_miss(&self) -> bool {
         matches!(self, Probe::Miss)
     }
+    #[inline(always)]
     pub fn is_hit(&self) -> bool {
         matches!(self, Probe::Hit(_))
     }
 
     /// Map the inner value of a `Hit`, leaving `Miss` unchanged.
+    #[inline(always)]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Probe<U> {
         match self {
             Probe::Hit(v) => Probe::Hit(f(v)),
@@ -186,6 +191,7 @@ pub struct MissWrapper<T>(pub T);
 
 // Inherent method for Future types (takes priority)
 impl<T: Future> MissWrapper<T> {
+    #[inline(always)]
     pub fn into_future(self) -> T {
         self.0
     }
@@ -199,6 +205,7 @@ pub trait MissFallback {
 }
 impl<T, E> MissFallback for MissWrapper<Result<Probe<T>, E>> {
     type Fut = core::future::Ready<Result<Probe<T>, E>>;
+    #[inline(always)]
     fn into_future(self) -> Self::Fut {
         core::future::ready(self.0)
     }
@@ -214,10 +221,13 @@ pub trait SelectProbeKillFlag {
 
 impl SelectProbeKillFlag for () {
     const SIZE: usize = 0;
+    #[inline(always)]
     fn new() -> Self {}
+    #[inline(always)]
     fn is_marked(&self, _i: usize) -> bool {
         unreachable!()
     }
+    #[inline(always)]
     fn mark(&self, _i: usize) {
         unreachable!()
     }
@@ -225,9 +235,11 @@ impl SelectProbeKillFlag for () {
 
 impl<T: SelectProbeKillFlag> SelectProbeKillFlag for (T, Cell<bool>) {
     const SIZE: usize = T::SIZE + 1;
+    #[inline(always)]
     fn new() -> Self {
         (T::new(), Cell::new(false))
     }
+    #[inline(always)]
     fn is_marked(&self, i: usize) -> bool {
         debug_assert!(i < Self::SIZE);
         if i == Self::SIZE - 1 {
@@ -236,6 +248,7 @@ impl<T: SelectProbeKillFlag> SelectProbeKillFlag for (T, Cell<bool>) {
             self.0.is_marked(i)
         }
     }
+    #[inline(always)]
     fn mark(&self, i: usize) {
         debug_assert!(i < Self::SIZE);
         if i == Self::SIZE - 1 {
@@ -253,22 +266,26 @@ pub struct KillManager<T: SelectProbeKillFlag> {
 }
 
 impl<T: SelectProbeKillFlag> Default for KillManager<T> {
+    #[inline(always)]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<T: SelectProbeKillFlag> KillManager<T> {
+    #[inline(always)]
     pub fn new() -> Self {
         Self {
             flags: T::new(),
             new_kills: Cell::new(false),
         }
     }
+    #[inline(always)]
     pub fn mark(&self, i: usize) {
         self.flags.mark(i);
         self.new_kills.set(true);
     }
+    #[inline(always)]
     fn take_new_kills(&self) -> bool {
         self.new_kills.replace(false)
     }
@@ -288,6 +305,7 @@ pub struct SelectProbeBase;
 // SelectProbeBase + ProbeArm(f) → SP1
 impl<F> core::ops::Add<ProbeArm<F>> for SelectProbeBase {
     type Output = SP1<F>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<F>) -> SP1<F> {
         SP1(Some(rhs.0))
     }
@@ -321,6 +339,7 @@ pub struct SP4<A, B, C, D>(
 // SP1 + ProbeArm → SP2
 impl<A, B> core::ops::Add<ProbeArm<B>> for SP1<A> {
     type Output = SP2<A, B>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<B>) -> SP2<A, B> {
         SP2(self.0, Some(rhs.0))
     }
@@ -329,6 +348,7 @@ impl<A, B> core::ops::Add<ProbeArm<B>> for SP1<A> {
 // SP2 + ProbeArm → SP3
 impl<A, B, C> core::ops::Add<ProbeArm<C>> for SP2<A, B> {
     type Output = SP3<A, B, C>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<C>) -> SP3<A, B, C> {
         SP3(self.0, self.1, Some(rhs.0))
     }
@@ -337,6 +357,7 @@ impl<A, B, C> core::ops::Add<ProbeArm<C>> for SP2<A, B> {
 // SP3 + ProbeArm → SP4
 impl<A, B, C, D> core::ops::Add<ProbeArm<D>> for SP3<A, B, C> {
     type Output = SP4<A, B, C, D>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<D>) -> SP4<A, B, C, D> {
         SP4(self.0, self.1, self.2, Some(rhs.0))
     }
@@ -345,6 +366,7 @@ impl<A, B, C, D> core::ops::Add<ProbeArm<D>> for SP3<A, B, C> {
 // SP4 + ProbeArm → overflow into left-nested SelectProbeSlot chain
 impl<A, B, C, D, E> core::ops::Add<ProbeArm<E>> for SP4<A, B, C, D> {
     type Output = SelectProbeSlot<SP4<A, B, C, D>, E>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<E>) -> SelectProbeSlot<SP4<A, B, C, D>, E> {
         SelectProbeSlot {
             rest: self,
@@ -356,6 +378,7 @@ impl<A, B, C, D, E> core::ops::Add<ProbeArm<E>> for SP4<A, B, C, D> {
 // SelectProbeSlot<L, F> + ProbeArm → keep left-nesting
 impl<L, F, G> core::ops::Add<ProbeArm<G>> for SelectProbeSlot<L, F> {
     type Output = SelectProbeSlot<SelectProbeSlot<L, F>, G>;
+    #[inline(always)]
     fn add(self, rhs: ProbeArm<G>) -> SelectProbeSlot<SelectProbeSlot<L, F>, G> {
         SelectProbeSlot {
             rest: self,
@@ -383,30 +406,35 @@ pub trait IntoSelectProbeSlots {
 
 impl<A> IntoSelectProbeSlots for SP1<A> {
     type Slots = Self;
+    #[inline(always)]
     fn into_slots(self) -> Self {
         self
     }
 }
 impl<A, B> IntoSelectProbeSlots for SP2<A, B> {
     type Slots = Self;
+    #[inline(always)]
     fn into_slots(self) -> Self {
         self
     }
 }
 impl<A, B, C> IntoSelectProbeSlots for SP3<A, B, C> {
     type Slots = Self;
+    #[inline(always)]
     fn into_slots(self) -> Self {
         self
     }
 }
 impl<A, B, C, D> IntoSelectProbeSlots for SP4<A, B, C, D> {
     type Slots = Self;
+    #[inline(always)]
     fn into_slots(self) -> Self {
         self
     }
 }
 impl<L: IntoSelectProbeSlots, F> IntoSelectProbeSlots for SelectProbeSlot<L, F> {
     type Slots = SelectProbeSlot<L::Slots, F>;
+    #[inline(always)]
     fn into_slots(self) -> Self::Slots {
         SelectProbeSlot {
             rest: self.rest.into_slots(),
@@ -419,37 +447,31 @@ impl<L: IntoSelectProbeSlots, F> IntoSelectProbeSlots for SelectProbeSlot<L, F> 
 pub trait SelectProbeFutures<T, E> {
     const SIZE: usize;
     type KF: SelectProbeKillFlag;
-    type DF: SelectProbeDoneFlag;
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF);
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize);
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>>;
 }
 
-// Helper: poll a pinned Option<F> slot, updating the done flag.
+// Helper: poll a pinned Option<F> slot.
 // Returns Poll::Ready(Some(result)) on hit/err, Poll::Pending otherwise.
-// Sets *done = true on Miss.
+// On Miss, sets slot to None and decrements *active.
 #[inline(always)]
 fn poll_slot<T, E, F: Future<Output = Result<Probe<T>, E>>>(
-    slot: Pin<&mut Option<F>>,
-    done: &mut bool,
+    mut slot: Pin<&mut Option<F>>,
+    active: &mut usize,
     cx: &mut Context<'_>,
 ) -> Poll<Option<Result<Probe<T>, E>>> {
-    if *done {
-        return Poll::Pending;
-    }
-    match slot.as_pin_mut() {
-        None => {
-            *done = true;
-            Poll::Pending
-        }
+    match slot.as_mut().as_pin_mut() {
+        None => Poll::Pending,
         Some(fut) => match Future::poll(fut, cx) {
             Poll::Ready(Ok(Probe::Hit(v))) => Poll::Ready(Some(Ok(Probe::Hit(v)))),
             Poll::Ready(Ok(Probe::Miss)) => {
-                *done = true;
+                slot.set(None);
+                *active -= 1;
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -462,38 +484,24 @@ fn poll_slot<T, E, F: Future<Output = Result<Probe<T>, E>>>(
 #[doc(hidden)]
 pub struct FlatKillFlags<const N: usize>([Cell<bool>; N]);
 impl<const N: usize> FlatKillFlags<N> {
+    #[inline(always)]
     fn new() -> Self {
         Self(core::array::from_fn(|_| Cell::new(false)))
     }
 }
 impl<const N: usize> SelectProbeKillFlag for FlatKillFlags<N> {
     const SIZE: usize = N;
+    #[inline(always)]
     fn new() -> Self {
         Self::new()
     }
+    #[inline(always)]
     fn is_marked(&self, i: usize) -> bool {
         self.0[i].get()
     }
+    #[inline(always)]
     fn mark(&self, i: usize) {
         self.0[i].set(true);
-    }
-}
-
-/// Done flags for flat SP1–SP4: one `bool` per arm.
-#[doc(hidden)]
-pub struct FlatDoneFlags<const N: usize>([bool; N]);
-impl<const N: usize> FlatDoneFlags<N> {
-    fn new() -> Self {
-        Self([false; N])
-    }
-}
-impl<const N: usize> SelectProbeDoneFlag for FlatDoneFlags<N> {
-    const SIZE: usize = N;
-    fn new() -> Self {
-        Self::new()
-    }
-    fn all_done(&self) -> bool {
-        self.0.iter().all(|&d| d)
     }
 }
 
@@ -501,21 +509,23 @@ impl<const N: usize> SelectProbeDoneFlag for FlatDoneFlags<N> {
 impl<T, E, A: Future<Output = Result<Probe<T>, E>>> SelectProbeFutures<T, E> for SP1<A> {
     const SIZE: usize = 1;
     type KF = FlatKillFlags<1>;
-    type DF = FlatDoneFlags<1>;
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF) {
-        if !done.0[0] && kill_flags.0[0].get() {
-            self.project().0.set(None);
-            done.0[0] = true;
+    #[inline(always)]
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize) {
+        let mut slot = self.project().0;
+        if kill_flags.0[0].get() && slot.as_mut().as_pin_mut().is_some() {
+            slot.set(None);
+            *active -= 1;
         }
     }
+    #[inline(always)]
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>> {
         debug_assert_eq!(i, 0);
-        match poll_slot(self.project().0, &mut done.0[0], cx) {
+        match poll_slot(self.project().0, active, cx) {
             Poll::Ready(Some(r)) => Poll::Ready(r),
             _ => Poll::Pending,
         }
@@ -528,32 +538,33 @@ impl<T, E, A: Future<Output = Result<Probe<T>, E>>, B: Future<Output = Result<Pr
 {
     const SIZE: usize = 2;
     type KF = FlatKillFlags<2>;
-    type DF = FlatDoneFlags<2>;
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF) {
+    #[inline(always)]
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize) {
         let mut p = self.project();
-        if !done.0[0] && kill_flags.0[0].get() {
+        if kill_flags.0[0].get() && p.0.as_mut().as_pin_mut().is_some() {
             p.0.set(None);
-            done.0[0] = true;
+            *active -= 1;
         }
-        if !done.0[1] && kill_flags.0[1].get() {
+        if kill_flags.0[1].get() && p.1.as_mut().as_pin_mut().is_some() {
             p.1.set(None);
-            done.0[1] = true;
+            *active -= 1;
         }
     }
+    #[inline(always)]
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>> {
         debug_assert!(i < 2);
         let p = self.project();
         match i {
-            0 => match poll_slot(p.0, &mut done.0[0], cx) {
+            0 => match poll_slot(p.0, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            _ => match poll_slot(p.1, &mut done.0[1], cx) {
+            _ => match poll_slot(p.1, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
@@ -572,40 +583,41 @@ impl<
 {
     const SIZE: usize = 3;
     type KF = FlatKillFlags<3>;
-    type DF = FlatDoneFlags<3>;
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF) {
+    #[inline(always)]
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize) {
         let mut p = self.project();
-        if !done.0[0] && kill_flags.0[0].get() {
+        if kill_flags.0[0].get() && p.0.as_mut().as_pin_mut().is_some() {
             p.0.set(None);
-            done.0[0] = true;
+            *active -= 1;
         }
-        if !done.0[1] && kill_flags.0[1].get() {
+        if kill_flags.0[1].get() && p.1.as_mut().as_pin_mut().is_some() {
             p.1.set(None);
-            done.0[1] = true;
+            *active -= 1;
         }
-        if !done.0[2] && kill_flags.0[2].get() {
+        if kill_flags.0[2].get() && p.2.as_mut().as_pin_mut().is_some() {
             p.2.set(None);
-            done.0[2] = true;
+            *active -= 1;
         }
     }
+    #[inline(always)]
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>> {
         debug_assert!(i < 3);
         let p = self.project();
         match i {
-            0 => match poll_slot(p.0, &mut done.0[0], cx) {
+            0 => match poll_slot(p.0, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            1 => match poll_slot(p.1, &mut done.0[1], cx) {
+            1 => match poll_slot(p.1, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            _ => match poll_slot(p.2, &mut done.0[2], cx) {
+            _ => match poll_slot(p.2, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
@@ -625,48 +637,49 @@ impl<
 {
     const SIZE: usize = 4;
     type KF = FlatKillFlags<4>;
-    type DF = FlatDoneFlags<4>;
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF) {
+    #[inline(always)]
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize) {
         let mut p = self.project();
-        if !done.0[0] && kill_flags.0[0].get() {
+        if kill_flags.0[0].get() && p.0.as_mut().as_pin_mut().is_some() {
             p.0.set(None);
-            done.0[0] = true;
+            *active -= 1;
         }
-        if !done.0[1] && kill_flags.0[1].get() {
+        if kill_flags.0[1].get() && p.1.as_mut().as_pin_mut().is_some() {
             p.1.set(None);
-            done.0[1] = true;
+            *active -= 1;
         }
-        if !done.0[2] && kill_flags.0[2].get() {
+        if kill_flags.0[2].get() && p.2.as_mut().as_pin_mut().is_some() {
             p.2.set(None);
-            done.0[2] = true;
+            *active -= 1;
         }
-        if !done.0[3] && kill_flags.0[3].get() {
+        if kill_flags.0[3].get() && p.3.as_mut().as_pin_mut().is_some() {
             p.3.set(None);
-            done.0[3] = true;
+            *active -= 1;
         }
     }
+    #[inline(always)]
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>> {
         debug_assert!(i < 4);
         let p = self.project();
         match i {
-            0 => match poll_slot(p.0, &mut done.0[0], cx) {
+            0 => match poll_slot(p.0, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            1 => match poll_slot(p.1, &mut done.0[1], cx) {
+            1 => match poll_slot(p.1, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            2 => match poll_slot(p.2, &mut done.0[2], cx) {
+            2 => match poll_slot(p.2, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
-            _ => match poll_slot(p.3, &mut done.0[3], cx) {
+            _ => match poll_slot(p.3, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             },
@@ -680,59 +693,36 @@ impl<T, E, F: Future<Output = Result<Probe<T>, E>>, Rest: SelectProbeFutures<T, 
 {
     const SIZE: usize = Rest::SIZE + 1;
     type KF = (Rest::KF, Cell<bool>);
-    type DF = (Rest::DF, bool);
-    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, done: &mut Self::DF) {
+    #[inline(always)]
+    fn process_kills(self: Pin<&mut Self>, kill_flags: &Self::KF, active: &mut usize) {
         let mut this = self.project();
-        this.rest.process_kills(&kill_flags.0, &mut done.0);
-        if !done.1 && kill_flags.1.get() {
+        this.rest.process_kills(&kill_flags.0, active);
+        if kill_flags.1.get() && this.fut.as_mut().as_pin_mut().is_some() {
             this.fut.set(None);
-            done.1 = true;
+            *active -= 1;
         }
     }
+    #[inline(always)]
     fn poll_one(
         self: Pin<&mut Self>,
         i: usize,
-        done: &mut Self::DF,
+        active: &mut usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<T>, E>> {
         debug_assert!(i < Self::SIZE);
         if i == Self::SIZE - 1 {
-            match poll_slot(self.project().fut, &mut done.1, cx) {
+            match poll_slot(self.project().fut, active, cx) {
                 Poll::Ready(Some(r)) => Poll::Ready(r),
                 _ => Poll::Pending,
             }
         } else {
-            self.project().rest.poll_one(i, &mut done.0, cx)
+            self.project().rest.poll_one(i, active, cx)
         }
     }
 }
 
 #[doc(hidden)]
-pub trait SelectProbeDoneFlag {
-    const SIZE: usize;
-    fn new() -> Self;
-    fn all_done(&self) -> bool;
-}
-
-impl SelectProbeDoneFlag for () {
-    const SIZE: usize = 0;
-    fn new() -> Self {}
-    fn all_done(&self) -> bool {
-        true
-    }
-}
-
-impl<T: SelectProbeDoneFlag> SelectProbeDoneFlag for (T, bool) {
-    const SIZE: usize = T::SIZE + 1;
-    fn new() -> Self {
-        (T::new(), false)
-    }
-    fn all_done(&self) -> bool {
-        self.1 && self.0.all_done()
-    }
-}
-
-#[doc(hidden)]
+#[inline(always)]
 pub const fn align_types<T, E, M, Fut>(_: *const Result<Probe<T>, E>, _: *const M)
 where
     M: FnOnce() -> Fut,
@@ -742,6 +732,7 @@ where
 
 /// Runs select_probe polling. Takes bare futures via `IntoSelectProbeSlots`,
 /// pins them internally.
+#[inline(always)]
 pub async fn select_probe<T, E, Raw, M, Fut>(
     biased: bool,
     kills: &KillManager<<Raw::Slots as SelectProbeFutures<T, E>>::KF>,
@@ -755,21 +746,21 @@ where
     Fut: Future<Output = Result<Probe<T>, E>>,
 {
     let mut slots = core::pin::pin!(futures.into_slots());
-    let mut done = <Raw::Slots as SelectProbeFutures<T, E>>::DF::new();
+    let mut active = <Raw::Slots as SelectProbeFutures<T, E>>::SIZE;
     let v = core::future::poll_fn(move |cx| {
         for i in 0..<Raw::Slots as SelectProbeFutures<T, E>>::SIZE {
             if kills.take_new_kills() {
-                slots.as_mut().process_kills(&kills.flags, &mut done);
+                slots.as_mut().process_kills(&kills.flags, &mut active);
             }
-            match slots.as_mut().poll_one(i, &mut done, cx) {
+            match slots.as_mut().poll_one(i, &mut active, cx) {
                 Poll::Ready(Ok(Probe::Hit(val))) if biased => {
                     // Re-poll arms 0..i to see if a higher-priority arm is
                     // also ready. If so, prefer it over arm i.
                     for j in 0..i {
                         if kills.take_new_kills() {
-                            slots.as_mut().process_kills(&kills.flags, &mut done);
+                            slots.as_mut().process_kills(&kills.flags, &mut active);
                         }
-                        match slots.as_mut().poll_one(j, &mut done, cx) {
+                        match slots.as_mut().poll_one(j, &mut active, cx) {
                             Poll::Ready(Ok(Probe::Hit(earlier_val))) => {
                                 drop(val);
                                 return Poll::Ready(Some(Ok(Probe::Hit(earlier_val))));
@@ -788,7 +779,7 @@ where
                 Poll::Pending => {}
             }
         }
-        if done.all_done() {
+        if active == 0 {
             return Poll::Ready(None);
         }
         Poll::Pending
@@ -814,12 +805,14 @@ pub enum Chunk<Data, Done> {
 }
 
 impl<Data, Done> Chunk<Data, Done> {
+    #[inline(always)]
     pub fn data(self) -> Option<Data> {
         match self {
             Self::Data(d) => Some(d),
             _ => None,
         }
     }
+    #[inline(always)]
     pub fn done(self) -> Option<Done> {
         match self {
             Self::Done(d) => Some(d),
@@ -827,6 +820,7 @@ impl<Data, Done> Chunk<Data, Done> {
         }
     }
 
+    #[inline(always)]
     pub fn map_data<Data2>(self, f: impl FnOnce(Data) -> Data2) -> Chunk<Data2, Done> {
         match self {
             Self::Data(d) => Chunk::Data(f(d)),

@@ -335,7 +335,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
         (guard.loader.as_mut().unwrap())(b).await;
         self.load_state
             .set(LoadState::Idle(guard.loader.take().unwrap()));
-        core::mem::forget(guard);
+        mem::forget(guard);
     }
 
     fn fork_helper(&self) -> Handle<'_, B, F> {

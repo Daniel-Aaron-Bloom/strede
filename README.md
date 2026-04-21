@@ -566,6 +566,41 @@ e.deserialize_value::<UnwrapOrElse<MyType>, _>((async || MyType::default(), ()))
 The derive macro uses `UnwrapOrElse<MatchVals<usize>>` with a sentinel fallback
 so unknown map keys produce a sentinel index while still consuming the key entry.
 
+## Performance
+
+strede is currently **~10–15x slower than serde_json** in the borrow family and **~20–35x slower** in the owned family on equivalent JSON
+deserialization workloads. Benchmarks (Criterion, Apple M-series):
+
+| benchmark   | strede/borrow | strede/owned | serde_json | borrow ratio | owned ratio |
+| ----------- | ------------- | ------------ | ---------- | -----------: | ----------: |
+| point       | ~400 ns       | ~850 ns      | ~30 ns     |         ~13× |        ~30× |
+| log_entry   | ~1.0 µs       | ~3 µs        | ~90 ns     |         ~11× |        ~33× |
+| rect        | ~1.1 µs       | ~2.5 µs      | ~100 ns    |         ~11× |        ~25× |
+| deep_nested | ~4.4 µs       | ~11 µs       | ~500 ns    |          ~9× |        ~22× |
+
+The gap is structural. serde's visitor pattern compiles to a tight
+synchronous dispatch loop. strede's coroutine model produces nested async
+state machines - one per field, per nested type, per arm of every
+`select_probe!`. Each layer adds state-machine overhead at compile time and movement cost at
+runtime, i.e. the cost of Rust
+storing each nested future into its parent state machine on every `.await`.
+
+Language-level [in-place initialization](https://rust-lang.github.io/rust-project-goals/2025h2/in-place-initialization.html)
+would allow futures to be constructed directly into their parent state
+machine slot rather than moved there, which may significantly reduce this
+overhead.
+
+**Compile times and recursion limits.** Deeply-nested async state machines also
+stress the compiler's recursion limit. If you encounter `reached the recursion
+limit` errors, add this to the crate:
+
+```rust
+#![recursion_limit = "256"]
+```
+
+This is the nested future types produced by coroutine deserialization,
+not an artifact of macro expansion.
+
 ## Status
 
 Early development - core traits stable with both borrow and owned families.

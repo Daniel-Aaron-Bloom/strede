@@ -4,6 +4,7 @@ members = [
     "strede-derive",
     "strede-json",
     "strede-test-util",
+    "strede-bench",
 ]
 resolver = "2"
 
@@ -23,3 +24,7 @@ rust-version = "1.88"
 
 [profile.test]
 opt-level = 1
+
+[profile.bench]
+lto = true
+debug = 1

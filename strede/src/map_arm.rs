@@ -266,36 +266,30 @@ pub enum TagDispatchState<TagFut, InnerState> {
 // poll_key_slot - shared helper
 // ---------------------------------------------------------------------------
 
-/// Poll an `Option<Future>` slot, returning `Miss` if `None` or already done.
+/// Poll an `Option<Future>` slot, returning `Miss` if the slot is `None`.
 ///
 /// Used by both families' `poll_race_one` implementations.
+#[inline(always)]
 pub(crate) fn poll_key_slot<F, KC, K, E>(
-    slot: Pin<&mut Option<F>>,
-    done: &mut bool,
+    mut slot: Pin<&mut Option<F>>,
     cx: &mut Context<'_>,
 ) -> Poll<Result<Probe<(KC, K)>, E>>
 where
     F: Future<Output = Result<Probe<(KC, K)>, E>>,
 {
-    if *done {
-        return Poll::Ready(Ok(Probe::Miss));
-    }
-    match slot.as_pin_mut() {
-        None => {
-            *done = true;
-            Poll::Ready(Ok(Probe::Miss))
-        }
+    match slot.as_mut().as_pin_mut() {
+        None => Poll::Ready(Ok(Probe::Miss)),
         Some(fut) => match fut.poll(cx) {
             Poll::Ready(Ok(Probe::Hit(v))) => {
-                *done = true;
+                slot.set(None);
                 Poll::Ready(Ok(Probe::Hit(v)))
             }
             Poll::Ready(Ok(Probe::Miss)) => {
-                *done = true;
+                slot.set(None);
                 Poll::Ready(Ok(Probe::Miss))
             }
             Poll::Ready(Err(e)) => {
-                *done = true;
+                slot.set(None);
                 Poll::Ready(Err(e))
             }
             Poll::Pending => Poll::Pending,

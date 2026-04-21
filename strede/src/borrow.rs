@@ -1,4 +1,5 @@
 use core::future::Future;
+use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -455,15 +456,12 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
     fn open_count(&self) -> usize;
 
     type RaceState;
-    type RaceDone;
 
-    fn init_race(&mut self, kp: KP) -> (Self::RaceState, Self::RaceDone);
-    fn race_all_done(done: &Self::RaceDone) -> bool;
+    fn init_race(&mut self, kp: KP) -> Self::RaceState;
     #[allow(clippy::type_complexity)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>>;
@@ -483,18 +481,20 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
-        let (race_state, mut done) = self.init_race(kp);
-        let mut race_state = core::pin::pin!(race_state);
+        let mut race_state = core::pin::pin!(self.init_race(kp));
         core::future::poll_fn(|cx| {
+            let mut all_miss = true;
             for i in 0..Self::SIZE {
-                match self.poll_race_one(race_state.as_mut(), &mut done, i, cx) {
+                match self.poll_race_one(race_state.as_mut(), i, cx) {
                     Poll::Ready(Ok(Probe::Hit(v))) => return Poll::Ready(Ok(Probe::Hit(v))),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(Probe::Miss)) => {}
-                    Poll::Pending => {}
+                    Poll::Pending => {
+                        all_miss = false;
+                    }
                 }
             }
-            if Self::race_all_done(&done) {
+            if all_miss {
                 return Poll::Ready(Ok(Probe::Miss));
             }
             Poll::Pending
@@ -522,26 +522,23 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
     const SIZE: usize = 0;
     type Outputs = ();
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         0
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         0
     }
 
     type RaceState = ();
-    type RaceDone = ();
 
-    fn init_race(&mut self, _kp: KP) -> ((), ()) {
-        ((), ())
-    }
-    fn race_all_done(_done: &()) -> bool {
-        true
-    }
+    #[inline(always)]
+    fn init_race(&mut self, _kp: KP) {}
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         _state: Pin<&mut ()>,
-        _done: &mut (),
         _arm_index: usize,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
@@ -550,9 +547,11 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
 
     type DispatchState = core::convert::Infallible;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, _arm_index: usize, _vp: VP<'de, KP>) -> Self::DispatchState {
         unreachable!("init_dispatch called on MapArmBase")
     }
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         _state: Pin<&mut Self::DispatchState>,
@@ -561,6 +560,7 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
         unreachable!("poll_dispatch called on MapArmBase")
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) {}
 }
 
@@ -579,48 +579,41 @@ where
     const SIZE: usize = Rest::SIZE + 1;
     type Outputs = (Rest::Outputs, Option<(K, V)>);
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count() + if self.1.state.is_done() { 0 } else { 1 }
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         self.0.open_count() + if self.1.state.is_done() { 0 } else { 1 }
     }
 
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
-    type RaceDone = (Rest::RaceDone, bool);
 
-    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
-        let this_done = self.1.state.is_done();
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
         let rest_kp = kp.fork();
-        let this_fut = if this_done {
+        let this_fut = if self.1.state.is_done() {
             None
         } else {
             Some((self.1.key_fn)(kp))
         };
-        let (rest_state, rest_done) = self.0.init_race(rest_kp);
-        (
-            SlotRaceState {
-                rest: rest_state,
-                this: this_fut,
-            },
-            (rest_done, this_done),
-        )
+        SlotRaceState {
+            rest: self.0.init_race(rest_kp),
+            this: this_fut,
+        }
     }
 
-    fn race_all_done(done: &Self::RaceDone) -> bool {
-        Rest::race_all_done(&done.0) && done.1
-    }
-
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
         let projected = state.project();
         if arm_index == Self::SIZE - 1 {
-            match poll_key_slot(projected.this, &mut done.1, cx) {
+            match poll_key_slot(projected.this, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
                     self.1.state = ArmState::Key(k);
                     Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
@@ -630,13 +623,13 @@ where
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            self.0
-                .poll_race_one(projected.rest, &mut done.0, arm_index, cx)
+            self.0.poll_race_one(projected.rest, arm_index, cx)
         }
     }
 
     type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             let k = match core::mem::replace(&mut self.1.state, ArmState::Empty) {
@@ -649,6 +642,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -668,8 +662,9 @@ where
         }
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
-        let out = match core::mem::replace(&mut self.1.state, ArmState::Empty) {
+        let out = match mem::replace(&mut self.1.state, ArmState::Empty) {
             ArmState::Done(k, v) => Some((k, v)),
             _ => None,
         };
@@ -692,43 +687,37 @@ where
     const SIZE: usize = Rest::SIZE + 1;
     type Outputs = Rest::Outputs;
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count()
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         self.0.open_count() + 1
     }
 
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
-    type RaceDone = (Rest::RaceDone, bool);
 
-    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = (self.1.key_fn)(kp);
-        let (rest_state, rest_done) = self.0.init_race(rest_kp);
-        (
-            SlotRaceState {
-                rest: rest_state,
-                this: Some(this_fut),
-            },
-            (rest_done, false),
-        )
+        SlotRaceState {
+            rest: self.0.init_race(rest_kp),
+            this: Some(this_fut),
+        }
     }
 
-    fn race_all_done(done: &Self::RaceDone) -> bool {
-        Rest::race_all_done(&done.0) && done.1
-    }
-
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
         let projected = state.project();
         if arm_index == Self::SIZE - 1 {
-            match poll_key_slot(projected.this, &mut done.1, cx) {
+            match poll_key_slot(projected.this, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
                     self.1.pending_key = Some(k);
                     Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
@@ -738,13 +727,13 @@ where
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            self.0
-                .poll_race_one(projected.rest, &mut done.0, arm_index, cx)
+            self.0.poll_race_one(projected.rest, arm_index, cx)
         }
     }
 
     type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             let k = self
@@ -758,6 +747,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -769,6 +759,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.0.take_outputs()
     }
@@ -789,43 +780,37 @@ where
     const SIZE: usize = S::SIZE + 1;
     type Outputs = S::Outputs;
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         self.inner.unsatisfied_count()
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         self.inner.open_count() + 1
     }
 
     type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
-    type RaceDone = (S::RaceDone, bool);
 
-    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
         let dup_kp = kp.fork();
         let dup_fut = (self.key_fn)(dup_kp);
-        let (inner_state, inner_done) = self.inner.init_race(kp);
-        (
-            WrapperRaceState {
-                inner: inner_state,
-                virtual_arm: Some(dup_fut),
-            },
-            (inner_done, false),
-        )
+        WrapperRaceState {
+            inner: self.inner.init_race(kp),
+            virtual_arm: Some(dup_fut),
+        }
     }
 
-    fn race_all_done(done: &Self::RaceDone) -> bool {
-        S::race_all_done(&done.0) && done.1
-    }
-
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
         let projected = state.project();
         if arm_index == Self::SIZE - 1 {
-            match poll_key_slot(projected.virtual_arm, &mut done.1, cx) {
+            match poll_key_slot(projected.virtual_arm, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, matched)))) => {
                     self.dup = self.wire_names[matched.0].0;
                     Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
@@ -835,13 +820,13 @@ where
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            self.inner
-                .poll_race_one(projected.inner, &mut done.0, arm_index, cx)
+            self.inner.poll_race_one(projected.inner, arm_index, cx)
         }
     }
 
     type DispatchState = WrapperDispatchState<S::DispatchState, SkipFut>;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             WrapperDispatchState::Virtual((self.skip_fn)(vp))
@@ -850,6 +835,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -866,6 +852,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.inner.take_outputs()
     }
@@ -886,53 +873,44 @@ where
     const SIZE: usize = S::SIZE + 1;
     type Outputs = S::Outputs;
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         self.inner.unsatisfied_count()
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         self.inner.open_count() + 1
     }
 
     type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
-    type RaceDone = (bool, S::RaceDone);
 
-    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
         let inner_kp = kp.fork();
         let tag_fut = (self.tag_key_fn)(kp);
-        let (inner_state, inner_done) = self.inner.init_race(inner_kp);
-        (
-            TagRaceState {
-                tag_fut: Some(tag_fut),
-                inner: inner_state,
-            },
-            (false, inner_done),
-        )
+        TagRaceState {
+            tag_fut: Some(tag_fut),
+            inner: self.inner.init_race(inner_kp),
+        }
     }
 
-    fn race_all_done(done: &Self::RaceDone) -> bool {
-        done.0 && S::race_all_done(&done.1)
-    }
-
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
         let projected = state.project();
         if arm_index == 0 {
-            match poll_key_slot(projected.tag_fut, &mut done.0, cx) {
+            match poll_key_slot(projected.tag_fut, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, _match)))) => Poll::Ready(Ok(Probe::Hit((0, kc)))),
                 Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            match self
-                .inner
-                .poll_race_one(projected.inner, &mut done.1, arm_index - 1, cx)
-            {
+            match self.inner.poll_race_one(projected.inner, arm_index - 1, cx) {
                 Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
                     Poll::Ready(Ok(Probe::Hit((idx + 1, kc))))
                 }
@@ -943,6 +921,7 @@ where
 
     type DispatchState = TagDispatchState<TagValFut, S::DispatchState>;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
         if arm_index == 0 {
             TagDispatchState::Tag((self.tag_val_fn)(vp))
@@ -951,6 +930,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -970,6 +950,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.inner.take_outputs()
     }
@@ -986,49 +967,38 @@ where
     const SIZE: usize = A::SIZE + B::SIZE;
     type Outputs = (A::Outputs, B::Outputs);
 
+    #[inline(always)]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count() + self.1.unsatisfied_count()
     }
+    #[inline(always)]
     fn open_count(&self) -> usize {
         self.0.open_count() + self.1.open_count()
     }
 
     type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
-    type RaceDone = (A::RaceDone, B::RaceDone);
 
-    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
         let b_kp = kp.fork();
-        let (a_state, a_done) = self.0.init_race(kp);
-        let (b_state, b_done) = self.1.init_race(b_kp);
-        (
-            ConcatRaceState {
-                a: a_state,
-                b: b_state,
-            },
-            (a_done, b_done),
-        )
+        ConcatRaceState {
+            a: self.0.init_race(kp),
+            b: self.1.init_race(b_kp),
+        }
     }
 
-    fn race_all_done(done: &Self::RaceDone) -> bool {
-        A::race_all_done(&done.0) && B::race_all_done(&done.1)
-    }
-
+    #[inline(always)]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
-        done: &mut Self::RaceDone,
         arm_index: usize,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
         let projected = state.project();
         if arm_index < A::SIZE {
-            self.0
-                .poll_race_one(projected.a, &mut done.0, arm_index, cx)
+            self.0.poll_race_one(projected.a, arm_index, cx)
         } else {
-            match self
-                .1
-                .poll_race_one(projected.b, &mut done.1, arm_index - A::SIZE, cx)
-            {
+            match self.1.poll_race_one(projected.b, arm_index - A::SIZE, cx) {
                 Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
                     Poll::Ready(Ok(Probe::Hit((A::SIZE + idx, kc))))
                 }
@@ -1039,6 +1009,7 @@ where
 
     type DispatchState = ConcatDispatchState<A::DispatchState, B::DispatchState>;
 
+    #[inline(always)]
     fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
         if arm_index < A::SIZE {
             ConcatDispatchState::InA(self.0.init_dispatch(arm_index, vp))
@@ -1047,6 +1018,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -1058,6 +1030,7 @@ where
         }
     }
 
+    #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
         (self.0.take_outputs(), self.1.take_outputs())
     }

@@ -17,6 +17,8 @@
 //! `deserialize_str` against `deserialize_str_chunks`; the former hits only
 //! when the borrow is free, the latter handles the rest via owned allocation.
 
+use core::mem;
+
 use crate::{
     JsonError,
     token::{SimpleToken, StrChunk, Token, Tokenizer},
@@ -25,6 +27,7 @@ use crate::{
 use strede::{
     BytesAccess, Chunk, Deserialize, Deserializer, Entry, MapAccess, MapArmStack, MapKeyClaim,
     MapKeyProbe, MapValueClaim, MapValueProbe, Probe, SeqAccess, SeqEntry, StrAccess, hit,
+    utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,44 +49,24 @@ pub struct JsonClaim<'de> {
 pub struct JsonDeserializer<'de> {
     tokenizer: Tokenizer,
     src: &'de [u8],
-    /// Pre-read token to replay on the next `next()` call.
-    /// Set by sub-deserializers created for map keys, map values, and seq elements,
-    /// and also restored when `next()` returns `Probe::Miss`.
-    pending_tok: Option<Token>,
-    /// True for deserializers created via [`Self::new`]; triggers trailing-garbage
-    /// checks after the top-level value is consumed.
-    is_root: bool,
 }
 
 impl<'de> JsonDeserializer<'de> {
+    #[inline(always)]
     pub fn new(src: &'de [u8]) -> Self {
         Self {
             tokenizer: Tokenizer::new(),
             src,
-            pending_tok: None,
-            is_root: true,
         }
     }
 
-    fn sub_with_pending(src: &'de [u8], tok: Token) -> Self {
-        Self {
-            tokenizer: Tokenizer::new(),
-            src,
-            pending_tok: Some(tok),
-            is_root: false,
-        }
-    }
-
-    /// Read the next dispatch token, honouring any pre-read `pending_tok`.
+    /// Read the next dispatch token.
     ///
     /// `NoTokens` from the tokenizer means the in-memory buffer is exhausted -
     /// for this deserializer that always means the input is truncated.
     fn next_dispatch(&mut self) -> Result<Token, JsonError> {
-        if let Some(tok) = self.pending_tok.take() {
-            return Ok(tok);
-        }
         while !self.src.is_empty() {
-            let old = core::mem::replace(&mut self.tokenizer, Tokenizer::new());
+            let old = mem::replace(&mut self.tokenizer, Tokenizer::new());
             match old.next_token(&mut self.src) {
                 Ok(Token::Simple(SimpleToken::PartialLiteral, new_tok)) => {
                     self.tokenizer = new_tok; // resume on next iteration
@@ -97,7 +80,30 @@ impl<'de> JsonDeserializer<'de> {
     }
 }
 
-async fn json_deserializer_next<'de, const N: usize, F, Fut, R>(
+// ---------------------------------------------------------------------------
+// JsonSubDeserializer — internal sub-deserializer (no trailing-garbage check)
+// ---------------------------------------------------------------------------
+
+/// Sub-deserializer created internally for map keys, map values, seq elements,
+/// `deserialize_option`, and `deserialize_value`. Has a pre-loaded token and
+/// skips the trailing-garbage check performed by [`JsonDeserializer`].
+struct JsonSubDeserializer<'de> {
+    src: &'de [u8],
+    pending_tok: Token,
+}
+
+impl<'de> JsonSubDeserializer<'de> {
+    #[inline(always)]
+    fn new(src: &'de [u8], tok: Token) -> Self {
+        Self {
+            src,
+            pending_tok: tok,
+        }
+    }
+}
+
+#[inline(always)]
+async fn json_root_next<'de, const N: usize, F, Fut, R>(
     mut de: JsonDeserializer<'de>,
     mut f: F,
 ) -> Result<Probe<(JsonClaim<'de>, R)>, JsonError>
@@ -106,21 +112,19 @@ where
     Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
 {
     let token = de.next_dispatch()?;
-    // Keep a copy so we can restore pending_tok if the closure returns Miss.
     let entry = JsonEntry {
         token: token.clone(),
         src: de.src,
     };
-    match f(core::array::from_fn(|_| entry.clone())).await? {
+    match f(repeat(entry, |e| e.clone())).await? {
         Probe::Hit((claim, r)) => {
-            if de.is_root {
-                let mut rest = claim.src;
-                while !rest.is_empty() && matches!(rest[0], b' ' | b'\t' | b'\n' | b'\r') {
-                    rest = &rest[1..];
-                }
-                if !rest.is_empty() {
-                    return Err(JsonError::ExpectedEnd);
-                }
+            // Root deserializer: reject trailing non-whitespace garbage.
+            let mut rest = claim.src;
+            while !rest.is_empty() && matches!(rest[0], b' ' | b'\t' | b'\n' | b'\r') {
+                rest = &rest[1..];
+            }
+            if !rest.is_empty() {
+                return Err(JsonError::ExpectedEnd);
             }
             Ok(Probe::Hit((claim, r)))
         }
@@ -134,6 +138,7 @@ impl<'de> Deserializer<'de> for JsonDeserializer<'de> {
     type EntryClaim = JsonClaim<'de>;
     type Entry = JsonEntry<'de>;
 
+    #[inline(always)]
     async fn entry<const N: usize, F, Fut, R>(
         self,
         f: F,
@@ -142,7 +147,30 @@ impl<'de> Deserializer<'de> for JsonDeserializer<'de> {
         F: FnMut([Self::Entry; N]) -> Fut,
         Fut: core::future::Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>,
     {
-        json_deserializer_next(self, f).await
+        json_root_next(self, f).await
+    }
+}
+
+impl<'de> Deserializer<'de> for JsonSubDeserializer<'de> {
+    type Error = JsonError;
+    type Claim = JsonClaim<'de>;
+    type EntryClaim = JsonClaim<'de>;
+    type Entry = JsonEntry<'de>;
+
+    #[inline(always)]
+    async fn entry<const N: usize, F, Fut, R>(
+        self,
+        mut f: F,
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
+    where
+        F: FnMut([Self::Entry; N]) -> Fut,
+        Fut: core::future::Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>,
+    {
+        let entry = JsonEntry {
+            token: self.pending_tok,
+            src: self.src,
+        };
+        f(repeat(entry, |e| e.clone())).await
     }
 }
 
@@ -241,7 +269,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Scalars -----------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
@@ -256,60 +284,71 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Integers ----------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((claim, n as u8)))
     }
+    #[inline(always)]
     async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((claim, n as u16)))
     }
+    #[inline(always)]
     async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((claim, n as u32)))
     }
+    #[inline(always)]
     async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
         self.parse_num::<u64>().await
     }
+    #[inline(always)]
     async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
         self.parse_num::<u128>().await
     }
+    #[inline(always)]
     async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((claim, n as i8)))
     }
+    #[inline(always)]
     async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((claim, n as i16)))
     }
+    #[inline(always)]
     async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
         let (claim, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((claim, n as i32)))
     }
+    #[inline(always)]
     async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
         self.parse_num::<i64>().await
     }
+    #[inline(always)]
     async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
         self.parse_num::<i128>().await
     }
+    #[inline(always)]
     async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
         self.parse_num::<f32>().await
     }
+    #[inline(always)]
     async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
         self.parse_num::<f64>().await
     }
 
     // ---- Char --------------------------------------------------------------
 
+    #[inline(always)]
     async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
         // V1: deserialize a single-char JSON string
         let (claim, s) = hit!(self.deserialize_str().await);
-        let c = s
-            .chars()
-            .next()
-            .ok_or(JsonError::UnexpectedByte { byte: b'"' })?;
-        Ok(Probe::Hit((claim, c)))
+        if s.len() != 1 {
+            return Ok(Probe::Miss);
+        }
+        Ok(Probe::Hit((claim, s.chars().next().unwrap())))
     }
 
     // ---- Strings -----------------------------------------------------------
@@ -325,22 +364,19 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
                 // This makes Cow<str> / Cow<[u8]> callers free to borrow when possible
                 // and fall back to an owned allocation only when actually needed.
                 let mut src = self.src;
-                let s = match access.next_chunk(&mut src) {
-                    Ok(Some(StrChunk::Slice(s))) => {
+                let s = match access.next_chunk(&mut src)? {
+                    Some(StrChunk::Slice(s)) => {
                         // Consume the closing `"` (next chunk must be None).
-                        match access.next_chunk(&mut src) {
-                            Ok(None) => {}
+                        if access.next_chunk(&mut src)?.is_some() {
                             // More chunks means there were escape sequences; Miss so that
                             // a concurrent deserialize_str_chunks arm can take over.
-                            Ok(Some(_)) => return Ok(Probe::Miss),
-                            Err(e) => return Err(e),
+                            return Ok(Probe::Miss);
                         }
                         s
                     }
                     // First chunk is already an escaped char - not zero-copy; Miss.
-                    Ok(Some(StrChunk::Char(_))) => return Ok(Probe::Miss),
-                    Ok(None) => "",
-                    Err(e) => return Err(e),
+                    Some(StrChunk::Char(_)) => return Ok(Probe::Miss),
+                    None => "",
                 };
                 Ok(Probe::Hit((
                     JsonClaim {
@@ -366,12 +402,13 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Bytes -------------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_bytes(self) -> Result<Probe<(Self::Claim, &'de [u8])>, Self::Error> {
         let (claim, s) = hit!(self.deserialize_str().await);
         Ok(Probe::Hit((claim, s.as_bytes())))
     }
 
+    #[inline(always)]
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
         match self.token {
             Token::Str(access) => Ok(Probe::Hit(JsonBytesAccess {
@@ -384,7 +421,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Map ---------------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::ObjectStart, tok) => Ok(Probe::Hit(JsonMapAccess {
@@ -397,7 +434,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Seq ---------------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::ArrayStart, tok) => Ok(Probe::Hit(JsonSeqAccess {
@@ -410,7 +447,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Option ------------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_option<T: Deserialize<'de, Extra>, Extra>(
         self,
         extra: Extra,
@@ -424,7 +461,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
                 None,
             ))),
             other => {
-                let sub = JsonDeserializer::sub_with_pending(self.src, other);
+                let sub = JsonSubDeserializer::new(self.src, other);
                 let (claim, v) = hit!(T::deserialize(sub, extra).await);
                 Ok(Probe::Hit((claim, Some(v))))
             }
@@ -432,7 +469,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Null ---------------------------------------------------------------
-
+    #[inline(always)]
     async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit(JsonClaim {
@@ -444,16 +481,17 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     // ---- Value (delegate to T::deserialize) ---------------------------------
-
+    #[inline(always)]
     async fn deserialize_value<T: Deserialize<'de, Extra>, Extra>(
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-        let sub = JsonDeserializer::sub_with_pending(self.src, self.token);
+        let sub = JsonSubDeserializer::new(self.src, self.token);
         let (claim, v) = hit!(T::deserialize(sub, extra).await);
         Ok(Probe::Hit((claim, v)))
     }
 
+    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut src = self.src;
         let tok = skip_value(&mut src, self.token)?;
@@ -518,6 +556,7 @@ impl<'de> StrAccess for JsonStrAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             access: self.access,
@@ -555,6 +594,7 @@ impl<'de> BytesAccess for JsonBytesAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             access: self.access,
@@ -599,6 +639,7 @@ pub struct JsonMapKeyProbe<'de> {
 }
 
 impl<'de> JsonMapKeyProbe<'de> {
+    #[inline(always)]
     fn clone(&self) -> Self {
         Self {
             src: self.src,
@@ -611,6 +652,7 @@ impl<'de> MapKeyProbe<'de> for JsonMapKeyProbe<'de> {
     type Error = JsonError;
     type KeyClaim = JsonMapKeyClaim<'de>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         self.clone()
     }
@@ -619,7 +661,7 @@ impl<'de> MapKeyProbe<'de> for JsonMapKeyProbe<'de> {
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error> {
-        let key_deser = JsonDeserializer::sub_with_pending(self.src, self.key_tok);
+        let key_deser = JsonSubDeserializer::new(self.src, self.key_tok);
         let (key_claim, k) = match K::deserialize(key_deser, extra).await? {
             Probe::Hit(v) => v,
             Probe::Miss => return Ok(Probe::Miss),
@@ -683,15 +725,17 @@ impl<'de> MapValueProbe<'de> for JsonMapValueProbe<'de> {
     type MapClaim = JsonClaim<'de>;
     type ValueClaim = JsonMapValueClaim<'de>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         self.clone()
     }
 
+    #[inline(always)]
     async fn deserialize_value<V: Deserialize<'de, Extra>, Extra>(
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error> {
-        let value_deser = JsonDeserializer::sub_with_pending(self.src, self.value_tok);
+        let value_deser = JsonSubDeserializer::new(self.src, self.value_tok);
         let (claim, v) = hit!(V::deserialize(value_deser, extra).await);
         Ok(Probe::Hit((
             JsonMapValueClaim {
@@ -702,6 +746,7 @@ impl<'de> MapValueProbe<'de> for JsonMapValueProbe<'de> {
         )))
     }
 
+    #[inline(always)]
     async fn skip(self) -> Result<Self::ValueClaim, Self::Error> {
         let mut src = self.src;
         let tok = skip_value(&mut src, self.value_tok)?;
@@ -761,6 +806,7 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'de> {
     type MapClaim = JsonClaim<'de>;
     type KeyProbe = JsonMapKeyProbe<'de>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             tokenizer: self.tokenizer.clone(),
@@ -835,28 +881,26 @@ pub struct JsonSeqAccess<'de> {
     first: bool,
 }
 
-// Free function to work around a rustc ICE (triggered by RPITIT lifetime checking
-// in `compare_impl_item` for local DefId), by placing the async body here.
-async fn json_seq_next<'de, const N: usize, F, Fut, R>(
-    mut seq: JsonSeqAccess<'de>,
-    mut f: F,
-) -> Result<Probe<Chunk<(JsonSeqAccess<'de>, R), JsonClaim<'de>>>, JsonError>
-where
-    F: FnMut([JsonSeqEntry<'de>; N]) -> Fut,
-    Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
-{
+enum SeqNextState<'de> {
+    Done(JsonClaim<'de>),
+    Elem(JsonSeqAccess<'de>, JsonSeqEntry<'de>),
+}
+
+// Separated from the async call site so that `json_seq_next` can be `#[inline(always)]`
+// (inlining the `f` call), while keeping the token-advance logic out-of-line.
+fn json_seq_advance<'de>(mut seq: JsonSeqAccess<'de>) -> Result<SeqNextState<'de>, JsonError> {
     // After first element, expect comma or closing bracket.
     if !seq.first {
-        let old = core::mem::replace(&mut seq.tokenizer, Tokenizer::new());
+        let old = mem::replace(&mut seq.tokenizer, Tokenizer::new());
         match old.next_token(&mut seq.src) {
             Ok(Token::Simple(SimpleToken::Comma, new_tok)) => {
                 seq.tokenizer = new_tok;
             }
             Ok(Token::Simple(SimpleToken::ArrayEnd, new_tok)) => {
-                return Ok(Probe::Hit(Chunk::Done(JsonClaim {
+                return Ok(SeqNextState::Done(JsonClaim {
                     tokenizer: new_tok,
                     src: seq.src,
-                })));
+                }));
             }
             Ok(_) => return Err(JsonError::UnexpectedByte { byte: 0 }),
             Err(e) => return Err(e),
@@ -866,13 +910,13 @@ where
 
     // Read element start token (or closing bracket for empty seq).
     let elem_tok = {
-        let old = core::mem::replace(&mut seq.tokenizer, Tokenizer::new());
+        let old = mem::replace(&mut seq.tokenizer, Tokenizer::new());
         match old.next_token(&mut seq.src) {
             Ok(Token::Simple(SimpleToken::ArrayEnd, new_tok)) => {
-                return Ok(Probe::Hit(Chunk::Done(JsonClaim {
+                return Ok(SeqNextState::Done(JsonClaim {
                     tokenizer: new_tok,
                     src: seq.src,
-                })));
+                }));
             }
             Ok(t) => t,
             Err(e) => return Err(e),
@@ -883,7 +927,26 @@ where
         src: seq.src,
         elem_tok,
     };
-    let (claim, r) = hit!(f(core::array::from_fn(|_| se.clone())).await);
+    Ok(SeqNextState::Elem(seq, se))
+}
+
+// Free function to work around a rustc ICE (triggered by RPITIT lifetime checking
+// in `compare_impl_item` for local DefId), by placing the async body here.
+// `#[inline(always)]` so the call to `f` is inlined at each call site.
+#[inline(always)]
+async fn json_seq_next<'de, const N: usize, F, Fut, R>(
+    seq: JsonSeqAccess<'de>,
+    mut f: F,
+) -> Result<Probe<Chunk<(JsonSeqAccess<'de>, R), JsonClaim<'de>>>, JsonError>
+where
+    F: FnMut([JsonSeqEntry<'de>; N]) -> Fut,
+    Fut: core::future::Future<Output = Result<Probe<(JsonClaim<'de>, R)>, JsonError>>,
+{
+    let (mut seq, se) = match json_seq_advance(seq)? {
+        SeqNextState::Done(claim) => return Ok(Probe::Hit(Chunk::Done(claim))),
+        SeqNextState::Elem(seq, se) => (seq, se),
+    };
+    let (claim, r) = hit!(f(repeat(se, |se| se.clone())).await);
     seq.tokenizer = claim.tokenizer;
     seq.src = claim.src;
     Ok(Probe::Hit(Chunk::Data((seq, r))))
@@ -896,6 +959,7 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'de> {
 
     type Elem = JsonSeqEntry<'de>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             tokenizer: self.tokenizer.clone(),
@@ -904,6 +968,7 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'de> {
         }
     }
 
+    #[inline(always)]
     async fn next<const N: usize, F, Fut, R>(
         self,
         f: F,
@@ -922,6 +987,7 @@ pub struct JsonSeqEntry<'de> {
 }
 
 impl<'de> JsonSeqEntry<'de> {
+    #[inline(always)]
     fn clone(&self) -> Self {
         Self {
             src: self.src,
@@ -934,19 +1000,22 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         self.clone()
     }
 
+    #[inline(always)]
     async fn get<T: Deserialize<'de, Extra>, Extra>(
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-        let elem_deser = JsonDeserializer::sub_with_pending(self.src, self.elem_tok);
+        let elem_deser = JsonSubDeserializer::new(self.src, self.elem_tok);
         let (claim, v) = hit!(T::deserialize(elem_deser, extra).await);
         Ok(Probe::Hit((claim, v)))
     }
 
+    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut src = self.src;
         let tok = skip_value(&mut src, self.elem_tok)?;

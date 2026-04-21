@@ -1201,6 +1201,8 @@ impl DeserializeOwned for core::time::Duration {
 
 #[cfg(feature = "alloc")]
 mod alloc_impls {
+    use core::mem;
+
     use crate::borrow::{
         Deserialize, Deserializer, Entry, MapAccess, MapArmStack, MapKeyProbe, MapValueProbe,
         SeqAccess, SeqEntry, VC, VP,
@@ -1481,17 +1483,12 @@ mod alloc_impls {
         }
 
         type RaceState = ();
-        type RaceDone = ();
-        fn init_race(&mut self, _kp: KP) -> ((), ()) {
-            unreachable!()
-        }
-        fn race_all_done(_done: &()) -> bool {
+        fn init_race(&mut self, _kp: KP) -> () {
             unreachable!()
         }
         fn poll_race_one(
             &mut self,
             _state: core::pin::Pin<&mut ()>,
-            _done: &mut (),
             _arm_index: usize,
             _cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
@@ -1535,7 +1532,7 @@ mod alloc_impls {
         }
 
         fn take_outputs(&mut self) -> Self::Outputs {
-            core::mem::take(&mut self.out)
+            mem::take(&mut self.out)
         }
     }
 
@@ -1611,17 +1608,12 @@ mod alloc_impls {
         // CollectMapArm is never used inside StackConcat, so init/poll are
         // not called. We provide panicking stubs and override the async methods.
         type RaceState = ();
-        type RaceDone = ();
-        fn init_race(&mut self, _kp: KP) -> ((), ()) {
-            unreachable!()
-        }
-        fn race_all_done(_done: &()) -> bool {
+        fn init_race(&mut self, _kp: KP) -> () {
             unreachable!()
         }
         fn poll_race_one(
             &mut self,
             _state: core::pin::Pin<&mut ()>,
-            _done: &mut (),
             _arm_index: usize,
             _cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
@@ -1665,7 +1657,7 @@ mod alloc_impls {
         }
 
         fn take_outputs(&mut self) -> Self::Outputs {
-            core::mem::take(&mut self.out)
+            mem::take(&mut self.out)
         }
     }
 
@@ -1848,6 +1840,7 @@ mod std_impls {
     };
     use crate::{Chunk, DeserializeError, Probe, hit, or_miss};
     use core::hash::{BuildHasher, Hash};
+    use core::mem;
     use std::collections::{HashMap, HashSet};
 
     extern crate alloc;
@@ -1887,17 +1880,12 @@ mod std_impls {
         }
 
         type RaceState = ();
-        type RaceDone = ();
-        fn init_race(&mut self, _kp: KP) -> ((), ()) {
-            unreachable!()
-        }
-        fn race_all_done(_done: &()) -> bool {
+        fn init_race(&mut self, _kp: KP) -> () {
             unreachable!()
         }
         fn poll_race_one(
             &mut self,
             _state: core::pin::Pin<&mut ()>,
-            _done: &mut (),
             _arm_index: usize,
             _cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
@@ -1941,7 +1929,7 @@ mod std_impls {
         }
 
         fn take_outputs(&mut self) -> Self::Outputs {
-            core::mem::take(&mut self.out)
+            mem::take(&mut self.out)
         }
     }
 
@@ -2024,17 +2012,12 @@ mod std_impls {
 
         // CollectHashMapArm is never used inside StackConcat.
         type RaceState = ();
-        type RaceDone = ();
-        fn init_race(&mut self, _kp: KP) -> ((), ()) {
-            unreachable!()
-        }
-        fn race_all_done(_done: &()) -> bool {
+        fn init_race(&mut self, _kp: KP) -> () {
             unreachable!()
         }
         fn poll_race_one(
             &mut self,
             _state: core::pin::Pin<&mut ()>,
-            _done: &mut (),
             _arm_index: usize,
             _cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
@@ -2078,7 +2061,7 @@ mod std_impls {
         }
 
         fn take_outputs(&mut self) -> Self::Outputs {
-            core::mem::take(&mut self.out)
+            mem::take(&mut self.out)
         }
     }
 

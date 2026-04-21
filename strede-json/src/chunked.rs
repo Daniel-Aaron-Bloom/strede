@@ -27,6 +27,8 @@
 use crate::JsonError;
 use crate::token::{self, SimpleToken, StrChunk, Token, Tokenizer};
 use core::future::Future;
+use core::mem;
+use strede::utils::repeat;
 use strede::{
     Buffer, BytesAccessOwned, Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, Handle,
     MapAccessOwned, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned,
@@ -102,6 +104,7 @@ pub struct ChunkedJsonSubDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonSubDeserializer<'s, B, F> {
+    #[inline(always)]
     fn new(handle: Handle<'s, B, F>, tokenizer: Tokenizer, offset: usize, tok: Token) -> Self {
         Self {
             handle,
@@ -114,6 +117,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonSubDeserializer<'s, B, F> 
 
 /// Advance `handle` to the next chunk via `Handle::next`, resetting `offset`
 /// and verifying that the new chunk is non-empty (else `UnexpectedEnd`).
+#[inline(always)]
 async fn refill<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     handle: Handle<'s, B, F>,
     offset: &mut usize,
@@ -146,7 +150,7 @@ async fn next_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                 *offset = buf.len();
             }
             let mut src: &[u8] = &buf[*offset..];
-            let old = core::mem::replace(tokenizer, Tokenizer::new());
+            let old = mem::replace(tokenizer, Tokenizer::new());
             let r = old.next_token(&mut src);
             *offset = new_offset(buf, src);
             r
@@ -163,18 +167,20 @@ async fn next_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
 }
 
 /// Build N entries by forking the main handle N-1 times.
+#[inline(always)]
 fn build_entries<'s, B: Buffer, F: AsyncFnMut(&mut B), const N: usize>(
-    mut main: Handle<'s, B, F>,
+    handle: Handle<'s, B, F>,
     token: Token,
     tokenizer: Tokenizer,
     offset: usize,
 ) -> [ChunkedJsonEntry<'s, B, F>; N] {
-    core::array::from_fn(|_| ChunkedJsonEntry {
-        handle: main.fork(),
-        token: token.clone(),
-        tokenizer: tokenizer.clone(),
+    let entry = ChunkedJsonEntry {
+        handle,
+        token,
+        tokenizer,
         offset,
-    })
+    };
+    repeat(entry, ChunkedJsonEntry::clone)
 }
 
 /// Top-level `next`: forks a handle from SharedBuf, runs the closure, does
@@ -231,6 +237,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned for ChunkedJsonDese
     type EntryClaim = ChunkedJsonClaim<'s, B, F>;
     type Entry = ChunkedJsonEntry<'s, B, F>;
 
+    #[inline(always)]
     async fn entry<const N: usize, Fn_, Fut, R>(
         self,
         f: Fn_,
@@ -287,6 +294,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned
     type EntryClaim = ChunkedJsonClaim<'s, B, F>;
     type Entry = ChunkedJsonEntry<'s, B, F>;
 
+    #[inline(always)]
     async fn entry<const N: usize, Fn_, Fut, R>(
         self,
         f: Fn_,
@@ -311,6 +319,17 @@ pub struct ChunkedJsonEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'s, B, F> {
+    #[inline(always)]
+    fn clone(&mut self) -> Self {
+        Self {
+            handle: self.handle.fork(),
+            token: self.token.clone(),
+            tokenizer: self.tokenizer.clone(),
+            offset: self.offset,
+        }
+    }
+
+    #[inline(always)]
     fn into_claim_with_tok(
         handle: Handle<'s, B, F>,
         offset: usize,
@@ -375,6 +394,7 @@ trait ParseNum: Sized {
 macro_rules! impl_parse_num {
     ($($t:ty),*) => {
         $(impl ParseNum for $t {
+            #[inline(always)]
             fn parse(s: &str) -> Result<Self, JsonError> {
                 s.parse().map_err(|_| JsonError::InvalidNumber)
             }
@@ -506,6 +526,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     type Map = ChunkedJsonMapAccessOwned<'s, B, F>;
     type Seq = ChunkedJsonSeqAccess<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             handle: self.handle.fork(),
@@ -515,6 +536,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
@@ -525,45 +547,57 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((c, n as u8)))
     }
+    #[inline(always)]
     async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((c, n as u16)))
     }
+    #[inline(always)]
     async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<u64>().await);
         Ok(Probe::Hit((c, n as u32)))
     }
+    #[inline(always)]
     async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
         self.parse_num::<u64>().await
     }
+    #[inline(always)]
     async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
         self.parse_num::<u128>().await
     }
+    #[inline(always)]
     async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((c, n as i8)))
     }
+    #[inline(always)]
     async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((c, n as i16)))
     }
+    #[inline(always)]
     async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
         let (c, n) = hit!(self.parse_num::<i64>().await);
         Ok(Probe::Hit((c, n as i32)))
     }
+    #[inline(always)]
     async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
         self.parse_num::<i64>().await
     }
+    #[inline(always)]
     async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
         self.parse_num::<i128>().await
     }
+    #[inline(always)]
     async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
         self.parse_num::<f32>().await
     }
+    #[inline(always)]
     async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
         self.parse_num::<f64>().await
     }
@@ -613,6 +647,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
         match self.token {
             Token::Str(access) => Ok(Probe::Hit(ChunkedJsonStrAccess {
@@ -625,6 +660,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
         match self.token {
             Token::Str(access) => Ok(Probe::Hit(ChunkedJsonBytesAccess {
@@ -637,6 +673,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::ObjectStart, tok) => {
@@ -650,6 +687,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::ArrayStart, tok) => Ok(Probe::Hit(ChunkedJsonSeqAccess {
@@ -686,6 +724,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         }
     }
 
+    #[inline(always)]
     async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
         match self.token {
             Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit(Self::into_claim_with_tok(
@@ -713,6 +752,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
         Ok(Probe::Hit((claim, v)))
     }
 
+    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
@@ -741,6 +781,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedJsonStrAcce
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             handle: self.handle.fork(),
@@ -822,6 +863,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedJsonBytes
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             handle: self.handle.fork(),
@@ -899,7 +941,7 @@ pub struct ChunkedJsonMapAccessOwned<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 pub struct ChunkedJsonKeyProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'s, B, F>>,
+    handle: Handle<'s, B, F>,
     key_tok: Token,
     tokenizer: Tokenizer,
     offset: usize,
@@ -912,7 +954,7 @@ pub struct ChunkedJsonKeyClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 pub struct ChunkedJsonValueProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'s, B, F>>,
+    handle: Handle<'s, B, F>,
     value_tok: Token,
     tokenizer: Tokenizer,
     offset: usize,
@@ -930,26 +972,23 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyProbeOwned for ChunkedJsonKeyPr
     type Error = JsonError;
     type KeyClaim = ChunkedJsonKeyClaim<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
-            handle: Some(
-                self.handle
-                    .as_mut()
-                    .expect("fork on consumed key probe")
-                    .fork(),
-            ),
+            handle: self.handle.fork(),
             key_tok: self.key_tok.clone(),
             tokenizer: self.tokenizer.clone(),
             offset: self.offset,
         }
     }
 
+    #[inline(always)]
     async fn deserialize_key<K: DeserializeOwned<Extra>, Extra>(
-        mut self,
+        self,
         extra: Extra,
     ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error> {
-        let h = self.handle.take().expect("key probe handle missing");
-        let sub = ChunkedJsonSubDeserializer::new(h, self.tokenizer, self.offset, self.key_tok);
+        let sub =
+            ChunkedJsonSubDeserializer::new(self.handle, self.tokenizer, self.offset, self.key_tok);
         let (sub, k) = hit!(K::deserialize_owned(sub, extra).await);
         Ok(Probe::Hit((
             ChunkedJsonKeyClaim {
@@ -985,11 +1024,11 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyClaimOwned for ChunkedJsonKeyCl
         }
 
         // Read the value start token.
-        let (h, value_tok) =
+        let (handle, value_tok) =
             next_dispatch(h, &mut self.tokenizer, &mut self.offset, &mut pending).await?;
 
         Ok(ChunkedJsonValueProbe {
-            handle: Some(h),
+            handle,
             value_tok,
             tokenizer: self.tokenizer,
             offset: self.offset,
@@ -1004,26 +1043,27 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned for ChunkedJsonVal
     type MapClaim = ChunkedJsonClaim<'s, B, F>;
     type ValueClaim = ChunkedJsonValueClaim<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
-            handle: Some(
-                self.handle
-                    .as_mut()
-                    .expect("fork on consumed value probe")
-                    .fork(),
-            ),
+            handle: self.handle.fork(),
             value_tok: self.value_tok.clone(),
             tokenizer: self.tokenizer.clone(),
             offset: self.offset,
         }
     }
 
+    #[inline(always)]
     async fn deserialize_value<V: DeserializeOwned<Extra>, Extra>(
-        mut self,
+        self,
         extra: Extra,
     ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error> {
-        let h = self.handle.take().expect("value probe handle missing");
-        let sub = ChunkedJsonSubDeserializer::new(h, self.tokenizer, self.offset, self.value_tok);
+        let sub = ChunkedJsonSubDeserializer::new(
+            self.handle,
+            self.tokenizer,
+            self.offset,
+            self.value_tok,
+        );
         let (sub, v) = hit!(V::deserialize_owned(sub, extra).await);
         Ok(Probe::Hit((
             ChunkedJsonValueClaim {
@@ -1035,11 +1075,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned for ChunkedJsonVal
         )))
     }
 
-    async fn skip(mut self) -> Result<Self::ValueClaim, Self::Error> {
-        let h = self.handle.take().expect("value probe handle missing");
+    #[inline(always)]
+    async fn skip(self) -> Result<Self::ValueClaim, Self::Error> {
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
-        let handle = skip_value_chunked(h, &mut tokenizer, &mut offset, self.value_tok).await?;
+        let handle =
+            skip_value_chunked(self.handle, &mut tokenizer, &mut offset, self.value_tok).await?;
         Ok(ChunkedJsonValueClaim {
             handle,
             tokenizer,
@@ -1084,11 +1125,11 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueClaimOwned for ChunkedJsonVal
         }
 
         // Read the next key start token.
-        let (h, key_tok) =
+        let (handle, key_tok) =
             next_dispatch(h, &mut self.tokenizer, &mut self.offset, &mut pending).await?;
 
         Ok(NextKey::Entry(ChunkedJsonKeyProbe {
-            handle: Some(h),
+            handle,
             key_tok,
             tokenizer: self.tokenizer,
             offset: self.offset,
@@ -1103,6 +1144,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAcce
     type MapClaim = ChunkedJsonClaim<'s, B, F>;
     type KeyProbe = ChunkedJsonKeyProbe<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             handle: self.handle.fork(),
@@ -1116,7 +1158,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAcce
         mut arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
         let mut pending: Option<Token> = None;
-        let (h, tok) = next_dispatch(
+        let (handle, tok) = next_dispatch(
             self.handle,
             &mut self.tokenizer,
             &mut self.offset,
@@ -1130,12 +1172,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAcce
                 let claim = ChunkedJsonClaim {
                     tokenizer: t,
                     offset: self.offset,
-                    handle: h,
+                    handle,
                 };
                 return Ok(Probe::Hit((claim, arms.take_outputs())));
             }
             key_tok => ChunkedJsonKeyProbe {
-                handle: Some(h),
+                handle,
                 key_tok,
                 tokenizer: self.tokenizer,
                 offset: self.offset,
@@ -1240,21 +1282,12 @@ where
         }
     };
 
-    let main = seq.handle;
-    let mut handles: [Option<Handle<'s, B, F>>; N] = [const { None }; N];
-    handles[0] = Some(main);
-    for i in 1..N {
-        let h0 = handles[0].as_mut().expect("h0 present");
-        handles[i] = Some(h0.fork());
-    }
-    let snap_tok = seq.tokenizer.clone();
-    let snap_off = seq.offset;
     let entries: [ChunkedJsonSeqEntry<'s, B, F>; N] =
-        core::array::from_fn(|i| ChunkedJsonSeqEntry {
-            handle: handles[i].take(),
+        repeat(seq.handle, Handle::fork).map(|handle| ChunkedJsonSeqEntry {
+            handle,
             elem_tok: elem_tok.clone(),
-            tokenizer: snap_tok.clone(),
-            offset: snap_off,
+            tokenizer: seq.tokenizer.clone(),
+            offset: seq.offset,
         });
 
     let (elem_claim, r) = hit!(f(entries).await);
@@ -1270,6 +1303,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedJsonSeqAcce
     type ElemClaim = ChunkedJsonElemClaim<'s, B, F>;
     type Elem = ChunkedJsonSeqEntry<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
             handle: self.handle.fork(),
@@ -1279,6 +1313,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedJsonSeqAcce
         }
     }
 
+    #[inline(always)]
     async fn next<const N: usize, Fn_, Fut, R>(
         self,
         f: Fn_,
@@ -1292,7 +1327,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedJsonSeqAcce
 }
 
 pub struct ChunkedJsonSeqEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'s, B, F>>,
+    handle: Handle<'s, B, F>,
     elem_tok: Token,
     tokenizer: Tokenizer,
     offset: usize,
@@ -1302,22 +1337,27 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedJsonSeqEntry
     type Error = JsonError;
     type Claim = ChunkedJsonElemClaim<'s, B, F>;
 
+    #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
-            handle: Some(self.handle.as_mut().expect("fork on consumed entry").fork()),
+            handle: self.handle.fork(),
             elem_tok: self.elem_tok.clone(),
             tokenizer: self.tokenizer.clone(),
             offset: self.offset,
         }
     }
 
+    #[inline(always)]
     async fn get<T: DeserializeOwned<Extra>, Extra>(
-        mut self,
+        self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-        let h = self.handle.take().expect("seq entry handle missing");
-        let sub =
-            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.elem_tok);
+        let sub = ChunkedJsonSubDeserializer::new(
+            self.handle,
+            self.tokenizer.clone(),
+            self.offset,
+            self.elem_tok,
+        );
         let (sub, v) = hit!(T::deserialize_owned(sub, extra).await);
         let claim = ChunkedJsonElemClaim {
             tokenizer: sub.tokenizer,
@@ -1327,11 +1367,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedJsonSeqEntry
         Ok(Probe::Hit((claim, v)))
     }
 
-    async fn skip(mut self) -> Result<Self::Claim, Self::Error> {
-        let h = self.handle.take().expect("seq entry handle missing");
+    #[inline(always)]
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
-        let handle = skip_value_chunked(h, &mut tokenizer, &mut offset, self.elem_tok).await?;
+        let handle =
+            skip_value_chunked(self.handle, &mut tokenizer, &mut offset, self.elem_tok).await?;
         Ok(ChunkedJsonElemClaim {
             tokenizer,
             offset,

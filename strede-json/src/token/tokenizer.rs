@@ -38,6 +38,7 @@ pub(crate) struct Tokenizer {
 }
 
 impl Tokenizer {
+    #[inline(always)]
     pub(crate) fn new() -> Self {
         Self { mode: None }
     }
