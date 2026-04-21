@@ -12,7 +12,7 @@ resolver = "2"
 arrayvec = { version = "0.7.6", default-features = false }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Daniel-Aaron-Bloom/strede"
