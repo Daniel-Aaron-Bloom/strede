@@ -1,5 +1,10 @@
 # strede
 
+[![github](https://img.shields.io/badge/Daniel--Aaron--Bloom%2Fstrede-8da0cb?style=for-the-badge&logo=github&label=github&labelColor=555555)](https://github.com/Daniel-Aaron-Bloom/strede)
+[![crates.io](https://img.shields.io/crates/v/strede.svg?style=for-the-badge&color=fc8d62&logo=rust)](https://crates.io/crates/strede)
+[![docs.rs](https://img.shields.io/badge/docs.rs-strede-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs)](https://docs.rs/strede)
+[![build status](https://img.shields.io/github/actions/workflow/status/Daniel-Aaron-Bloom/strede/ci.yml?branch=main&style=for-the-badge)](https://github.com/Daniel-Aaron-Bloom/strede/actions?query=branch%3Amain)
+
 Async, zero-alloc, pull-based deserialization for Rust.
 
 ## The name
