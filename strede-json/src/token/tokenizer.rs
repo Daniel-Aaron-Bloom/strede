@@ -150,8 +150,7 @@ mod tests {
             let mut src: &[u8] = input;
             assert!(
                 matches!(tok.next_token(&mut src).unwrap(), Token::Simple(s, _) if s == *expected),
-                "input: {:?}",
-                input,
+                "input: {input:?}",
             );
         }
     }
@@ -288,8 +287,7 @@ mod tests {
             let mut src: &[u8] = input;
             assert!(
                 matches!(tok.next_token(&mut src).unwrap(), Token::Simple(s, _) if s == *expected),
-                "input: {:?}",
-                input,
+                "input: {input:?}",
             );
         }
     }
