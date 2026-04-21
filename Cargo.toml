@@ -20,3 +20,6 @@ authors = ["Daniel Bloom"]
 categories = ["encoding", "asynchronous", "no-std"]
 keywords = ["serde", "async", "deserialize", "streaming", "zero-alloc"]
 rust-version = "1.88"
+
+[profile.test]
+opt-level = 1

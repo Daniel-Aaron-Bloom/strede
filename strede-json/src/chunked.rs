@@ -9,7 +9,7 @@
 //!
 //! - Implements the **owned** trait family only ([`DeserializerOwned`],
 //!   [`EntryOwned`], etc.). Zero-copy `&'de str` / `&'de [u8]` borrowing is
-//!   unsupported by design — buffer-chunk lifetimes are shorter than the
+//!   unsupported by design - buffer-chunk lifetimes are shorter than the
 //!   caller-facing deserialization session, so there is no `'de` to borrow
 //!   for. Use [`EntryOwned::deserialize_str_chunks`] /
 //!   [`EntryOwned::deserialize_bytes_chunks`] for string and byte data.
@@ -24,14 +24,15 @@
 //!   slice signals EOF). The `F: AsyncFnMut(&mut B)` signature does not
 //!   support `Result`.
 
+use crate::JsonError;
+use crate::token::{self, SimpleToken, StrChunk, Token, Tokenizer};
 use core::future::Future;
 use strede::{
     Buffer, BytesAccessOwned, Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, Handle,
-    MapAccessOwned, MapKeyEntryOwned, MapValueEntryOwned, Probe, SeqAccessOwned, SeqEntryOwned,
-    SharedBuf, StrAccessOwned, hit,
+    MapAccessOwned, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned,
+    MapValueProbeOwned, NextKey, Probe, SeqAccessOwned, SeqEntryOwned, SharedBuf, StrAccessOwned,
+    hit,
 };
-use crate::JsonError;
-use crate::token::{self, SimpleToken, StrChunk, Token, Tokenizer};
 
 // ---------------------------------------------------------------------------
 // Claim
@@ -52,7 +53,7 @@ pub struct ChunkedJsonClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — pointer arithmetic to recover offset after tokenizer advances `src`
+// Helpers - pointer arithmetic to recover offset after tokenizer advances `src`
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -70,7 +71,7 @@ fn new_offset(buf: &[u8], src: &[u8]) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Top-level deserializer. Holds a `&mut SharedBuf` and forks fresh handles
-/// per `next()`. Claim is `()` — the top-level is consumed and produces
+/// per `next()`. Claim is `()` - the top-level is consumed and produces
 /// nothing the caller needs to thread back.
 pub struct ChunkedJsonDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     shared: SharedBuf<'s, B, F>,
@@ -91,7 +92,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonDeserializer<'s, B, F> {
 }
 
 /// Sub-deserializer for option / map value / seq element use where the inner
-/// type calls `next()` once. Claim is `Self` — the sub-deserializer is
+/// type calls `next()` once. Claim is `Self` - the sub-deserializer is
 /// returned to the caller so it can extract handle/tokenizer/offset.
 pub struct ChunkedJsonSubDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     handle: Handle<'s, B, F>,
@@ -141,7 +142,7 @@ async fn next_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
         let result = {
             let buf = handle.buf();
             if *offset > buf.len() {
-                // Defensive — shouldn't happen.
+                // Defensive - shouldn't happen.
                 *offset = buf.len();
             }
             let mut src: &[u8] = &buf[*offset..];
@@ -224,11 +225,10 @@ where
     Ok(Probe::Hit(((), r)))
 }
 
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
-    for ChunkedJsonDeserializer<'s, B, F>
-{
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned for ChunkedJsonDeserializer<'s, B, F> {
     type Error = JsonError;
     type Claim = ();
+    type EntryClaim = ChunkedJsonClaim<'s, B, F>;
     type Entry = ChunkedJsonEntry<'s, B, F>;
 
     async fn entry<const N: usize, Fn_, Fut, R>(
@@ -237,9 +237,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
     ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
         Fn_: FnMut([Self::Entry; N]) -> Fut,
-        Fut: Future<
-            Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
-        >,
+        Fut: Future<Output = Result<Probe<(<Self::Entry as EntryOwned>::Claim, R)>, Self::Error>>,
     {
         run_next_top(self, f).await
     }
@@ -281,11 +279,12 @@ where
     )))
 }
 
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned
     for ChunkedJsonSubDeserializer<'s, B, F>
 {
     type Error = JsonError;
     type Claim = ChunkedJsonSubDeserializer<'s, B, F>;
+    type EntryClaim = ChunkedJsonClaim<'s, B, F>;
     type Entry = ChunkedJsonEntry<'s, B, F>;
 
     async fn entry<const N: usize, Fn_, Fut, R>(
@@ -294,9 +293,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
     ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
         Fn_: FnMut([Self::Entry; N]) -> Fut,
-        Fut: Future<
-            Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
-        >,
+        Fut: Future<Output = Result<Probe<(<Self::Entry as EntryOwned>::Claim, R)>, Self::Error>>,
     {
         run_next_sub(self, f).await
     }
@@ -306,19 +303,19 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializerOwned<'s>
 // Entry
 // ---------------------------------------------------------------------------
 
-pub struct ChunkedJsonEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'a, B, F>,
+pub struct ChunkedJsonEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
     token: Token,
     tokenizer: Tokenizer,
     offset: usize,
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'a, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'s, B, F> {
     fn into_claim_with_tok(
-        handle: Handle<'a, B, F>,
+        handle: Handle<'s, B, F>,
         offset: usize,
         tokenizer: Tokenizer,
-    ) -> ChunkedJsonClaim<'a, B, F> {
+    ) -> ChunkedJsonClaim<'s, B, F> {
         ChunkedJsonClaim {
             tokenizer,
             offset,
@@ -330,7 +327,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'a, B, F> {
     /// Accumulates digit chunks across chunk boundaries.
     async fn parse_num<T: ParseNum>(
         mut self,
-    ) -> Result<Probe<(ChunkedJsonClaim<'a, B, F>, T)>, JsonError> {
+    ) -> Result<Probe<(ChunkedJsonClaim<'s, B, F>, T)>, JsonError> {
         let Token::Number(mut access) = self.token else {
             return Ok(Probe::Miss);
         };
@@ -387,11 +384,11 @@ macro_rules! impl_parse_num {
 impl_parse_num!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
 
 /// Drain a chunked string access, discarding all chunks.
-async fn drain_str_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
-    mut handle: Handle<'a, B, F>,
+async fn drain_str_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    mut handle: Handle<'s, B, F>,
     access: &mut token::StrAccess,
     offset: &mut usize,
-) -> Result<Handle<'a, B, F>, JsonError> {
+) -> Result<Handle<'s, B, F>, JsonError> {
     loop {
         let result = {
             let buf = handle.buf();
@@ -412,11 +409,11 @@ async fn drain_str_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
 }
 
 /// Drain a chunked number access, discarding all chunks.
-async fn drain_num_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
-    mut handle: Handle<'a, B, F>,
+async fn drain_num_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    mut handle: Handle<'s, B, F>,
     access: &mut token::NumberAccess,
     offset: &mut usize,
-) -> Result<Handle<'a, B, F>, JsonError> {
+) -> Result<Handle<'s, B, F>, JsonError> {
     loop {
         let result = {
             let buf = handle.buf();
@@ -438,12 +435,12 @@ async fn drain_num_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
 
 /// Skip one complete JSON value (scalar, string, object, or array) in chunked
 /// mode. Uses iterative depth tracking instead of recursion to stay no_std.
-async fn skip_value_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
-    mut handle: Handle<'a, B, F>,
+async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    mut handle: Handle<'s, B, F>,
     tokenizer: &mut Tokenizer,
     offset: &mut usize,
     tok: Token,
-) -> Result<Handle<'a, B, F>, JsonError> {
+) -> Result<Handle<'s, B, F>, JsonError> {
     match tok {
         Token::Simple(SimpleToken::Null | SimpleToken::Bool(_), t) => {
             *tokenizer = t;
@@ -501,13 +498,13 @@ async fn skip_value_chunked<'a, B: Buffer, F: AsyncFnMut(&mut B)>(
     }
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'a, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B, F> {
     type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
-    type StrChunks = ChunkedJsonStrAccess<'a, B, F>;
-    type BytesChunks = ChunkedJsonBytesAccess<'a, B, F>;
-    type Map = ChunkedJsonMapAccess<'a, B, F>;
-    type Seq = ChunkedJsonSeqAccess<'a, B, F>;
+    type Claim = ChunkedJsonClaim<'s, B, F>;
+    type StrChunks = ChunkedJsonStrAccess<'s, B, F>;
+    type BytesChunks = ChunkedJsonBytesAccess<'s, B, F>;
+    type Map = ChunkedJsonMapAccessOwned<'s, B, F>;
+    type Seq = ChunkedJsonSeqAccess<'s, B, F>;
 
     fn fork(&mut self) -> Self {
         Self {
@@ -592,7 +589,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
                         && let Some(ch) = s.chars().next()
                         && s.len() == ch.len_utf8()
                     {
-                        // Exactly one char and nothing leftover — drain remaining chunks.
+                        // Exactly one char and nothing leftover - drain remaining chunks.
                         chunks = c;
                         let claim = loop {
                             match chunks.next_str(|_| ()).await? {
@@ -607,7 +604,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
                 Chunk::Done(claim) => break claim,
             }
         };
-        // Ended — should have exactly one char.
+        // Ended - should have exactly one char.
         let s = core::str::from_utf8(&buf[..len]).map_err(|_| JsonError::InvalidUtf8)?;
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
@@ -642,12 +639,13 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
 
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
         match self.token {
-            Token::Simple(SimpleToken::ObjectStart, tok) => Ok(Probe::Hit(ChunkedJsonMapAccess {
-                handle: self.handle,
-                tokenizer: tok,
-                offset: self.offset,
-                first: true,
-            })),
+            Token::Simple(SimpleToken::ObjectStart, tok) => {
+                Ok(Probe::Hit(ChunkedJsonMapAccessOwned {
+                    handle: self.handle,
+                    tokenizer: tok,
+                    offset: self.offset,
+                }))
+            }
             _ => Ok(Probe::Miss),
         }
     }
@@ -664,7 +662,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
         }
     }
 
-    async fn deserialize_option<T: DeserializeOwned<'a, Extra>, Extra>(
+    async fn deserialize_option<T: DeserializeOwned<Extra>, Extra>(
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
@@ -699,7 +697,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
         }
     }
 
-    async fn deserialize_value<T: DeserializeOwned<'a, Extra>, Extra>(
+    async fn deserialize_value<T: DeserializeOwned<Extra>, Extra>(
         self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
@@ -732,15 +730,15 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned<'a> for ChunkedJsonEntry<'
 // StrAccess / BytesAccess
 // ---------------------------------------------------------------------------
 
-pub struct ChunkedJsonStrAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'a, B, F>,
+pub struct ChunkedJsonStrAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
     access: token::StrAccess,
     offset: usize,
     char_buf: [u8; 4],
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned<'a> for ChunkedJsonStrAccess<'a, B, F> {
-    type Claim = ChunkedJsonClaim<'a, B, F>;
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedJsonStrAccess<'s, B, F> {
+    type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
     fn fork(&mut self) -> Self {
@@ -813,17 +811,15 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned<'a> for ChunkedJsonStr
     }
 }
 
-pub struct ChunkedJsonBytesAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'a, B, F>,
+pub struct ChunkedJsonBytesAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
     access: token::StrAccess,
     offset: usize,
     char_buf: [u8; 4],
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned<'a>
-    for ChunkedJsonBytesAccess<'a, B, F>
-{
-    type Claim = ChunkedJsonClaim<'a, B, F>;
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedJsonBytesAccess<'s, B, F> {
+    type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
     fn fork(&mut self) -> Self {
@@ -892,249 +888,288 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned<'a>
     }
 }
 
-// ---------------------------------------------------------------------------
-// MapAccess
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Map access
+// ===========================================================================
 
-pub struct ChunkedJsonMapAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'a, B, F>,
+pub struct ChunkedJsonMapAccessOwned<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
     tokenizer: Tokenizer,
     offset: usize,
-    first: bool,
 }
 
-async fn map_next<'a, B, F, const N: usize, Fn_, Fut, R>(
-    mut map: ChunkedJsonMapAccess<'a, B, F>,
-    mut f: Fn_,
-) -> Result<Probe<Chunk<(ChunkedJsonMapAccess<'a, B, F>, R), ChunkedJsonClaim<'a, B, F>>>, JsonError>
-where
-    B: Buffer,
-    F: AsyncFnMut(&mut B),
-    Fn_: FnMut([ChunkedJsonMapKeyEntry<'a, B, F>; N]) -> Fut,
-    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'a, B, F>, R)>, JsonError>>,
-{
-    // After first pair: expect comma or }.
-    if !map.first {
-        let mut pending: Option<Token> = None;
-        let h = map.handle;
-        let (h, tok) = next_dispatch(h, &mut map.tokenizer, &mut map.offset, &mut pending).await?;
-        match tok {
-            Token::Simple(SimpleToken::Comma, t) => {
-                map.handle = h;
-                map.tokenizer = t;
-            }
-            Token::Simple(SimpleToken::ObjectEnd, t) => {
-                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
-                    tokenizer: t,
-                    offset: map.offset,
-                    handle: h,
-                })));
-            }
-            _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
-        }
-    }
-    map.first = false;
-
-    // Read key start (or closing brace for empty map).
-    let key_tok = {
-        let mut pending: Option<Token> = None;
-        let h = map.handle;
-        let (h, tok) = next_dispatch(h, &mut map.tokenizer, &mut map.offset, &mut pending).await?;
-        match tok {
-            Token::Simple(SimpleToken::ObjectEnd, t) => {
-                return Ok(Probe::Hit(Chunk::Done(ChunkedJsonClaim {
-                    tokenizer: t,
-                    offset: map.offset,
-                    handle: h,
-                })));
-            }
-            t => {
-                map.handle = h;
-                t
-            }
-        }
-    };
-
-    // Build N key entries (forking siblings).
-    let main = map.handle;
-    let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
-    handles[0] = Some(main);
-    for i in 1..N {
-        let h0 = handles[0].as_mut().expect("h0 present");
-        handles[i] = Some(h0.fork());
-    }
-    let snap_tok = map.tokenizer.clone();
-    let snap_off = map.offset;
-    let entries: [ChunkedJsonMapKeyEntry<'a, B, F>; N] =
-        core::array::from_fn(|i| ChunkedJsonMapKeyEntry {
-            handle: handles[i].take(),
-            key_tok: key_tok.clone(),
-            tokenizer: snap_tok.clone(),
-            offset: snap_off,
-        });
-
-    let (claim, r) = hit!(f(entries).await);
-    map.tokenizer = claim.tokenizer;
-    map.offset = claim.offset;
-    map.handle = claim.handle;
-    Ok(Probe::Hit(Chunk::Data((map, r))))
-}
-
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned<'a> for ChunkedJsonMapAccess<'a, B, F> {
-    type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
-    type KeyEntry = ChunkedJsonMapKeyEntry<'a, B, F>;
-
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            tokenizer: self.tokenizer.clone(),
-            offset: self.offset,
-            first: self.first,
-        }
-    }
-
-    async fn next_kv<const N: usize, Fn_, Fut, R>(
-        self,
-        f: Fn_,
-    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
-    where
-        Fn_: FnMut([Self::KeyEntry; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-    {
-        map_next(self, f).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MapKeyEntry / MapValueEntry
-// ---------------------------------------------------------------------------
-
-pub struct ChunkedJsonMapKeyEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'a, B, F>>,
+pub struct ChunkedJsonKeyProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'s, B, F>>,
     key_tok: Token,
     tokenizer: Tokenizer,
     offset: usize,
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyEntryOwned<'a>
-    for ChunkedJsonMapKeyEntry<'a, B, F>
-{
+pub struct ChunkedJsonKeyClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+pub struct ChunkedJsonValueProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'s, B, F>>,
+    value_tok: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+pub struct ChunkedJsonValueClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+// --- KeyProbe ---
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyProbeOwned for ChunkedJsonKeyProbe<'s, B, F> {
     type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
-    type ValueEntry = ChunkedJsonMapValueEntry<'a, B, F>;
+    type KeyClaim = ChunkedJsonKeyClaim<'s, B, F>;
 
     fn fork(&mut self) -> Self {
         Self {
-            handle: Some(self.handle.as_mut().expect("fork on consumed entry").fork()),
+            handle: Some(
+                self.handle
+                    .as_mut()
+                    .expect("fork on consumed key probe")
+                    .fork(),
+            ),
             key_tok: self.key_tok.clone(),
             tokenizer: self.tokenizer.clone(),
             offset: self.offset,
         }
     }
 
-    async fn key<K: DeserializeOwned<'a, KExtra>, KExtra, const N: usize, Fn_, Fut, R>(
+    async fn deserialize_key<K: DeserializeOwned<Extra>, Extra>(
         mut self,
-        extra: KExtra,
-        mut f: Fn_,
-    ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
-    where
-        Fn_: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-    {
-        let h = self.handle.take().expect("key entry handle missing");
-        let sub =
-            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.key_tok);
-        let (mut sub, k) = hit!(K::deserialize_owned(sub, extra).await);
+        extra: Extra,
+    ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error> {
+        let h = self.handle.take().expect("key probe handle missing");
+        let sub = ChunkedJsonSubDeserializer::new(h, self.tokenizer, self.offset, self.key_tok);
+        let (sub, k) = hit!(K::deserialize_owned(sub, extra).await);
+        Ok(Probe::Hit((
+            ChunkedJsonKeyClaim {
+                handle: sub.handle,
+                tokenizer: sub.tokenizer,
+                offset: sub.offset,
+            },
+            k,
+        )))
+    }
+}
 
+// --- KeyClaim ---
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyClaimOwned for ChunkedJsonKeyClaim<'s, B, F> {
+    type Error = JsonError;
+    type MapClaim = ChunkedJsonClaim<'s, B, F>;
+    type ValueProbe = ChunkedJsonValueProbe<'s, B, F>;
+
+    async fn into_value_probe(mut self) -> Result<Self::ValueProbe, Self::Error> {
         // Eat the colon.
+        let mut pending: Option<Token> = None;
         let (h, colon_tok) = next_dispatch(
-            sub.handle,
-            &mut sub.tokenizer,
-            &mut sub.offset,
-            &mut sub.pending_tok,
+            self.handle,
+            &mut self.tokenizer,
+            &mut self.offset,
+            &mut pending,
         )
         .await?;
         match colon_tok {
-            Token::Simple(SimpleToken::Colon, t) => sub.tokenizer = t,
+            Token::Simple(SimpleToken::Colon, t) => self.tokenizer = t,
             _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
         }
 
         // Read the value start token.
         let (h, value_tok) =
-            next_dispatch(h, &mut sub.tokenizer, &mut sub.offset, &mut sub.pending_tok).await?;
+            next_dispatch(h, &mut self.tokenizer, &mut self.offset, &mut pending).await?;
 
-        // Build N value entries by forking from the sub's handle.
-        let main = h;
-        let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
-        handles[0] = Some(main);
-        for i in 1..N {
-            let h0 = handles[0].as_mut().expect("h0 present");
-            handles[i] = Some(h0.fork());
-        }
-        let snap_tok = sub.tokenizer.clone();
-        let snap_off = sub.offset;
-        let value_entries: [ChunkedJsonMapValueEntry<'a, B, F>; N] =
-            core::array::from_fn(|i| ChunkedJsonMapValueEntry {
-                handle: handles[i].take(),
-                value_tok: value_tok.clone(),
-                tokenizer: snap_tok.clone(),
-                offset: snap_off,
-            });
-
-        let (claim, r) = hit!(f(&k, value_entries).await);
-        Ok(Probe::Hit((claim, k, r)))
+        Ok(ChunkedJsonValueProbe {
+            handle: Some(h),
+            value_tok,
+            tokenizer: self.tokenizer,
+            offset: self.offset,
+        })
     }
 }
 
-pub struct ChunkedJsonMapValueEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'a, B, F>>,
-    value_tok: Token,
-    tokenizer: Tokenizer,
-    offset: usize,
-}
+// --- ValueProbe ---
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapValueEntryOwned<'a>
-    for ChunkedJsonMapValueEntry<'a, B, F>
-{
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned for ChunkedJsonValueProbe<'s, B, F> {
     type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type MapClaim = ChunkedJsonClaim<'s, B, F>;
+    type ValueClaim = ChunkedJsonValueClaim<'s, B, F>;
 
     fn fork(&mut self) -> Self {
         Self {
-            handle: Some(self.handle.as_mut().expect("fork on consumed entry").fork()),
+            handle: Some(
+                self.handle
+                    .as_mut()
+                    .expect("fork on consumed value probe")
+                    .fork(),
+            ),
             value_tok: self.value_tok.clone(),
             tokenizer: self.tokenizer.clone(),
             offset: self.offset,
         }
     }
 
-    async fn value<V: DeserializeOwned<'a, Extra>, Extra>(
+    async fn deserialize_value<V: DeserializeOwned<Extra>, Extra>(
         mut self,
         extra: Extra,
-    ) -> Result<Probe<(Self::Claim, V)>, Self::Error> {
-        let h = self.handle.take().expect("value entry handle missing");
-        let sub =
-            ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.value_tok);
+    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error> {
+        let h = self.handle.take().expect("value probe handle missing");
+        let sub = ChunkedJsonSubDeserializer::new(h, self.tokenizer, self.offset, self.value_tok);
         let (sub, v) = hit!(V::deserialize_owned(sub, extra).await);
-        let claim = ChunkedJsonClaim {
-            tokenizer: sub.tokenizer,
-            offset: sub.offset,
-            handle: sub.handle,
-        };
-        Ok(Probe::Hit((claim, v)))
+        Ok(Probe::Hit((
+            ChunkedJsonValueClaim {
+                handle: sub.handle,
+                tokenizer: sub.tokenizer,
+                offset: sub.offset,
+            },
+            v,
+        )))
     }
 
-    async fn skip(mut self) -> Result<Self::Claim, Self::Error> {
-        let h = self.handle.take().expect("value entry handle missing");
+    async fn skip(mut self) -> Result<Self::ValueClaim, Self::Error> {
+        let h = self.handle.take().expect("value probe handle missing");
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
         let handle = skip_value_chunked(h, &mut tokenizer, &mut offset, self.value_tok).await?;
-        Ok(ChunkedJsonClaim {
+        Ok(ChunkedJsonValueClaim {
+            handle,
             tokenizer,
             offset,
-            handle,
         })
+    }
+}
+
+// --- ValueClaim ---
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueClaimOwned for ChunkedJsonValueClaim<'s, B, F> {
+    type Error = JsonError;
+    type KeyProbe = ChunkedJsonKeyProbe<'s, B, F>;
+    type MapClaim = ChunkedJsonClaim<'s, B, F>;
+
+    async fn next_key(
+        mut self,
+        _unsatisfied: usize,
+        _open: usize,
+    ) -> Result<NextKey<Self::KeyProbe, Self::MapClaim>, Self::Error> {
+        // Expect comma or closing brace.
+        let mut pending: Option<Token> = None;
+        let (h, tok) = next_dispatch(
+            self.handle,
+            &mut self.tokenizer,
+            &mut self.offset,
+            &mut pending,
+        )
+        .await?;
+        match tok {
+            Token::Simple(SimpleToken::Comma, t) => {
+                self.tokenizer = t;
+            }
+            Token::Simple(SimpleToken::ObjectEnd, t) => {
+                return Ok(NextKey::Done(ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: self.offset,
+                    handle: h,
+                }));
+            }
+            _ => return Err(JsonError::UnexpectedByte { byte: 0 }),
+        }
+
+        // Read the next key start token.
+        let (h, key_tok) =
+            next_dispatch(h, &mut self.tokenizer, &mut self.offset, &mut pending).await?;
+
+        Ok(NextKey::Entry(ChunkedJsonKeyProbe {
+            handle: Some(h),
+            key_tok,
+            tokenizer: self.tokenizer,
+            offset: self.offset,
+        }))
+    }
+}
+
+// --- MapAccessOwned ---
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAccessOwned<'s, B, F> {
+    type Error = JsonError;
+    type MapClaim = ChunkedJsonClaim<'s, B, F>;
+    type KeyProbe = ChunkedJsonKeyProbe<'s, B, F>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            handle: self.handle.fork(),
+            tokenizer: self.tokenizer.clone(),
+            offset: self.offset,
+        }
+    }
+
+    async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
+        mut self,
+        mut arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        let mut pending: Option<Token> = None;
+        let (h, tok) = next_dispatch(
+            self.handle,
+            &mut self.tokenizer,
+            &mut self.offset,
+            &mut pending,
+        )
+        .await?;
+
+        let mut key_probe = match tok {
+            Token::Simple(SimpleToken::ObjectEnd, t) => {
+                // Empty map.
+                let claim = ChunkedJsonClaim {
+                    tokenizer: t,
+                    offset: self.offset,
+                    handle: h,
+                };
+                return Ok(Probe::Hit((claim, arms.take_outputs())));
+            }
+            key_tok => ChunkedJsonKeyProbe {
+                handle: Some(h),
+                key_tok,
+                tokenizer: self.tokenizer,
+                offset: self.offset,
+            },
+        };
+
+        loop {
+            // Race all arms' key callbacks against this round's key probe.
+            let value_claim = match arms.race_keys(key_probe).await? {
+                Probe::Hit((arm_index, key_claim)) => {
+                    // A known arm matched. Convert key claim → value probe.
+                    let vp = key_claim.into_value_probe().await?;
+                    match arms.dispatch_value(arm_index, vp).await? {
+                        Probe::Hit((vc, ())) => vc,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    }
+                }
+                Probe::Miss => {
+                    // No arm matched this key - whole map is a Miss.
+                    return Ok(Probe::Miss);
+                }
+            };
+
+            // Advance to next key or end of map.
+            match value_claim
+                .next_key(arms.unsatisfied_count(), arms.open_count())
+                .await?
+            {
+                strede::NextKey::Entry(next_kp) => key_probe = next_kp,
+                strede::NextKey::Done(map_claim) => {
+                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
+                }
+            }
+        }
     }
 }
 
@@ -1142,22 +1177,28 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> MapValueEntryOwned<'a>
 // SeqAccess / SeqEntry
 // ---------------------------------------------------------------------------
 
-pub struct ChunkedJsonSeqAccess<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'a, B, F>,
+pub struct ChunkedJsonSeqAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
     tokenizer: Tokenizer,
     offset: usize,
     first: bool,
 }
 
-async fn seq_next<'a, B, F, const N: usize, Fn_, Fut, R>(
-    mut seq: ChunkedJsonSeqAccess<'a, B, F>,
+pub struct ChunkedJsonElemClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    tokenizer: Tokenizer,
+    offset: usize,
+}
+
+async fn seq_next<'s, B, F, const N: usize, Fn_, Fut, R>(
+    mut seq: ChunkedJsonSeqAccess<'s, B, F>,
     mut f: Fn_,
-) -> Result<Probe<Chunk<(ChunkedJsonSeqAccess<'a, B, F>, R), ChunkedJsonClaim<'a, B, F>>>, JsonError>
+) -> Result<Probe<Chunk<(ChunkedJsonSeqAccess<'s, B, F>, R), ChunkedJsonClaim<'s, B, F>>>, JsonError>
 where
     B: Buffer,
     F: AsyncFnMut(&mut B),
-    Fn_: FnMut([ChunkedJsonSeqEntry<'a, B, F>; N]) -> Fut,
-    Fut: Future<Output = Result<Probe<(ChunkedJsonClaim<'a, B, F>, R)>, JsonError>>,
+    Fn_: FnMut([ChunkedJsonSeqEntry<'s, B, F>; N]) -> Fut,
+    Fut: Future<Output = Result<Probe<(ChunkedJsonElemClaim<'s, B, F>, R)>, JsonError>>,
 {
     if !seq.first {
         let mut pending: Option<Token> = None;
@@ -1200,7 +1241,7 @@ where
     };
 
     let main = seq.handle;
-    let mut handles: [Option<Handle<'a, B, F>>; N] = [const { None }; N];
+    let mut handles: [Option<Handle<'s, B, F>>; N] = [const { None }; N];
     handles[0] = Some(main);
     for i in 1..N {
         let h0 = handles[0].as_mut().expect("h0 present");
@@ -1208,7 +1249,7 @@ where
     }
     let snap_tok = seq.tokenizer.clone();
     let snap_off = seq.offset;
-    let entries: [ChunkedJsonSeqEntry<'a, B, F>; N] =
+    let entries: [ChunkedJsonSeqEntry<'s, B, F>; N] =
         core::array::from_fn(|i| ChunkedJsonSeqEntry {
             handle: handles[i].take(),
             elem_tok: elem_tok.clone(),
@@ -1216,17 +1257,18 @@ where
             offset: snap_off,
         });
 
-    let (claim, r) = hit!(f(entries).await);
-    seq.tokenizer = claim.tokenizer;
-    seq.offset = claim.offset;
-    seq.handle = claim.handle;
+    let (elem_claim, r) = hit!(f(entries).await);
+    seq.tokenizer = elem_claim.tokenizer;
+    seq.offset = elem_claim.offset;
+    seq.handle = elem_claim.handle;
     Ok(Probe::Hit(Chunk::Data((seq, r))))
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned<'a> for ChunkedJsonSeqAccess<'a, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedJsonSeqAccess<'s, B, F> {
     type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
-    type Elem = ChunkedJsonSeqEntry<'a, B, F>;
+    type SeqClaim = ChunkedJsonClaim<'s, B, F>;
+    type ElemClaim = ChunkedJsonElemClaim<'s, B, F>;
+    type Elem = ChunkedJsonSeqEntry<'s, B, F>;
 
     fn fork(&mut self) -> Self {
         Self {
@@ -1240,25 +1282,25 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned<'a> for ChunkedJsonSeq
     async fn next<const N: usize, Fn_, Fut, R>(
         self,
         f: Fn_,
-    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::SeqClaim>>, Self::Error>
     where
         Fn_: FnMut([Self::Elem; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+        Fut: Future<Output = Result<Probe<(Self::ElemClaim, R)>, Self::Error>>,
     {
         seq_next(self, f).await
     }
 }
 
-pub struct ChunkedJsonSeqEntry<'a, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Option<Handle<'a, B, F>>,
+pub struct ChunkedJsonSeqEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Option<Handle<'s, B, F>>,
     elem_tok: Token,
     tokenizer: Tokenizer,
     offset: usize,
 }
 
-impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqEntry<'a, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedJsonSeqEntry<'s, B, F> {
     type Error = JsonError;
-    type Claim = ChunkedJsonClaim<'a, B, F>;
+    type Claim = ChunkedJsonElemClaim<'s, B, F>;
 
     fn fork(&mut self) -> Self {
         Self {
@@ -1269,7 +1311,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqE
         }
     }
 
-    async fn get<T: DeserializeOwned<'a, Extra>, Extra>(
+    async fn get<T: DeserializeOwned<Extra>, Extra>(
         mut self,
         extra: Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
@@ -1277,7 +1319,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqE
         let sub =
             ChunkedJsonSubDeserializer::new(h, self.tokenizer.clone(), self.offset, self.elem_tok);
         let (sub, v) = hit!(T::deserialize_owned(sub, extra).await);
-        let claim = ChunkedJsonClaim {
+        let claim = ChunkedJsonElemClaim {
             tokenizer: sub.tokenizer,
             offset: sub.offset,
             handle: sub.handle,
@@ -1290,7 +1332,7 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqE
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
         let handle = skip_value_chunked(h, &mut tokenizer, &mut offset, self.elem_tok).await?;
-        Ok(ChunkedJsonClaim {
+        Ok(ChunkedJsonElemClaim {
             tokenizer,
             offset,
             handle,
@@ -1307,16 +1349,13 @@ impl<'a, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned<'a> for ChunkedJsonSeqE
 mod tests {
     extern crate alloc;
     use super::*;
-    use alloc::string::String;
-    use strede::key_facade::KeyDeserializer;
-    use core::cell::Cell;
+    use alloc::string::{String, ToString};
     use strede::{
-        DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-        MapValueEntryOwned, Match, MatchVals, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
-        UnwrapOrElse, declare_comms, Chunk
+        Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapArmBase, Match,
+        MatchVals, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned, UnwrapOrElse, owned,
     };
 
-    use strede_test_util::{block_on, block_on_loop};
+    use strede_test_util::block_on;
 
     #[derive(Debug, DeserializeOwned, PartialEq, Eq)]
     enum Either<L, R> {
@@ -1334,16 +1373,6 @@ mod tests {
         block_on(SharedBuf::with_async(input, loader, f))
     }
 
-    /// Like `with_chunked` but uses a spin-loop executor for tests that involve
-    /// cooperative `Pending` yields (e.g. `key_facade`).
-    fn with_chunked_spin<L: AsyncFnMut(&mut &[u8]), R>(
-        input: &[u8],
-        loader: L,
-        f: impl AsyncFnOnce(SharedBuf<'_, &[u8], L>) -> R,
-    ) -> R {
-        block_on_loop(SharedBuf::with_async(input, loader, f))
-    }
-
     fn eof_loader() -> impl AsyncFnMut(&mut &[u8]) {
         async move |buf: &mut &[u8]| {
             *buf = &[];
@@ -1353,8 +1382,8 @@ mod tests {
     // ----- DeserializeOwned newtypes -----------------------------------------
 
     struct U32(u32);
-    impl<'s> DeserializeOwned<'s> for U32 {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for U32 {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1367,8 +1396,8 @@ mod tests {
     }
 
     struct I64(i64);
-    impl<'s> DeserializeOwned<'s> for I64 {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for I64 {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1381,8 +1410,8 @@ mod tests {
     }
 
     struct F64(f64);
-    impl<'s> DeserializeOwned<'s> for F64 {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for F64 {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1395,8 +1424,8 @@ mod tests {
     }
 
     struct Bool(bool);
-    impl<'s> DeserializeOwned<'s> for Bool {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for Bool {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1410,8 +1439,8 @@ mod tests {
 
     /// Str type that just measures byte length (no allocation needed).
     struct StrLen(usize);
-    impl<'s> DeserializeOwned<'s> for StrLen {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for StrLen {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1553,8 +1582,8 @@ mod tests {
 
     /// Str type that collects chunks into a String (for content verification).
     struct StrCollect(String);
-    impl<'s> DeserializeOwned<'s> for StrCollect {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for StrCollect {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1583,7 +1612,10 @@ mod tests {
         // \uD834\uDD1E = U+1D11E = 𝄞 (musical symbol G clef)
         let s = with_chunked(b"\"\\uD834\\uDD1E\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            let (_, v) = StrCollect::deserialize_owned(de, ()).await.unwrap().unwrap();
+            let (_, v) = StrCollect::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap();
             v.0
         });
         assert_eq!(s, "\u{1D11E}");
@@ -1593,7 +1625,10 @@ mod tests {
     fn str_chunks_surrogate_pair_min() {
         let s = with_chunked(b"\"\\uD800\\uDC00\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            let (_, v) = StrCollect::deserialize_owned(de, ()).await.unwrap().unwrap();
+            let (_, v) = StrCollect::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap();
             v.0
         });
         assert_eq!(s, "\u{10000}");
@@ -1603,7 +1638,10 @@ mod tests {
     fn str_chunks_surrogate_pair_max() {
         let s = with_chunked(b"\"\\uDBFF\\uDFFF\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            let (_, v) = StrCollect::deserialize_owned(de, ()).await.unwrap().unwrap();
+            let (_, v) = StrCollect::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap();
             v.0
         });
         assert_eq!(s, "\u{10FFFF}");
@@ -1613,7 +1651,10 @@ mod tests {
     fn str_chunks_surrogate_pair_with_text() {
         let s = with_chunked(b"\"abc\\uD834\\uDD1Exyz\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            let (_, v) = StrCollect::deserialize_owned(de, ()).await.unwrap().unwrap();
+            let (_, v) = StrCollect::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap();
             v.0
         });
         assert_eq!(s, "abc\u{1D11E}xyz");
@@ -1709,85 +1750,89 @@ mod tests {
 
     // ---- map ----------------------------------------------------------------
 
+    async fn map_single_pair_impl<D: DeserializerOwned<Error = JsonError>>(
+        d: D,
+    ) -> Result<Probe<(D::Claim, (usize, u32))>, JsonError> {
+        use strede::{MapAccessOwned as _, MapKeyProbeOwned as _, MapValueProbeOwned as _};
+        d.entry(|[e]| async {
+            let map = hit!(e.deserialize_map().await);
+            let arms = strede::map_arms! {
+                |kp: owned::KP<D>| kp.deserialize_key::<StrLen, ()>(())
+                => |vp: owned::VP2<D>, k: StrLen| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<U32, ()>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+            };
+            let (claim, strede::map_outputs!(opt_kv)) = hit!(map.iterate(arms).await);
+            let (k, v) = opt_kv.unwrap();
+            Ok(Probe::Hit((claim, (k.0, v.0))))
+        })
+        .await
+    }
+
     #[test]
     fn map_single_pair() {
         let (_, (key_len, val)) = with_chunked(b"{\"x\": 10}", eof_loader(), async |shared| {
-            let de = ChunkedJsonDeserializer::new(shared);
-            de.entry(|[e]| async {
-                let mut map = match e.deserialize_map().await? {
-                    Probe::Hit(m) => m,
-                    Probe::Miss => panic!("expected map"),
-                };
-                let mut result = (0usize, 0u32);
-                loop {
-                    match map
-                        .next_kv(|[ke]| async {
-                            let (claim, k, v) = hit!(
-                                ke.key((), |_k: &StrLen, [ve]| async {
-                                    let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
-                                    Ok(Probe::Hit((claim, v.0)))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, (k.0, v))))
-                        })
-                        .await?
-                        .unwrap()
-                    {
-                        Chunk::Data((m, kv)) => {
-                            result = kv;
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, result))),
-                    }
-                }
-            })
-            .await
-            .unwrap()
-            .unwrap()
+            map_single_pair_impl(ChunkedJsonDeserializer::new(shared))
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(key_len, 1); // "x"
         assert_eq!(val, 10);
     }
 
+    async fn map_empty_impl<D: DeserializerOwned<Error = JsonError>>(
+        d: D,
+    ) -> Result<Probe<(D::Claim, ())>, JsonError> {
+        d.entry(|[e]| async {
+            let map = hit!(e.deserialize_map().await);
+            let (claim, ()) = hit!(iterate_skip_all(map).await);
+            Ok(Probe::Hit((claim, ())))
+        })
+        .await
+    }
+
     #[test]
     fn map_empty() {
-        let (_, count) = with_chunked(b"{}", eof_loader(), async |shared| {
-            let de = ChunkedJsonDeserializer::new(shared);
-            de.entry(|[e]| async {
-                let mut map = match e.deserialize_map().await? {
-                    Probe::Hit(m) => m,
-                    Probe::Miss => panic!("expected map"),
-                };
-                let mut count = 0usize;
-                loop {
-                    match map
-                        .next_kv(|[ke]| async {
-                            let (claim, _k, v) = hit!(
-                                ke.key((), |_k: &StrLen, [ve]| async {
-                                    let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
-                                    Ok(Probe::Hit((claim, v.0)))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, v)))
-                        })
-                        .await?
-                        .unwrap()
-                    {
-                        Chunk::Data((m, _)) => {
-                            count += 1;
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, count))),
-                    }
-                }
-            })
-            .await
-            .unwrap()
-            .unwrap()
+        let (_, ()) = with_chunked(b"{}", eof_loader(), async |shared| {
+            map_empty_impl(ChunkedJsonDeserializer::new(shared))
+                .await
+                .unwrap()
+                .unwrap()
         });
-        assert_eq!(count, 0);
+    }
+
+    async fn map_multiple_pairs_impl<D: DeserializerOwned<Error = JsonError>>(
+        d: D,
+    ) -> Result<Probe<(D::Claim, u32)>, JsonError> {
+        use strede::{MapAccessOwned as _, MapKeyProbeOwned as _, MapValueProbeOwned as _};
+        d.entry(|[e]| async {
+            let map = hit!(e.deserialize_map().await);
+            let arms = strede::map_arms! {
+                |kp: owned::KP<D>| kp.deserialize_key::<Match, &str>("a")
+                => |vp: owned::VP2<D>, k: Match| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<U32, ()>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+                |kp: owned::KP<D>| kp.deserialize_key::<Match, &str>("b")
+                => |vp: owned::VP2<D>, k: Match| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<U32, ()>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+                |kp: owned::KP<D>| kp.deserialize_key::<Match, &str>("c")
+                => |vp: owned::VP2<D>, k: Match| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<U32, ()>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+            };
+            let (claim, strede::map_outputs!(a, b, c)) = hit!(map.iterate(arms).await);
+            let sum = a.map(|(_, v)| v.0).unwrap_or(0)
+                + b.map(|(_, v)| v.0).unwrap_or(0)
+                + c.map(|(_, v)| v.0).unwrap_or(0);
+            Ok(Probe::Hit((claim, sum)))
+        })
+        .await
     }
 
     #[test]
@@ -1796,39 +1841,10 @@ mod tests {
             b"{\"a\": 1, \"b\": 2, \"c\": 3}",
             eof_loader(),
             async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async {
-                    let mut map = match e.deserialize_map().await? {
-                        Probe::Hit(m) => m,
-                        Probe::Miss => panic!("expected map"),
-                    };
-                    let mut total = 0u32;
-                    loop {
-                        match map
-                            .next_kv(|[ke]| async {
-                                let (claim, _k, v) = hit!(
-                                    ke.key((), |_k: &StrLen, [ve]| async {
-                                        let (claim, v) = hit!(ve.value::<U32, ()>(()).await);
-                                        Ok(Probe::Hit((claim, v.0)))
-                                    })
-                                    .await
-                                );
-                                Ok(Probe::Hit((claim, v)))
-                            })
-                            .await?
-                            .unwrap()
-                        {
-                            Chunk::Data((m, v)) => {
-                                total += v;
-                                map = m;
-                            }
-                            Chunk::Done(claim) => return Ok(Probe::Hit((claim, total))),
-                        }
-                    }
-                })
-                .await
-                .unwrap()
-                .unwrap()
+                map_multiple_pairs_impl(ChunkedJsonDeserializer::new(shared))
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(sum, 6);
@@ -1973,7 +1989,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                MixedOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                MixedOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -1993,7 +2012,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                MixedOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                MixedOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2221,7 +2243,7 @@ mod tests {
         assert_eq!(v, GenWrapper { inner: Some(7) });
     }
 
-    // ---- derive(DeserializeOwned): enum — unit-only -------------------------
+    // ---- derive(DeserializeOwned): enum - unit-only -------------------------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     enum Color {
@@ -2266,7 +2288,7 @@ mod tests {
         assert_eq!(result, Ok(Probe::Miss));
     }
 
-    // ---- derive(DeserializeOwned): enum — mixed -----------------------------
+    // ---- derive(DeserializeOwned): enum - mixed -----------------------------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     enum Shape {
@@ -2334,7 +2356,7 @@ mod tests {
         assert_eq!(result, Ok(Probe::Miss));
     }
 
-    // ---- derive(DeserializeOwned): enum — tuple variants ---------------------
+    // ---- derive(DeserializeOwned): enum - tuple variants ---------------------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     enum Geom {
@@ -2393,7 +2415,7 @@ mod tests {
         assert_eq!(result, Ok(Probe::Miss));
     }
 
-    // ---- derive(DeserializeOwned): enum — newtype-only ----------------------
+    // ---- derive(DeserializeOwned): enum - newtype-only ----------------------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     enum Value {
@@ -2462,7 +2484,10 @@ mod tests {
     fn derive_owned_default_fields_missing() {
         let (_, v) = with_chunked(br#"{"required": 1}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            WithDefaults::deserialize_owned(de, ()).await.unwrap().unwrap()
+            WithDefaults::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(
             v,
@@ -2481,7 +2506,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                WithDefaults::deserialize_owned(de, ()).await.unwrap().unwrap()
+                WithDefaults::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2518,7 +2546,10 @@ mod tests {
     fn derive_owned_default_expr_missing() {
         let (_, v) = with_chunked(br#"{"required": 1}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            WithDefaultExpr::deserialize_owned(de, ()).await.unwrap().unwrap()
+            WithDefaultExpr::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(
             v,
@@ -2537,7 +2568,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                WithDefaultExpr::deserialize_owned(de, ()).await.unwrap().unwrap()
+                WithDefaultExpr::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2553,7 +2587,7 @@ mod tests {
     // ---- derive(DeserializeOwned): deserialize_owned_with attribute -----------
 
     /// Custom owned deserializer: reads an i64 and doubles it.
-    async fn double_i64_owned<'s, D: strede::DeserializerOwned<'s>>(
+    async fn double_i64_owned<D: strede::DeserializerOwned>(
         d: D,
     ) -> Result<Probe<(D::Claim, i64)>, D::Error>
     where
@@ -2580,7 +2614,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                WithCustomDe::deserialize_owned(de, ()).await.unwrap().unwrap()
+                WithCustomDe::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2653,7 +2690,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                RenamedFields::deserialize_owned(de, ()).await.unwrap().unwrap()
+                RenamedFields::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2677,7 +2717,10 @@ mod tests {
     fn derive_owned_rename_unit_variant() {
         let (_, v) = with_chunked(br#""circle""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            RenamedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            RenamedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, RenamedVariants::Circle);
     }
@@ -2686,7 +2729,10 @@ mod tests {
     fn derive_owned_rename_newtype_variant() {
         let (_, v) = with_chunked(br#"{"rect": 5}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            RenamedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            RenamedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, RenamedVariants::Rect(5));
     }
@@ -2707,7 +2753,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                AliasedFields::deserialize_owned(de, ()).await.unwrap().unwrap()
+                AliasedFields::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2726,7 +2775,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                AliasedFields::deserialize_owned(de, ()).await.unwrap().unwrap()
+                AliasedFields::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2745,7 +2797,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                AliasedFields::deserialize_owned(de, ()).await.unwrap().unwrap()
+                AliasedFields::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -2769,7 +2824,10 @@ mod tests {
     fn derive_owned_alias_unit_variant_primary() {
         let (_, v) = with_chunked(br#""Ping""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            AliasedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            AliasedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, AliasedVariants::Ping);
     }
@@ -2778,7 +2836,10 @@ mod tests {
     fn derive_owned_alias_unit_variant_alias() {
         let (_, v) = with_chunked(br#""pong""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            AliasedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            AliasedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, AliasedVariants::Ping);
     }
@@ -2787,7 +2848,10 @@ mod tests {
     fn derive_owned_alias_newtype_variant_primary() {
         let (_, v) = with_chunked(br#"{"Data": 42}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            AliasedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            AliasedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, AliasedVariants::Data(42));
     }
@@ -2796,7 +2860,10 @@ mod tests {
     fn derive_owned_alias_newtype_variant_alias() {
         let (_, v) = with_chunked(br#"{"payload": 42}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            AliasedVariants::deserialize_owned(de, ()).await.unwrap().unwrap()
+            AliasedVariants::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, AliasedVariants::Data(42));
     }
@@ -2871,7 +2938,10 @@ mod tests {
     fn derive_owned_mixed_tagged_unit() {
         let (_, v) = with_chunked(br#""Ping""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            MixedTagged::deserialize_owned(de, ()).await.unwrap().unwrap()
+            MixedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, MixedTagged::Ping);
     }
@@ -2880,7 +2950,10 @@ mod tests {
     fn derive_owned_mixed_tagged_newtype() {
         let (_, v) = with_chunked(br#"{"Data": 42}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            MixedTagged::deserialize_owned(de, ()).await.unwrap().unwrap()
+            MixedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, MixedTagged::Data(42));
     }
@@ -2889,7 +2962,10 @@ mod tests {
     fn derive_owned_mixed_untagged_fallback() {
         let (_, v) = with_chunked(b"true", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            MixedTagged::deserialize_owned(de, ()).await.unwrap().unwrap()
+            MixedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, MixedTagged::Fallback(true));
     }
@@ -2910,7 +2986,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                LenientOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, LenientOwned { x: 1, y: 2 });
@@ -2923,7 +3002,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                LenientOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, LenientOwned { x: 1, y: 2 });
@@ -2936,7 +3018,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                LenientOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, LenientOwned { x: 1, y: 2 });
@@ -2949,7 +3034,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                LenientOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, LenientOwned { x: 1, y: 2 });
@@ -2959,7 +3047,10 @@ mod tests {
     fn derive_owned_allow_unknown_fields_no_extra() {
         let (_, v) = with_chunked(b"{\"x\": 10, \"y\": 20}", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+            LenientOwned::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, LenientOwned { x: 10, y: 20 });
     }
@@ -2971,7 +3062,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                LenientOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+                LenientOwned::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, LenientOwned { x: 5, y: 6 });
@@ -3025,7 +3119,10 @@ mod tests {
     fn derive_owned_tuple_struct_mixed_types() {
         let (_, v) = with_chunked(b"[1, true, 3]", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            TripleOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+            TripleOwned::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, TripleOwned(1, true, 3));
     }
@@ -3042,7 +3139,10 @@ mod tests {
     fn derive_owned_transparent_named() {
         let (_, v) = with_chunked(b"42", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            WrapperOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+            WrapperOwned::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, WrapperOwned { inner: 42 });
     }
@@ -3055,7 +3155,10 @@ mod tests {
     fn derive_owned_transparent_tuple() {
         let (_, v) = with_chunked(b"99", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            NewtypeOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+            NewtypeOwned::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, NewtypeOwned(99));
     }
@@ -3085,7 +3188,10 @@ mod tests {
     fn derive_owned_unit_struct_null() {
         let (_, v) = with_chunked(b"null", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            UnitStructOwned::deserialize_owned(de, ()).await.unwrap().unwrap()
+            UnitStructOwned::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, UnitStructOwned);
     }
@@ -3103,13 +3209,13 @@ mod tests {
 
     // Supertrait pattern: anything implementing DeserializeOwned also
     // implements MyDeserializeOwned, so the generated body still compiles.
-    trait MyDeserializeOwned<'s>: strede::DeserializeOwned<'s> {}
-    impl<'s, T: strede::DeserializeOwned<'s>> MyDeserializeOwned<'s> for T {}
+    trait MyDeserializeOwned: strede::DeserializeOwned {}
+    impl<T: strede::DeserializeOwned> MyDeserializeOwned for T {}
 
-    // -- container-level bound = "T: Copy + DeserializeOwned<'s>" -------------
+    // -- container-level bound = "T: Copy + DeserializeOwned" -------------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
-    #[strede(bound = "T: Copy + strede::DeserializeOwned<'s>")]
+    #[strede(bound = "T: Copy + strede::DeserializeOwned")]
     struct OwnedBoundedCopy<T> {
         value: T,
     }
@@ -3138,7 +3244,7 @@ mod tests {
     // -- container-level bound replacing T: DeserializeOwned with MyDeserializeOwned
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
-    #[strede(bound = "T: MyDeserializeOwned<'s>")]
+    #[strede(bound = "T: MyDeserializeOwned")]
     struct OwnedBoundedMyDeserialize<T> {
         a: T,
         b: u32,
@@ -3169,9 +3275,9 @@ mod tests {
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     struct OwnedFieldBoundCopy<T, U> {
-        #[strede(bound = "T: Copy + strede::DeserializeOwned<'s>")]
+        #[strede(bound = "T: Copy + strede::DeserializeOwned")]
         first: T,
-        second: U, // auto-bound: U: DeserializeOwned<'s>
+        second: U, // auto-bound: U: DeserializeOwned
     }
 
     #[test]
@@ -3200,7 +3306,7 @@ mod tests {
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     struct OwnedFieldBoundMyDeserialize<T> {
-        #[strede(bound = "T: MyDeserializeOwned<'s>")]
+        #[strede(bound = "T: MyDeserializeOwned")]
         inner: T,
         tag: u32,
     }
@@ -3269,7 +3375,7 @@ mod tests {
         assert_eq!(result, Ok(Probe::Miss));
     }
 
-    // rename_all with an explicit rename on one field — explicit wins
+    // rename_all with an explicit rename on one field - explicit wins
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
     #[strede(rename_all = "camelCase")]
@@ -3373,7 +3479,10 @@ mod tests {
     fn derive_owned_other_known_variant_hits() {
         let (_, v) = with_chunked(br#""Known""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            OwnedWithOther::deserialize_owned(de, ()).await.unwrap().unwrap()
+            OwnedWithOther::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, OwnedWithOther::Known);
     }
@@ -3382,7 +3491,10 @@ mod tests {
     fn derive_owned_other_unknown_string_returns_other() {
         let (_, v) = with_chunked(br#""anything_else""#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            OwnedWithOther::deserialize_owned(de, ()).await.unwrap().unwrap()
+            OwnedWithOther::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, OwnedWithOther::Unknown);
     }
@@ -3462,7 +3574,10 @@ mod tests {
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                OwnedWithFrom::deserialize_owned(de, ()).await.unwrap().unwrap()
+                OwnedWithFrom::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(
@@ -3606,14 +3721,9 @@ mod tests {
                 };
 
                 let mut b = String::new();
-                loop {
-                    match fork.next_str(|s| String::from(s)).await? {
-                        Chunk::Data((c, s)) => {
-                            b.push_str(&s);
-                            fork = c;
-                        }
-                        Chunk::Done(_) => break, // drop fork claim; Handle::Drop releases refcount
-                    }
+                while let Chunk::Data((c, s)) = fork.next_str(|s| String::from(s)).await? {
+                    b.push_str(&s);
+                    fork = c;
                 }
 
                 Ok(Probe::Hit((claim, (a, b))))
@@ -3626,74 +3736,47 @@ mod tests {
         assert_eq!(b, "hello\nworld");
     }
 
+    /// Helper: create a skip-all arm stack for testing. Uses a closure-taking
+    /// pattern so the KP/VP types are inferred from the map.
+    async fn iterate_skip_all<M: MapAccessOwned>(
+        map: M,
+    ) -> Result<Probe<(M::MapClaim, ())>, M::Error> {
+        use strede::MapKeyProbeOwned as _;
+        use strede::MapValueProbeOwned as _;
+        let arms = (
+            MapArmBase,
+            strede::VirtualArmSlot::new(
+                |kp: M::KeyProbe| kp.deserialize_key::<strede::Skip, _>(()),
+                |vp: owned::VP<M::KeyProbe>, _k: strede::Skip| async move {
+                    let vc = vp.skip().await?;
+                    Ok(strede::Probe::Hit((vc, ())))
+                },
+            ),
+        );
+        map.iterate(arms).await
+    }
+
     #[test]
     fn map_access_owned_fork_counts_same_pairs() {
         // Fork a MapAccessOwned at the start; both forks must see all pairs.
-        let (_, (n1, n2)) = with_chunked(b"{\"a\": 1, \"b\": 2}", eof_loader(), async |shared| {
+        let (_, ()) = with_chunked(b"{\"a\": 1, \"b\": 2}", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
             de.entry(|[e]| async {
                 let mut map = match e.deserialize_map().await? {
                     Probe::Hit(m) => m,
                     Probe::Miss => panic!("expected map"),
                 };
-                let mut fork = map.fork();
+                let fork = map.fork();
 
-                let mut n1 = 0usize;
-                let claim = loop {
-                    match map
-                        .next_kv(|[ke]| async {
-                            let (claim, _k, ()) = hit!(
-                                ke.key((), |_k: &StrLen, [ve]| async {
-                                    let claim = ve.skip().await?;
-                                    Ok(Probe::Hit((claim, ())))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, ())))
-                        })
-                        .await?
-                        .unwrap()
-                    {
-                        Chunk::Data((m, ())) => {
-                            n1 += 1;
-                            map = m;
-                        }
-                        Chunk::Done(claim) => break claim,
-                    }
-                };
+                let (claim, ()) = hit!(iterate_skip_all(map).await);
+                let (_fork_claim, ()) = hit!(iterate_skip_all(fork).await);
 
-                let mut n2 = 0usize;
-                loop {
-                    match fork
-                        .next_kv(|[ke]| async {
-                            let (claim, _k, ()) = hit!(
-                                ke.key((), |_k: &StrLen, [ve]| async {
-                                    let claim = ve.skip().await?;
-                                    Ok(Probe::Hit((claim, ())))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, ())))
-                        })
-                        .await?
-                        .unwrap()
-                    {
-                        Chunk::Data((m, ())) => {
-                            n2 += 1;
-                            fork = m;
-                        }
-                        Chunk::Done(_) => break, // drop fork claim
-                    }
-                }
-
-                Ok(Probe::Hit((claim, (n1, n2))))
+                Ok(Probe::Hit((claim, ())))
             })
             .await
             .unwrap()
             .unwrap()
         });
-        assert_eq!(n1, 2);
-        assert_eq!(n2, 2);
     }
 
     // ---- Match (owned family) ------------------------------------------------
@@ -3792,7 +3875,11 @@ mod tests {
             let de = ChunkedJsonDeserializer::new(shared);
             <MatchVals<u8> as DeserializeOwned<[(&[u8], u8); 3]>>::deserialize_owned(
                 de,
-                [(b"ok".as_ref(), 0), (b"warn".as_ref(), 1), (b"error".as_ref(), 2)],
+                [
+                    (b"ok".as_ref(), 0),
+                    (b"warn".as_ref(), 1),
+                    (b"error".as_ref(), 2),
+                ],
             )
             .await
             .unwrap()
@@ -3828,10 +3915,13 @@ mod tests {
     fn match_vals_usize_str_owned_returns_index() {
         let (_, v) = with_chunked(b"\"b\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize_owned(de, ["a", "b", "c"])
-                .await
-                .unwrap()
-                .unwrap()
+            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize_owned(
+                de,
+                ["a", "b", "c"],
+            )
+            .await
+            .unwrap()
+            .unwrap()
         });
         assert_eq!(v, MatchVals(1));
     }
@@ -3840,9 +3930,12 @@ mod tests {
     fn match_vals_usize_str_owned_misses() {
         let probe = with_chunked(b"\"z\"", eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize_owned(de, ["a", "b", "c"])
-                .await
-                .unwrap()
+            <MatchVals<usize> as DeserializeOwned<[&str; 3]>>::deserialize_owned(
+                de,
+                ["a", "b", "c"],
+            )
+            .await
+            .unwrap()
         });
         assert!(matches!(probe, Probe::Miss));
     }
@@ -3879,277 +3972,6 @@ mod tests {
         assert_eq!(v, UnwrapOrElse(MatchVals(99)));
     }
 
-    // ---- tag_facade: TagFilteredMapOwned -------------------------------------
-
-    use strede::tag_facade::TagFilteredMapOwned;
-
-    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
-    struct TagFacadePoint {
-        x: i64,
-        y: i64,
-    }
-
-    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
-    struct TagFacadeEmpty {}
-
-    // Helper: drain a TagFilteredMapOwned and return the non-tag keys.
-    async fn drain_map_keys<'s, 'v, M>(
-        mut map: TagFilteredMapOwned<'s, 'v, M, strede::Skip>,
-    ) -> Result<(M::Claim, alloc::vec::Vec<String>), M::Error>
-    where
-        M: strede::MapAccessOwned<'s>,
-    {
-        let mut keys = alloc::vec::Vec::new();
-        let claim = loop {
-            let result = map
-                .next_kv(|[ke]| async move {
-                    let (c, _, s) = hit!(
-                        ke.key((), |k: &String, [ve]| {
-                            let s = k.clone();
-                            async move {
-                                let c = ve.skip().await?;
-                                Ok(Probe::Hit((c, s)))
-                            }
-                        })
-                        .await
-                    );
-                    Ok(Probe::Hit((c, s)))
-                })
-                .await?
-                .unwrap();
-            match result {
-                strede::Chunk::Data((m, s)) => {
-                    map = m;
-                    keys.push(s);
-                }
-                strede::Chunk::Done(c) => break c,
-            }
-        };
-        Ok((claim, keys))
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_passes_non_tag_keys() {
-        // {"tag": "v", "x": 1, "y": 2} — filter "tag"; only x and y pass through.
-        let (keys, tag_set) = with_chunked(
-            b"{\"tag\": \"v\", \"x\": 1, \"y\": 2}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, (keys, tag_set)) = de
-                    .entry(|[e]| async move {
-                        let map = hit!(e.deserialize_map().await);
-                        let cell = Cell::new(None);
-                        let map = TagFilteredMapOwned::new_skip(map, "tag", &cell);
-                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
-                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
-                (keys, tag_set)
-            },
-        );
-        assert_eq!(keys, alloc::vec!["x", "y"]);
-        assert!(tag_set, "tag cell should be set after draining");
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_skips_tag_key() {
-        // {"type": "Foo", "value": 42} — "type" filtered out, only "value" seen.
-        let (keys, tag_set) = with_chunked(
-            b"{\"type\": \"Foo\", \"value\": 42}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, (keys, tag_set)) = de
-                    .entry(|[e]| async move {
-                        let map = hit!(e.deserialize_map().await);
-                        let cell = Cell::new(None);
-                        let map = TagFilteredMapOwned::new_skip(map, "type", &cell);
-                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
-                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
-                (keys, tag_set)
-            },
-        );
-        assert_eq!(keys, alloc::vec!["value"]);
-        assert!(tag_set, "tag cell should be set after draining");
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_skips_tag_key_in_middle() {
-        // {"a": 1, "type": "X", "b": 2} — "type" in the middle is skipped.
-        let (keys, tag_set) = with_chunked(
-            b"{\"a\": 1, \"type\": \"X\", \"b\": 2}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, (keys, tag_set)) = de
-                    .entry(|[e]| async move {
-                        let map = hit!(e.deserialize_map().await);
-                        let cell = Cell::new(None);
-                        let map = TagFilteredMapOwned::new_skip(map, "type", &cell);
-                        let (_claim, keys) = drain_map_keys(map).await.unwrap();
-                        Ok(Probe::Hit((_claim, (keys, cell.get().is_some()))))
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
-                (keys, tag_set)
-            },
-        );
-        assert_eq!(keys, alloc::vec!["a", "b"]);
-        assert!(tag_set, "tag cell should be set after draining");
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_captures_tag_with_match() {
-        use strede::Match;
-        use strede::tag_facade::TagFilteredMapOwned as TFMO;
-        // {"type": "Foo", "value": 42} — capture tag using Match<"Foo">; cell set on hit.
-        let (keys, matched) = with_chunked(
-            b"{\"type\": \"Foo\", \"value\": 42}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, (keys, matched)) = de
-                    .entry(|[e]| async move {
-                        let map = hit!(e.deserialize_map().await);
-                        let cell: Cell<Option<Match>> = Cell::new(None);
-                        let mut map = TFMO::new(map, "type", &cell, "Foo");
-                        let mut keys = alloc::vec::Vec::new();
-                        let claim = loop {
-                            match hit!(
-                                map.next_kv(|[ke]| async move {
-                                    let (c, _, s) = hit!(
-                                        ke.key((), |k: &String, [ve]| {
-                                            let s = k.clone();
-                                            async move {
-                                                let c = ve.skip().await?;
-                                                Ok(Probe::Hit((c, s)))
-                                            }
-                                        })
-                                        .await
-                                    );
-                                    Ok(Probe::Hit((c, s)))
-                                })
-                                .await
-                            ) {
-                                strede::Chunk::Data((m, s)) => {
-                                    map = m;
-                                    keys.push(s);
-                                }
-                                strede::Chunk::Done(c) => break c,
-                            }
-                        };
-                        Ok(Probe::Hit((claim, (keys, cell.get().is_some()))))
-                    })
-                    .await
-                    .unwrap()
-                    .unwrap();
-                (keys, matched)
-            },
-        );
-        assert_eq!(keys, alloc::vec!["value"]);
-        assert!(matched, "Match cell should be set when tag value matches");
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_match_miss_when_tag_differs() {
-        use strede::Match;
-        use strede::tag_facade::TagFilteredMapOwned as TFMO;
-        // {"type": "Bar", "value": 42} — Match for "Foo" should miss; next_kv returns Miss.
-        let missed = with_chunked(
-            b"{\"type\": \"Bar\", \"value\": 42}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let probe = de
-                    .entry(|[e]| async move {
-                        let map = hit!(e.deserialize_map().await);
-                        let cell: Cell<Option<Match>> = Cell::new(None);
-                        let map = TFMO::new(map, "type", &cell, "Foo");
-                        // Attempt to read first key — tag probe for "Foo" misses on "Bar",
-                        // so next_kv returns Miss.
-                        let probe = map
-                            .next_kv(|[ke]| async move {
-                                let (c, _, ()) = hit!(
-                                    ke.key((), |_k: &String, [_ve]| async move {
-                                        panic!("Should not have reached here with bad type");
-                                    })
-                                    .await
-                                );
-                                Ok(Probe::Hit((c, true)))
-                            })
-                            .await?;
-                        // Probe::Miss means the tag key was found but value didn't match.
-                        assert!(matches!(probe, Probe::Miss));
-                        assert!(cell.get().is_none());
-
-                        Ok(Probe::<(_, ())>::Miss)
-                    })
-                    .await
-                    .unwrap();
-                assert!(matches!(probe, Probe::Miss));
-                true
-            },
-        );
-        assert!(
-            missed,
-            "next_kv should return Miss when tag value doesn't match"
-        );
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_deserializes_struct() {
-        use strede::map_facade::MapDeserializerOwned;
-        use strede::tag_facade::TagFilteredMapOwned;
-
-        let (_, v) = with_chunked(
-            b"{\"type\": \"Point\", \"x\": 3, \"y\": 7}",
-            eof_loader(),
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async move {
-                    let map = hit!(e.deserialize_map().await);
-                    let _cell = Cell::new(None);
-                    let facade =
-                        MapDeserializerOwned::new(TagFilteredMapOwned::new_skip(map, "type", &_cell));
-                    TagFacadePoint::deserialize_owned(facade, ()).await
-                })
-                .await
-                .unwrap()
-                .unwrap()
-            },
-        );
-        assert_eq!(v, TagFacadePoint { x: 3, y: 7 });
-    }
-
-    #[test]
-    fn tag_filtered_map_owned_tag_only_map_is_empty_struct() {
-        use strede::map_facade::MapDeserializerOwned;
-        use strede::tag_facade::TagFilteredMapOwned;
-
-        let (_, v) = with_chunked(b"{\"type\": \"Empty\"}", eof_loader(), async |shared| {
-            let de = ChunkedJsonDeserializer::new(shared);
-            de.entry(|[e]| async move {
-                let map = hit!(e.deserialize_map().await);
-                let _cell = Cell::new(None);
-                let facade =
-                    MapDeserializerOwned::new(TagFilteredMapOwned::new_skip(map, "type", &_cell));
-                TagFacadeEmpty::deserialize_owned(facade, ()).await
-            })
-            .await
-            .unwrap()
-            .unwrap()
-        });
-        assert_eq!(v, TagFacadeEmpty {});
-    }
-
     // ---- derive: #[strede(tag)] internally tagged enum (owned family) ---------
 
     #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
@@ -4163,7 +3985,10 @@ mod tests {
     fn derive_owned_internally_tagged_unit_hits_first() {
         let (_, v) = with_chunked(br#"{"type": "Ping"}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            OwnedTaggedEvent::deserialize_owned(de, ()).await.unwrap().unwrap()
+            OwnedTaggedEvent::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, OwnedTaggedEvent::Ping);
     }
@@ -4172,7 +3997,10 @@ mod tests {
     fn derive_owned_internally_tagged_unit_hits_second() {
         let (_, v) = with_chunked(br#"{"type": "Pong"}"#, eof_loader(), async |shared| {
             let de = ChunkedJsonDeserializer::new(shared);
-            OwnedTaggedEvent::deserialize_owned(de, ()).await.unwrap().unwrap()
+            OwnedTaggedEvent::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
         });
         assert_eq!(v, OwnedTaggedEvent::Pong);
     }
@@ -4199,388 +4027,700 @@ mod tests {
 
     #[test]
     fn derive_owned_internally_tagged_unit_tag_after_other_key() {
-        // Tag is not the first key — should still be found.
+        // Tag is not the first key - should still be found.
         let (_, v) = with_chunked(
             br#"{"extra": "ignored", "type": "Ping"}"#,
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                OwnedTaggedEvent::deserialize_owned(de, ()).await.unwrap().unwrap()
+                OwnedTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
         assert_eq!(v, OwnedTaggedEvent::Ping);
     }
 
-    // =========================================================================
-    // key_facade tests
-    // =========================================================================
-    //
-    // The key_facade interleaves two futures (outer loop + inner Foo), so we
-    // need a loop-until-ready executor instead of the single-poll one above.
+    // ---- derive: #[strede(tag)] internally tagged enum with non-unit variants (owned family) ----
 
-    // Hand-written struct deserialization using MatchVals for key dispatch.
-    #[derive(Debug, PartialEq)]
-    struct Point2 {
-        x: u32,
-        y: u32,
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    struct Vec2 {
+        x: f64,
+        y: f64,
     }
 
-    impl<'s> DeserializeOwned<'s> for Point2 {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
-            d: D,
-            _extra: (),
-        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            use strede::Chunk;
-            d.entry(|[e]| async {
-                let mut map = match e.deserialize_map().await? {
-                    Probe::Hit(m) => m,
-                    Probe::Miss => return Ok(Probe::Miss),
-                };
-                let mut x: Option<u32> = None;
-                let mut y: Option<u32> = None;
-                loop {
-                    let result = map
-                        .next_kv::<1, _, _, Option<(bool, u32)>>(|[ke]| async {
-                            let (c, key_idx, v) = hit!(
-                                ke.key::<MatchVals<usize>, _, 1, _, _, Option<u32>>(
-                                    ["x", "y"],
-                                    |_k, [ve]| {
-                                        async move {
-                                            let (c, val) = hit!(ve.value::<U32, _>(()).await);
-                                            Ok(Probe::Hit((c, Some(val.0))))
-                                        }
-                                    }
-                                )
-                                .await
-                            );
-                            Ok(Probe::Hit((c, Some((key_idx.0 == 0, v.unwrap())))))
-                        })
-                        .await?;
-                    match result {
-                        Probe::Hit(Chunk::Done(c)) => {
-                            let (x, y) = match (x, y) {
-                                (Some(x), Some(y)) => (x, y),
-                                _ => return Ok(Probe::Miss),
-                            };
-                            return Ok(Probe::Hit((c, Point2 { x, y })));
-                        }
-                        Probe::Hit(Chunk::Data((m, Some((true, v))))) => {
-                            x = Some(v);
-                            map = m;
-                        }
-                        Probe::Hit(Chunk::Data((m, Some((false, v))))) => {
-                            y = Some(v);
-                            map = m;
-                        }
-                        Probe::Hit(Chunk::Data((m, None))) => {
-                            map = m;
-                        }
-                        Probe::Miss => return Ok(Probe::Miss),
-                    }
-                }
-            })
-            .await
-        }
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "type")]
+    enum TaggedEvent {
+        Ping,
+        Move { x: f64, y: f64 },
+        Teleport(Vec2),
     }
 
-    /// Use `key_facade` to feed `{"x": 10, "y": 20}` into `Point2` by driving
-    /// it as if its map entries came from a real outer map.
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "kind")]
+    enum SimpleTagged {
+        Wrap(Vec2),
+    }
+
     #[test]
-    fn key_facade_basic_struct() {
-        let result = with_chunked_spin(
-            br#"{"x": 10, "y": 20}"#,
+    fn derive_owned_internally_tagged_simple_newtype() {
+        let (_, v) = with_chunked(
+            br#"{"kind": "Wrap", "x": 1.0, "y": 2.0}"#,
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async {
-                    let mut map = match e.deserialize_map().await? {
-                        Probe::Hit(m) => m,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-
-                    declare_comms! { 
-                        let comms = |c| Point2::deserialize_owned(KeyDeserializer::new(c), ())
-                    }
-
-                    loop {
-                        match map
-                            .next_kv(|[ke]| async {
-                                let claim =
-                                    hit!(comms.input(ke).await);
-                                Ok(Probe::Hit((claim, ())))
-                            })
-                            .await?
-                        {
-                            Probe::Hit(Chunk::Data((m, ()))) => map = m,
-                            Probe::Hit(Chunk::Done(real_claim)) => {
-                                return comms.finish(real_claim).await;
-                            }
-                            Probe::Miss => return Ok(Probe::Miss),
-                        }
-                    }
-                })
-                .await
+                let result = SimpleTagged::deserialize_owned(de, ()).await;
+                result.unwrap().unwrap()
             },
         );
-
-        let (_, point) = result.unwrap().unwrap();
-        assert_eq!(point, Point2 { x: 10, y: 20 });
+        assert_eq!(v, SimpleTagged::Wrap(Vec2 { x: 1.0, y: 2.0 }));
     }
 
-    /// key_facade with an empty map `{}` — inner future should see Done immediately
-    /// and return Miss (required fields absent).
     #[test]
-    fn key_facade_empty_map_returns_miss() {
-        let result = with_chunked_spin(
-            br#"{}"#,
+    fn derive_owned_internally_tagged_struct_variant() {
+        let (_, v) = with_chunked(
+            br#"{"type": "Move", "x": 1.0, "y": 2.0}"#,
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async {
-                    let mut map = match e.deserialize_map().await? {
-                        Probe::Hit(m) => m,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-
-                    declare_comms! { 
-                        let comms = |c| Point2::deserialize_owned(KeyDeserializer::new(c), ())
-                    }
-
-                    loop {
-                        match map
-                            .next_kv(|[ke]| async {
-                                let claim =
-                                    hit!(comms.input(ke).await);
-                                Ok(Probe::Hit((claim, ())))
-                            })
-                            .await?
-                        {
-                            Probe::Hit(Chunk::Data((m, ()))) => map = m,
-                            Probe::Hit(Chunk::Done(real_claim)) => {
-                                return comms.finish(real_claim).await;
-                            }
-                            Probe::Miss => return Ok(Probe::Miss),
-                        }
-                    }
-                })
-                .await
+                TaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
-
-        // Point2 requires both x and y — empty map must produce Miss.
-        assert!(matches!(result, Ok(Probe::Miss)));
+        assert_eq!(v, TaggedEvent::Move { x: 1.0, y: 2.0 });
     }
 
-    // Hand-written struct expecting "a" and "b" fields (contrast with Point2's "x" and "y").
-    #[derive(Debug, PartialEq)]
-    struct PointAB {
-        a: u32,
-        b: u32,
-    }
-
-    impl<'s> DeserializeOwned<'s> for PointAB {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
-            d: D,
-            _extra: (),
-        ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            use strede::Chunk;
-            d.entry(|[e]| async {
-                let mut map = match e.deserialize_map().await? {
-                    Probe::Hit(m) => m,
-                    Probe::Miss => return Ok(Probe::Miss),
-                };
-                let mut a: Option<u32> = None;
-                let mut b: Option<u32> = None;
-                loop {
-                    let result = map
-                        .next_kv::<1, _, _, Option<(bool, u32)>>(|[ke]| async {
-                            let (c, key_idx, v) = hit!(
-                                ke.key::<MatchVals<usize>, _, 1, _, _, Option<u32>>(
-                                    ["a", "b"],
-                                    |_k, [ve]| {
-                                        async move {
-                                            let (c, val) = hit!(ve.value::<U32, _>(()).await);
-                                            Ok(Probe::Hit((c, Some(val.0))))
-                                        }
-                                    }
-                                )
-                                .await
-                            );
-                            Ok(Probe::Hit((c, Some((key_idx.0 == 0, v.unwrap())))))
-                        })
-                        .await?;
-                    match result {
-                        Probe::Hit(Chunk::Done(c)) => {
-                            let (a, b) = match (a, b) {
-                                (Some(a), Some(b)) => (a, b),
-                                _ => return Ok(Probe::Miss),
-                            };
-                            return Ok(Probe::Hit((c, PointAB { a, b })));
-                        }
-                        Probe::Hit(Chunk::Data((m, Some((true, v))))) => {
-                            a = Some(v);
-                            map = m;
-                        }
-                        Probe::Hit(Chunk::Data((m, Some((false, v))))) => {
-                            b = Some(v);
-                            map = m;
-                        }
-                        Probe::Hit(Chunk::Data((m, None))) => {
-                            map = m;
-                        }
-                        Probe::Miss => return Ok(Probe::Miss),
-                    }
-                }
-            })
-            .await
-        }
-    }
-
-    /// Race two `key_facade` instances in parallel via `select_probe!` inside
-    /// `next_kv`.  Input `{"x": 10, "y": 20}` matches `Point2` but not `PointAB`,
-    /// so the Point2 arm wins and PointAB's comms gets killed after its first Miss.
     #[test]
-    fn key_facade_parallel_select() {
-        let result = with_chunked_spin(
-            br#"{"x": 10, "y": 20}"#,
+    fn derive_owned_internally_tagged_newtype_variant() {
+        let (_, v) = with_chunked(
+            br#"{"type": "Teleport", "x": 3.0, "y": 4.0}"#,
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async {
-                    let mut map = match e.deserialize_map().await? {
-                        Probe::Hit(m) => m,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-
-                    declare_comms! {
-                        let (comms_xy, comms_ab) = (
-                            &|c| Point2::deserialize_owned(KeyDeserializer::new(c), ()),
-                            &|c| PointAB::deserialize_owned(KeyDeserializer::new(c), ())
-                        )
-                    }
-
-                    loop {
-                        match map
-                            .next_kv(|[ke1, ke2]| async {
-                                strede::select_probe! {
-                                    async move {
-                                        if comms_xy.is_killed() { return Ok(Probe::Miss); }
-                                        let claim = hit!(comms_xy.input(ke1).await);
-                                        Ok(Probe::Hit((claim, 0u8)))
-                                    },
-                                    async move {
-                                        if comms_ab.is_killed() { return Ok(Probe::Miss); }
-                                        let claim = hit!(comms_ab.input(ke2).await);
-                                        Ok(Probe::Hit((claim, 1u8)))
-                                    },
-                                    miss => {
-                                        // Both missed — neither struct wants this key.
-                                        Ok(Probe::Miss)
-                                    },
-                                }
-                            })
-                            .await?
-                        {
-                            Probe::Hit(Chunk::Data((m, tag))) => {
-                                // Kill whichever arm didn't win this round.
-                                if tag == 0 { comms_ab.kill(); }
-                                if tag == 1 { comms_xy.kill(); }
-                                map = m;
-                            }
-                            Probe::Hit(Chunk::Done(real_claim)) => {
-                                // Map exhausted — finish the surviving comms.
-                                if !comms_xy.is_killed() {
-                                    let r = comms_xy.finish::<Point2, _>(real_claim).await?;
-                                    return Ok(r.map(|(c, pt)| (c, Either::Left(pt))));
-                                } else {
-                                    let r = comms_ab.finish::<PointAB, _>(real_claim).await?;
-                                    return Ok(r.map(|(c, pt)| (c, Either::Right(pt))));
-                                }
-                            }
-                            Probe::Miss => return Ok(Probe::Miss),
-                        }
-                    }
-                })
-                .await
+                let result = TaggedEvent::deserialize_owned(de, ()).await;
+                result.unwrap().unwrap()
             },
         );
-
-        let (_, val) = result.unwrap().unwrap();
-        match val {
-            Either::Left(pt) => assert_eq!(pt, Point2 { x: 10, y: 20 }),
-            Either::Right(_) => panic!("expected Point2, got PointAB"),
-        }
+        assert_eq!(v, TaggedEvent::Teleport(Vec2 { x: 3.0, y: 4.0 }));
     }
 
-    /// Same as above but with input that matches PointAB, confirming the other
-    /// arm can win.
     #[test]
-    fn key_facade_parallel_select_other_arm() {
-        let result = with_chunked_spin(
-            br#"{"a": 3, "b": 4}"#,
+    fn derive_owned_internally_tagged_unit_variant_mixed() {
+        let (_, v) = with_chunked(br#"{"type": "Ping"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            TaggedEvent::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, TaggedEvent::Ping);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_tag_not_first() {
+        let (_, v) = with_chunked(
+            br#"{"x": 5.0, "type": "Move", "y": 6.0}"#,
             eof_loader(),
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                de.entry(|[e]| async {
-                    let mut map = match e.deserialize_map().await? {
-                        Probe::Hit(m) => m,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-
-                    declare_comms! {
-                        let (comms_xy, comms_ab) = (
-                            &|c| Point2::deserialize_owned(KeyDeserializer::new(c), ()),
-                            &|c| PointAB::deserialize_owned(KeyDeserializer::new(c), ())
-                        )
-                    }
-
-                    loop {
-                        match map
-                            .next_kv(|[ke1, ke2]| async {
-                                strede::select_probe! {
-                                    async move {
-                                        if comms_xy.is_killed() { return Ok(Probe::Miss); }
-                                        let claim = hit!(comms_xy.input(ke1).await);
-                                        Ok(Probe::Hit((claim, 0u8)))
-                                    },
-                                    async move {
-                                        if comms_ab.is_killed() { return Ok(Probe::Miss); }
-                                        let claim = hit!(comms_ab.input(ke2).await);
-                                        Ok(Probe::Hit((claim, 1u8)))
-                                    },
-                                    miss => {
-                                        Ok(Probe::Miss)
-                                    },
-                                }
-                            })
-                            .await?
-                        {
-                            Probe::Hit(Chunk::Data((m, tag))) => {
-                                if tag == 0 { comms_ab.kill(); }
-                                if tag == 1 { comms_xy.kill(); }
-                                map = m;
-                            }
-                            Probe::Hit(Chunk::Done(real_claim)) => {
-                                if !comms_xy.is_killed() {
-                                    let r = comms_xy.finish::<Point2, _>(real_claim).await?;
-                                    return Ok(r.map(|(c, pt)| (c, Either::Left(pt))));
-                                } else {
-                                    let r = comms_ab.finish::<PointAB, _>(real_claim).await?;
-                                    return Ok(r.map(|(c, pt)| (c, Either::Right(pt))));
-                                }
-                            }
-                            Probe::Miss => return Ok(Probe::Miss),
-                        }
-                    }
-                })
-                .await
+                TaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
             },
         );
+        assert_eq!(v, TaggedEvent::Move { x: 5.0, y: 6.0 });
+    }
 
-        let (_, val) = result.unwrap().unwrap();
-        match val {
-            Either::Right(pt) => assert_eq!(pt, PointAB { a: 3, b: 4 }),
-            Either::Left(_) => panic!("expected PointAB, got Point2"),
-        }
+    #[test]
+    fn derive_owned_internally_tagged_unknown_variant_misses() {
+        let missed = with_chunked(
+            br#"{"type": "Unknown", "x": 1.0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                let probe = TaggedEvent::deserialize_owned(de, ()).await.unwrap();
+                probe.is_miss()
+            },
+        );
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_missing_tag_non_unit_misses() {
+        let missed = with_chunked(br#"{"x": 1.0, "y": 2.0}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let probe = TaggedEvent::deserialize_owned(de, ()).await.unwrap();
+            probe.is_miss()
+        });
+        assert!(
+            missed,
+            "missing tag field should return Miss for non-unit enum"
+        );
+    }
+
+    // ---- derive: #[strede(tag)] with rename/alias on variants ----
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "t")]
+    enum RenamedTagged {
+        #[strede(rename = "start")]
+        Begin,
+        #[strede(alias = "quit", alias = "bye")]
+        End,
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_rename_variant() {
+        let (_, v) = with_chunked(br#"{"t": "start"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, RenamedTagged::Begin);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_original_name_misses_after_rename() {
+        let missed = with_chunked(br#"{"t": "Begin"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            let probe = RenamedTagged::deserialize_owned(de, ()).await.unwrap();
+            probe.is_miss()
+        });
+        assert!(missed, "original name should not match after rename");
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_alias_first() {
+        let (_, v) = with_chunked(br#"{"t": "quit"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, RenamedTagged::End);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_alias_second() {
+        let (_, v) = with_chunked(br#"{"t": "bye"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, RenamedTagged::End);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_canonical_name_still_matches_alongside_alias() {
+        let (_, v) = with_chunked(br#"{"t": "End"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            RenamedTagged::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, RenamedTagged::End);
+    }
+
+    // ---- derive: #[strede(tag)] with rename_all ----
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "kind", rename_all = "snake_case")]
+    enum SnakeCaseTagged {
+        UserCreated,
+        OrderPlaced { id: u64 },
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_rename_all_unit() {
+        let (_, v) = with_chunked(
+            br#"{"kind": "user_created"}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                SnakeCaseTagged::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, SnakeCaseTagged::UserCreated);
+    }
+
+    #[test]
+    fn derive_owned_internally_tagged_rename_all_struct_variant() {
+        let (_, v) = with_chunked(
+            br#"{"kind": "order_placed", "id": 42}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                SnakeCaseTagged::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, SnakeCaseTagged::OrderPlaced { id: 42 });
+    }
+
+    // ---- derive: #[strede(tag, content)] adjacently tagged enum (owned family) ----
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "type", content = "data")]
+    enum AdjTaggedUnit {
+        Ping,
+        Pong,
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_unit_hits_first() {
+        let (_, v) = with_chunked(br#"{"type": "Ping"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            AdjTaggedUnit::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, AdjTaggedUnit::Ping);
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_unit_hits_second() {
+        let (_, v) = with_chunked(br#"{"type": "Pong"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            AdjTaggedUnit::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, AdjTaggedUnit::Pong);
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_unit_unknown_misses() {
+        let missed = with_chunked(br#"{"type": "Unknown"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            AdjTaggedUnit::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .is_miss()
+        });
+        assert!(missed);
+    }
+
+    #[derive(strede_derive::DeserializeOwned, Debug, PartialEq)]
+    #[strede(tag = "t", content = "c")]
+    enum AdjTaggedEvent {
+        Ping,
+        Move { x: f64, y: f64 },
+        Teleport(Vec2),
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_struct_variant() {
+        let (_, v) = with_chunked(
+            br#"{"t": "Move", "c": {"x": 1.0, "y": 2.0}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, AdjTaggedEvent::Move { x: 1.0, y: 2.0 });
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_newtype_variant() {
+        let (_, v) = with_chunked(
+            br#"{"t": "Teleport", "c": {"x": 3.0, "y": 4.0}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, AdjTaggedEvent::Teleport(Vec2 { x: 3.0, y: 4.0 }));
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_unit_in_mixed_enum() {
+        let (_, v) = with_chunked(br#"{"t": "Ping"}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            AdjTaggedEvent::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(v, AdjTaggedEvent::Ping);
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_content_before_tag() {
+        // JSON key order shouldn't matter.
+        let (_, v) = with_chunked(
+            br#"{"c": {"x": 5.0, "y": 6.0}, "t": "Move"}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, AdjTaggedEvent::Move { x: 5.0, y: 6.0 });
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_unknown_variant_misses() {
+        let missed = with_chunked(
+            br#"{"t": "Unknown", "c": {"x": 1.0}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .is_miss()
+            },
+        );
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_missing_tag_misses() {
+        let missed = with_chunked(
+            br#"{"c": {"x": 1.0, "y": 2.0}}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .is_miss()
+            },
+        );
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_adjacent_tagged_extra_fields_ignored() {
+        let (_, v) = with_chunked(
+            br#"{"extra": true, "t": "Move", "c": {"x": 7.0, "y": 8.0}, "also": 1}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                AdjTaggedEvent::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(v, AdjTaggedEvent::Move { x: 7.0, y: 8.0 });
+    }
+
+    // -------------------------------------------------------------------------
+    // flatten
+    // -------------------------------------------------------------------------
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct FlatInner {
+        x: f64,
+        y: f64,
+    }
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct FlatOuter {
+        name: String,
+        #[strede(flatten)]
+        pos: FlatInner,
+    }
+
+    // A struct where the flatten field comes before a regular field (order stress test).
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct FlatLeadingInner {
+        #[strede(flatten)]
+        pos: FlatInner,
+        label: String,
+    }
+
+    #[test]
+    fn derive_owned_flatten_basic() {
+        let (_, v) = with_chunked(
+            br#"{"name": "origin", "x": 1.0, "y": 2.0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                FlatOuter::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            FlatOuter {
+                name: "origin".to_string(),
+                pos: FlatInner { x: 1.0, y: 2.0 }
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_flatten_inner_keys_first() {
+        // Inner (flatten) keys come before the outer key.
+        let (_, v) = with_chunked(
+            br#"{"x": 3.0, "y": 4.0, "name": "point"}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                FlatOuter::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            FlatOuter {
+                name: "point".to_string(),
+                pos: FlatInner { x: 3.0, y: 4.0 }
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_flatten_extra_fields_ignored() {
+        // Extra fields not claimed by outer or inner are skipped.
+        let (_, v) = with_chunked(
+            br#"{"name": "p", "x": 5.0, "extra": true, "y": 6.0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                FlatOuter::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            FlatOuter {
+                name: "p".to_string(),
+                pos: FlatInner { x: 5.0, y: 6.0 }
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_flatten_missing_inner_field_misses() {
+        // Inner field missing - should return Miss.
+        let missed = with_chunked(
+            br#"{"name": "p", "x": 1.0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                FlatOuter::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .is_miss()
+            },
+        );
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_flatten_missing_outer_field_misses() {
+        // Outer (non-flatten) field missing - should return Miss.
+        let missed = with_chunked(br#"{"x": 1.0, "y": 2.0}"#, eof_loader(), async |shared| {
+            let de = ChunkedJsonDeserializer::new(shared);
+            FlatOuter::deserialize_owned(de, ())
+                .await
+                .unwrap()
+                .is_miss()
+        });
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_flatten_field_first() {
+        // Flatten field declared first in struct - outer field comes after in JSON.
+        let (_, v) = with_chunked(
+            br#"{"x": 7.0, "y": 8.0, "label": "test"}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                FlatLeadingInner::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            FlatLeadingInner {
+                pos: FlatInner { x: 7.0, y: 8.0 },
+                label: "test".to_string()
+            }
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // multi-flatten
+    // -------------------------------------------------------------------------
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct FlatColor {
+        r: u8,
+        g: u8,
+        b: u8,
+    }
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct MultiFlat {
+        name: String,
+        #[strede(flatten(boxed))]
+        pos: FlatInner,
+        #[strede(flatten(boxed))]
+        color: FlatColor,
+    }
+
+    #[test]
+    fn derive_owned_multi_flatten_basic() {
+        let (_, v) = with_chunked(
+            br#"{"name": "pt", "x": 1.0, "y": 2.0, "r": 255, "g": 128, "b": 0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MultiFlat::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            MultiFlat {
+                name: "pt".to_string(),
+                pos: FlatInner { x: 1.0, y: 2.0 },
+                color: FlatColor {
+                    r: 255,
+                    g: 128,
+                    b: 0
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_multi_flatten_interleaved_keys() {
+        // Keys from all three groups interleaved.
+        let (_, v) = with_chunked(
+            br#"{"r": 10, "x": 3.0, "name": "mix", "g": 20, "y": 4.0, "b": 30}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MultiFlat::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            MultiFlat {
+                name: "mix".to_string(),
+                pos: FlatInner { x: 3.0, y: 4.0 },
+                color: FlatColor {
+                    r: 10,
+                    g: 20,
+                    b: 30
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn derive_owned_multi_flatten_missing_second_field_misses() {
+        // Missing a field from the second flatten type.
+        let missed = with_chunked(
+            br#"{"name": "pt", "x": 1.0, "y": 2.0, "r": 255, "g": 128}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MultiFlat::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .is_miss()
+            },
+        );
+        assert!(missed);
+    }
+
+    #[test]
+    fn derive_owned_multi_flatten_extra_fields_ignored() {
+        let (_, v) = with_chunked(
+            br#"{"name": "pt", "x": 1.0, "y": 2.0, "r": 0, "g": 0, "b": 0, "extra": true}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                MultiFlat::deserialize_owned(de, ()).await.unwrap().unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            MultiFlat {
+                name: "pt".to_string(),
+                pos: FlatInner { x: 1.0, y: 2.0 },
+                color: FlatColor { r: 0, g: 0, b: 0 },
+            }
+        );
+    }
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct FlatSize {
+        w: f64,
+        h: f64,
+    }
+
+    #[derive(Debug, PartialEq, strede_derive::DeserializeOwned)]
+    struct TripleFlat {
+        #[strede(flatten)]
+        // #[strede(flatten(boxed))]
+        pos: FlatInner,
+        #[strede(flatten)]
+        // #[strede(flatten(boxed))]
+        color: FlatColor,
+        #[strede(flatten)]
+        // #[strede(flatten(boxed))]
+        size: FlatSize,
+    }
+
+    #[test]
+    fn derive_owned_triple_flatten() {
+        let (_, v) = with_chunked(
+            br#"{"x": 1.0, "y": 2.0, "r": 10, "g": 20, "b": 30, "w": 100.0, "h": 200.0}"#,
+            eof_loader(),
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                TripleFlat::deserialize_owned(de, ())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            },
+        );
+        assert_eq!(
+            v,
+            TripleFlat {
+                pos: FlatInner { x: 1.0, y: 2.0 },
+                color: FlatColor {
+                    r: 10,
+                    g: 20,
+                    b: 30
+                },
+                size: FlatSize { w: 100.0, h: 200.0 },
+            }
+        );
     }
 }

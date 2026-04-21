@@ -58,10 +58,10 @@ impl NumberAccess {
 impl NumberAccess {
     /// Yield the next chunk of the current JSON number.
     ///
-    /// - `Ok(Some(chunk))` — more number content; zero-copy slice of the source.
-    /// - `Ok(None)` — number finished. Use [`Tokenizer::new`] to continue.
-    /// - `Err(InvalidNumber)` — grammar violation.
-    /// - `Err(UnexpectedEnd)` — stream ended inside an incomplete number.
+    /// - `Ok(Some(chunk))` - more number content; zero-copy slice of the source.
+    /// - `Ok(None)` - number finished. Use [`Tokenizer::new`] to continue.
+    /// - `Err(InvalidNumber)` - grammar violation.
+    /// - `Err(UnexpectedEnd)` - stream ended inside an incomplete number.
     pub(crate) fn next_chunk<'a>(
         &mut self,
         src: &mut &'a [u8],
@@ -71,7 +71,7 @@ impl NumberAccess {
             return Ok(None);
         }
 
-        // Buffer empty — terminal states end the number cleanly; non-terminal
+        // Buffer empty - terminal states end the number cleanly; non-terminal
         // states mean the stream was truncated mid-number.
         if src.is_empty() {
             return if self.state.is_terminal() {
@@ -147,7 +147,7 @@ impl NumberAccess {
                     cur += 1;
                 }
                 None => {
-                    // Terminating byte found — do NOT consume it.
+                    // Terminating byte found - do NOT consume it.
                     if cur == 0 {
                         // Already in a terminal state; signal end immediately.
                         return Ok(None);
@@ -161,7 +161,7 @@ impl NumberAccess {
             }
         }
 
-        // Buffer exhausted — cur == src.len(), cur > 0.
+        // Buffer exhausted - cur == src.len(), cur > 0.
         let chunk = core::str::from_utf8(&src[..cur]).map_err(|_| JsonError::InvalidNumber)?;
         *src = &src[cur..];
 
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn streaming_split_integer() -> Result<(), JsonError> {
-        // "12" then "34}" — the number 1234
+        // "12" then "34}" - the number 1234
         let mut src1: &[u8] = b"12";
         let mut access = NumberAccess::start();
         let c1 = access.next_chunk(&mut src1)?.expect("chunk");
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn streaming_split_exponent() -> Result<(), JsonError> {
-        // "1e" (buffer exhausted in AfterE) then "10}" — yields "1e10"
+        // "1e" (buffer exhausted in AfterE) then "10}" - yields "1e10"
         let mut src1: &[u8] = b"1e";
         let mut access = NumberAccess::start();
         let c1 = access.next_chunk(&mut src1)?.expect("chunk");

@@ -14,13 +14,13 @@ use strede_derive::{Deserialize, DeserializeOwned};
 
 use crate::borrow::{BytesAccess, Deserialize, Deserializer, Entry, SeqAccess, SeqEntry};
 use crate::owned::{
-    BytesAccessOwned, DeserializeOwned, DeserializerOwned, EntryOwned, SeqAccessOwned,
-    SeqEntryOwned, StrAccessOwned,
+    BytesAccessOwned, DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned,
+    SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
 };
 use crate::{Chunk, DeserializeError, Probe, StrAccess, hit, or_miss, select_probe};
 
 // ===========================================================================
-// Core impls — no features required
+// Core impls - no features required
 // ===========================================================================
 
 // --- Unit ---
@@ -38,8 +38,8 @@ impl<'de> Deserialize<'de> for () {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for () {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for () {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -93,8 +93,8 @@ impl<'de> Deserialize<'de> for isize {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for usize {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for usize {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -113,8 +113,8 @@ impl<'s> DeserializeOwned<'s> for usize {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for isize {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for isize {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -148,8 +148,8 @@ impl<'de, T: ?Sized> Deserialize<'de> for PhantomData<T> {
     }
 }
 
-impl<'s, T: ?Sized> DeserializeOwned<'s> for PhantomData<T> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<T: ?Sized> DeserializeOwned for PhantomData<T> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -165,7 +165,7 @@ impl<'s, T: ?Sized> DeserializeOwned<'s> for PhantomData<T> {
 
 /// Deserializes by discarding the current token unconditionally.
 ///
-/// Always returns `Probe::Hit(Skip)` on well-formed input — it never misses,
+/// Always returns `Probe::Hit(Skip)` on well-formed input - it never misses,
 /// since [`Entry::skip`](crate::Entry::skip) accepts any token type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Skip;
@@ -183,8 +183,8 @@ impl<'de> Deserialize<'de> for Skip {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for Skip {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for Skip {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -343,8 +343,8 @@ impl<'de, 'a, T: Copy, const N: usize> Deserialize<'de, [(&'a [u8], T); N]> for 
     }
 }
 
-impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a str, T); N]> for MatchVals<T> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, T: Copy, const N: usize> DeserializeOwned<[(&'a str, T); N]> for MatchVals<T> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [(&'a str, T); N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -382,8 +382,8 @@ impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a str, T); N]> fo
     }
 }
 
-impl<'s, 'a, T: Copy, const N: usize> DeserializeOwned<'s, [(&'a [u8], T); N]> for MatchVals<T> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, T: Copy, const N: usize> DeserializeOwned<[(&'a [u8], T); N]> for MatchVals<T> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [(&'a [u8], T); N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -427,8 +427,14 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a str; N]> for MatchVals<usize
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
-        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as Deserialize<'de, [(&'a str, usize); N]>>::deserialize(d, pairs).await?;
+        let pairs = extra.map(|k| {
+            let idx = i;
+            i += 1;
+            (k, idx)
+        });
+        let probe =
+            <MatchVals<usize> as Deserialize<'de, [(&'a str, usize); N]>>::deserialize(d, pairs)
+                .await?;
         Ok(probe)
     }
 }
@@ -439,32 +445,54 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for MatchVals<usiz
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
-        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as Deserialize<'de, [(&'a [u8], usize); N]>>::deserialize(d, pairs).await?;
+        let pairs = extra.map(|k| {
+            let idx = i;
+            i += 1;
+            (k, idx)
+        });
+        let probe =
+            <MatchVals<usize> as Deserialize<'de, [(&'a [u8], usize); N]>>::deserialize(d, pairs)
+                .await?;
         Ok(probe)
     }
 }
 
-impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for MatchVals<usize> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, const N: usize> DeserializeOwned<[&'a str; N]> for MatchVals<usize> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
-        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a str, usize); N]>>::deserialize_owned(d, pairs).await?;
+        let pairs = extra.map(|k| {
+            let idx = i;
+            i += 1;
+            (k, idx)
+        });
+        let probe =
+            <MatchVals<usize> as DeserializeOwned<[(&'a str, usize); N]>>::deserialize_owned(
+                d, pairs,
+            )
+            .await?;
         Ok(probe)
     }
 }
 
-impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for MatchVals<usize> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, const N: usize> DeserializeOwned<[&'a [u8]; N]> for MatchVals<usize> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         let mut i = 0usize;
-        let pairs = extra.map(|k| { let idx = i; i += 1; (k, idx) });
-        let probe = <MatchVals<usize> as DeserializeOwned<'s, [(&'a [u8], usize); N]>>::deserialize_owned(d, pairs).await?;
+        let pairs = extra.map(|k| {
+            let idx = i;
+            i += 1;
+            (k, idx)
+        });
+        let probe =
+            <MatchVals<usize> as DeserializeOwned<[(&'a [u8], usize); N]>>::deserialize_owned(
+                d, pairs,
+            )
+            .await?;
         Ok(probe)
     }
 }
@@ -525,13 +553,13 @@ where
 }
 
 // Owned family
-impl<'s, T, F, Extra> DeserializeOwned<'s, (F, Extra)> for UnwrapOrElse<T>
+impl<T, F, Extra> DeserializeOwned<(F, Extra)> for UnwrapOrElse<T>
 where
-    T: DeserializeOwned<'s, Extra>,
+    T: DeserializeOwned<Extra>,
     F: AsyncFnOnce() -> T,
     Extra: Copy,
 {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         (fallback, extra): (F, Extra),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -562,8 +590,8 @@ where
 /// against a caller-supplied value passed as `Extra`.
 ///
 /// The `Extra` can be:
-/// - `&str` / `&[u8]` — single string/bytes to match.
-/// - `[&str; N]` / `[&[u8]; N]` — match any of N strings/bytes.
+/// - `&str` / `&[u8]` - single string/bytes to match.
+/// - `[&str; N]` / `[&[u8]; N]` - match any of N strings/bytes.
 ///
 /// Returns `Probe::Hit(Match)` if the token's content equals `extra` (or any
 /// element of `extra`), `Probe::Miss` if the token is the wrong type or the
@@ -574,7 +602,7 @@ where
 /// d.entry(|[e1, e2]| select_probe! {
 ///     e1.deserialize_value::<Match, &str>("ok"),
 ///     e2.deserialize_value::<Match, &str>("err"),
-///     miss => Ok(Probe::Miss),
+///     @miss => Ok(Probe::Miss),
 /// })
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,7 +613,11 @@ impl<'de, 'a> Deserialize<'de, &'a str> for Match {
         d: D,
         extra: &'a str,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); 1]>>::deserialize(
+            d,
+            [(extra, Match)],
+        )
+        .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
@@ -595,7 +627,11 @@ impl<'de, 'a> Deserialize<'de, &'a [u8]> for Match {
         d: D,
         extra: &'a [u8],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); 1]>>::deserialize(d, [(extra, Match)]).await?;
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); 1]>>::deserialize(
+            d,
+            [(extra, Match)],
+        )
+        .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
@@ -605,7 +641,11 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a str; N]> for Match {
         d: D,
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a str, Match); N]>>::deserialize(
+            d,
+            extra.map(|k| (k, Match)),
+        )
+        .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
@@ -615,47 +655,71 @@ impl<'de, 'a, const N: usize> Deserialize<'de, [&'a [u8]; N]> for Match {
         d: D,
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); N]>>::deserialize(d, extra.map(|k| (k, Match))).await?;
+        let probe = <MatchVals<Match> as Deserialize<'de, [(&'a [u8], Match); N]>>::deserialize(
+            d,
+            extra.map(|k| (k, Match)),
+        )
+        .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
-impl<'s, 'a> DeserializeOwned<'s, &'a str> for Match {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a> DeserializeOwned<&'a str> for Match {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: &'a str,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); 1]>>::deserialize_owned(d, [(extra, Match)]).await?;
+        let probe =
+            <MatchVals<Match> as DeserializeOwned<[(&'a str, Match); 1]>>::deserialize_owned(
+                d,
+                [(extra, Match)],
+            )
+            .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
-impl<'s, 'a> DeserializeOwned<'s, &'a [u8]> for Match {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a> DeserializeOwned<&'a [u8]> for Match {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: &'a [u8],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); 1]>>::deserialize_owned(d, [(extra, Match)]).await?;
+        let probe =
+            <MatchVals<Match> as DeserializeOwned<[(&'a [u8], Match); 1]>>::deserialize_owned(
+                d,
+                [(extra, Match)],
+            )
+            .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
-impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a str; N]> for Match {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, const N: usize> DeserializeOwned<[&'a str; N]> for Match {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [&'a str; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a str, Match); N]>>::deserialize_owned(d, extra.map(|k| (k, Match))).await?;
+        let probe =
+            <MatchVals<Match> as DeserializeOwned<[(&'a str, Match); N]>>::deserialize_owned(
+                d,
+                extra.map(|k| (k, Match)),
+            )
+            .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
 
-impl<'s, 'a, const N: usize> DeserializeOwned<'s, [&'a [u8]; N]> for Match {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<'a, const N: usize> DeserializeOwned<[&'a [u8]; N]> for Match {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         extra: [&'a [u8]; N],
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        let probe = <MatchVals<Match> as DeserializeOwned<'s, [(&'a [u8], Match); N]>>::deserialize_owned(d, extra.map(|k| (k, Match))).await?;
+        let probe =
+            <MatchVals<Match> as DeserializeOwned<[(&'a [u8], Match); N]>>::deserialize_owned(
+                d,
+                extra.map(|k| (k, Match)),
+            )
+            .await?;
         Ok(probe.map(|(claim, MatchVals(m))| (claim, m)))
     }
 }
@@ -673,12 +737,14 @@ macro_rules! impl_newtype_wrapper {
             }
         }
 
-        impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for $wrapper<T> {
-            async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        impl<T: DeserializeOwned> DeserializeOwned for $wrapper<T> {
+            async fn deserialize_owned<D: DeserializerOwned>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, $wrapper(v))))
+                Ok(T::deserialize_owned(d, ())
+                    .await?
+                    .map(|(c, v)| (c, $wrapper(v))))
             }
         }
     };
@@ -699,12 +765,14 @@ impl<'de, T: Deserialize<'de> + Copy> Deserialize<'de> for Cell<T> {
     }
 }
 
-impl<'s, T: DeserializeOwned<'s> + Copy> DeserializeOwned<'s> for Cell<T> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<T: DeserializeOwned + Copy> DeserializeOwned for Cell<T> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, Cell::new(v))))
+        Ok(T::deserialize_owned(d, ())
+            .await?
+            .map(|(c, v)| (c, Cell::new(v))))
     }
 }
 
@@ -721,8 +789,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for RefCell<T> {
     }
 }
 
-impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for RefCell<T> {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<T: DeserializeOwned> DeserializeOwned for RefCell<T> {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -753,8 +821,8 @@ macro_rules! impl_nonzero {
             }
         }
 
-        impl<'s> DeserializeOwned<'s> for $nonzero {
-            async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        impl DeserializeOwned for $nonzero {
+            async fn deserialize_owned<D: DeserializerOwned>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -783,7 +851,7 @@ impl_nonzero!(NonZeroI32, deserialize_i32);
 impl_nonzero!(NonZeroI64, deserialize_i64);
 impl_nonzero!(NonZeroI128, deserialize_i128);
 
-// NonZeroUsize / NonZeroIsize — delegate to usize/isize
+// NonZeroUsize / NonZeroIsize - delegate to usize/isize
 
 impl<'de> Deserialize<'de> for NonZeroUsize {
     async fn deserialize<D: Deserializer<'de>>(
@@ -799,8 +867,8 @@ impl<'de> Deserialize<'de> for NonZeroUsize {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for NonZeroUsize {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for NonZeroUsize {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -827,8 +895,8 @@ impl<'de> Deserialize<'de> for NonZeroIsize {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for NonZeroIsize {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for NonZeroIsize {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -862,14 +930,18 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for [T; N] {
             }
             let v = hit!(seq.next(|[elem]| { elem.get::<T, _>(()) }).await);
             let claim = or_miss!(v.done());
-            Ok(Probe::Hit((claim, buf.into_inner().unwrap_or_else(|_| panic!("all N elements pushed")))))
+            Ok(Probe::Hit((
+                claim,
+                buf.into_inner()
+                    .unwrap_or_else(|_| panic!("all N elements pushed")),
+            )))
         })
         .await
     }
 }
 
-impl<'s, T: DeserializeOwned<'s>, const N: usize> DeserializeOwned<'s> for [T; N] {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl<T: DeserializeOwned, const N: usize> DeserializeOwned for [T; N] {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -890,7 +962,11 @@ impl<'s, T: DeserializeOwned<'s>, const N: usize> DeserializeOwned<'s> for [T; N
                     .await
             );
             let claim = or_miss!(v.done());
-            Ok(Probe::Hit((claim, buf.into_inner().unwrap_or_else(|_| panic!("all N elements pushed")))))
+            Ok(Probe::Hit((
+                claim,
+                buf.into_inner()
+                    .unwrap_or_else(|_| panic!("all N elements pushed")),
+            )))
         })
         .await
     }
@@ -920,8 +996,8 @@ macro_rules! impl_tuple {
             }
         }
 
-        impl<'s, $($T: DeserializeOwned<'s>),+> DeserializeOwned<'s> for ($($T,)+) {
-            async fn deserialize_owned<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
+        impl<$($T: DeserializeOwned),+> DeserializeOwned for ($($T,)+) {
+            async fn deserialize_owned<D: DeserializerOwned>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
             where
                 D::Error: DeserializeError,
             {
@@ -962,7 +1038,7 @@ impl_tuple!(T0 v0, T1 v1, T2 v2, T3 v3, T4 v4, T5 v5, T6 v6, T7 v7, T8 v8, T9 v9
 impl_tuple!(T0 v0, T1 v1, T2 v2, T3 v3, T4 v4, T5 v5, T6 v6, T7 v7, T8 v8, T9 v9, T10 v10, T11 v11, T12 v12, T13 v13, T14 v14, T15 v15);
 
 // ===========================================================================
-// IP address and socket address types — string-parsed
+// IP address and socket address types - string-parsed
 // ===========================================================================
 
 macro_rules! impl_from_str {
@@ -1002,15 +1078,15 @@ macro_rules! impl_from_str {
                             let v = or_miss!(buf.as_str().parse::<$ty>().ok());
                             Ok(Probe::Hit((claim, v)))
                         },
-                        miss => Ok(Probe::Miss),
+                        @miss => Ok(Probe::Miss),
                     }
                 })
                 .await
             }
         }
 
-        impl<'s> DeserializeOwned<'s> for $ty {
-            async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        impl DeserializeOwned for $ty {
+            async fn deserialize_owned<D: DeserializerOwned>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1077,17 +1153,45 @@ impl<'de> Deserialize<'de> for core::time::Duration {
     }
 }
 
-impl<'s> DeserializeOwned<'s> for core::time::Duration {
-    async fn deserialize_owned<D: DeserializerOwned<'s>>(
+impl DeserializeOwned for core::time::Duration {
+    async fn deserialize_owned<D: DeserializerOwned>(
         d: D,
         _extra: (),
     ) -> Result<Probe<(D::Claim, Self)>, D::Error>
     where
         D::Error: DeserializeError,
     {
-        let (claim, Duration { secs, nanos }) =
-            hit!(<Duration as DeserializeOwned>::deserialize_owned(d, ()).await);
-        Ok(Probe::Hit((claim, Self::new(secs, nanos))))
+        use crate::owned::{self, MapKeyProbeOwned, MapValueProbeOwned};
+
+        d.entry(|[e]| async {
+            let map = hit!(e.deserialize_map().await);
+
+            let arms = crate::map_arms! {
+                |kp: owned::KP<D>| kp.deserialize_key::<crate::Match, &str>("secs")
+                => |vp: owned::VP2<D>, k: crate::Match| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<u64, _>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+                |kp: owned::KP<D>| kp.deserialize_key::<crate::Match, &str>("nanos")
+                => |vp: owned::VP2<D>, k: crate::Match| async move {
+                    let (vc, v) = hit!(vp.deserialize_value::<u32, _>(()).await);
+                    Ok(Probe::Hit((vc, (k, v))))
+                },
+            };
+
+            let (claim, crate::map_outputs!(opt_secs, opt_nanos)) = hit!(map.iterate(arms).await);
+
+            // Miss on empty (neither field present).
+            if opt_secs.is_none() && opt_nanos.is_none() {
+                return Ok(Probe::Miss);
+            }
+
+            let secs = opt_secs.map(|(_, v)| v).unwrap_or(0);
+            let nanos = opt_nanos.map(|(_, v)| v).unwrap_or(0);
+
+            Ok(Probe::Hit((claim, Self::new(secs, nanos))))
+        })
+        .await
     }
 }
 
@@ -1098,12 +1202,12 @@ impl<'s> DeserializeOwned<'s> for core::time::Duration {
 #[cfg(feature = "alloc")]
 mod alloc_impls {
     use crate::borrow::{
-        Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry, SeqAccess,
-        SeqEntry,
+        Deserialize, Deserializer, Entry, MapAccess, MapArmStack, MapKeyProbe, MapValueProbe,
+        SeqAccess, SeqEntry, VC, VP,
     };
     use crate::owned::{
         BytesAccessOwned, DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned,
-        MapKeyEntryOwned, MapValueEntryOwned, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
+        MapValueProbeOwned, SeqAccessOwned, SeqEntryOwned, StrAccessOwned,
     };
     use crate::{BytesAccess, Chunk, DeserializeError, Probe, StrAccess, hit, or_miss};
 
@@ -1139,8 +1243,8 @@ mod alloc_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for String {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for String {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1194,8 +1298,8 @@ mod alloc_impls {
         }
     }
 
-    impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Vec<T> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<T: DeserializeOwned> DeserializeOwned for Vec<T> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1233,12 +1337,14 @@ mod alloc_impls {
         }
     }
 
-    impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Box<T> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<T: DeserializeOwned> DeserializeOwned for Box<T> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(T::deserialize_owned(d, ()).await?.map(|(c, v)| (c, Box::new(v))))
+            Ok(T::deserialize_owned(d, ())
+                .await?
+                .map(|(c, v)| (c, Box::new(v))))
         }
     }
 
@@ -1253,8 +1359,8 @@ mod alloc_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for Box<str> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for Box<str> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1278,8 +1384,8 @@ mod alloc_impls {
         }
     }
 
-    impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for Box<[T]> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<T: DeserializeOwned> DeserializeOwned for Box<[T]> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1317,8 +1423,8 @@ mod alloc_impls {
                 }
             }
 
-            impl<'s, $T: DeserializeOwned<'s> $($(+ $bound)+)?> DeserializeOwned<'s> for $ty<$T> {
-                async fn deserialize_owned<D: DeserializerOwned<'s>>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
+            impl<$T: DeserializeOwned $($(+ $bound)+)?> DeserializeOwned for $ty<$T> {
+                async fn deserialize_owned<D: DeserializerOwned>(d: D, _extra: ()) -> Result<Probe<(D::Claim, Self)>, D::Error>
                 where
                     D::Error: DeserializeError,
                 {
@@ -1344,6 +1450,95 @@ mod alloc_impls {
 
     // --- BTreeMap<K, V> ---
 
+    struct CollectBTreeMapArm<K, V> {
+        pending_key: Option<K>,
+        out: BTreeMap<K, V>,
+    }
+
+    impl<K: Ord, V> CollectBTreeMapArm<K, V> {
+        fn new() -> Self {
+            Self {
+                pending_key: None,
+                out: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl<'de, KP, K, V> MapArmStack<'de, KP> for CollectBTreeMapArm<K, V>
+    where
+        KP: MapKeyProbe<'de>,
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        const SIZE: usize = 1;
+        type Outputs = BTreeMap<K, V>;
+
+        fn unsatisfied_count(&self) -> usize {
+            0
+        }
+        fn open_count(&self) -> usize {
+            0
+        }
+
+        type RaceState = ();
+        type RaceDone = ();
+        fn init_race(&mut self, _kp: KP) -> ((), ()) {
+            unreachable!()
+        }
+        fn race_all_done(_done: &()) -> bool {
+            unreachable!()
+        }
+        fn poll_race_one(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _done: &mut (),
+            _arm_index: usize,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+            unreachable!()
+        }
+
+        type DispatchState = ();
+        fn init_dispatch(&mut self, _arm_index: usize, _vp: VP<'de, KP>) -> () {
+            unreachable!()
+        }
+        fn poll_dispatch(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+            unreachable!()
+        }
+
+        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+            let (kc, k) = hit!(kp.deserialize_key::<K, _>(()).await);
+            self.pending_key = Some(k);
+            Ok(Probe::Hit((0, kc)))
+        }
+
+        async fn dispatch_value(
+            &mut self,
+            _arm_index: usize,
+            vp: VP<'de, KP>,
+        ) -> Result<Probe<(VC<'de, KP>, ())>, KP::Error> {
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch_value without pending key");
+            match vp.deserialize_value::<V, _>(()).await? {
+                Probe::Hit((vc, v)) => {
+                    self.out.insert(k, v);
+                    Ok(Probe::Hit((vc, ())))
+                }
+                Probe::Miss => Ok(Probe::Miss),
+            }
+        }
+
+        fn take_outputs(&mut self) -> Self::Outputs {
+            core::mem::take(&mut self.out)
+        }
+    }
+
     impl<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>> Deserialize<'de> for BTreeMap<K, V> {
         async fn deserialize<D: Deserializer<'de>>(
             d: D,
@@ -1353,33 +1548,17 @@ mod alloc_impls {
             D::Error: DeserializeError,
         {
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut out = BTreeMap::new();
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, k, v) =
-                                hit!(ke.key((), |_k, [ve]| ve.value::<V, _>(())).await);
-                            Ok(Probe::Hit((claim, (k, v))))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, (k, v))) => {
-                            out.insert(k, v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+                let collector = CollectBTreeMapArm::<K, V>::new();
+                let (claim, out) = hit!(map.iterate(collector).await);
+                Ok(Probe::Hit((claim, out)))
             })
             .await
         }
     }
 
-    impl<'s, K: DeserializeOwned<'s> + Ord, V: DeserializeOwned<'s>> DeserializeOwned<'s>
-        for BTreeMap<K, V>
-    {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<K: DeserializeOwned + Ord, V: DeserializeOwned> DeserializeOwned for BTreeMap<K, V> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1387,26 +1566,106 @@ mod alloc_impls {
             D::Error: DeserializeError,
         {
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut out = BTreeMap::new();
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, k, v) =
-                                hit!(ke.key((), |_k, [ve]| ve.value::<V, _>(())).await);
-                            Ok(Probe::Hit((claim, (k, v))))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, (k, v))) => {
-                            out.insert(k, v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+                let collector = CollectMapArm::<K, V>::new();
+                let (claim, out) = hit!(map.iterate(collector).await);
+                Ok(Probe::Hit((claim, out)))
             })
             .await
+        }
+    }
+
+    /// A [`MapArmStackOwned`](crate::owned::MapArmStackOwned) implementation that collects
+    /// all KV pairs into a `BTreeMap`. Always hungry - never satisfied, always
+    /// matches, accumulates until the map is exhausted.
+    struct CollectMapArm<K, V> {
+        pending_key: Option<K>,
+        out: BTreeMap<K, V>,
+    }
+
+    impl<K, V> CollectMapArm<K, V> {
+        fn new() -> Self {
+            Self {
+                pending_key: None,
+                out: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl<KP, K, V> crate::owned::MapArmStackOwned<KP> for CollectMapArm<K, V>
+    where
+        KP: crate::owned::MapKeyProbeOwned,
+        K: DeserializeOwned + Ord,
+        V: DeserializeOwned,
+    {
+        const SIZE: usize = 1;
+        type Outputs = BTreeMap<K, V>;
+
+        fn unsatisfied_count(&self) -> usize {
+            0
+        }
+        fn open_count(&self) -> usize {
+            1
+        } // always hungry
+
+        // CollectMapArm is never used inside StackConcat, so init/poll are
+        // not called. We provide panicking stubs and override the async methods.
+        type RaceState = ();
+        type RaceDone = ();
+        fn init_race(&mut self, _kp: KP) -> ((), ()) {
+            unreachable!()
+        }
+        fn race_all_done(_done: &()) -> bool {
+            unreachable!()
+        }
+        fn poll_race_one(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _done: &mut (),
+            _arm_index: usize,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+            unreachable!()
+        }
+
+        type DispatchState = ();
+        fn init_dispatch(&mut self, _arm_index: usize, _vp: crate::owned::VP<KP>) -> () {
+            unreachable!()
+        }
+        fn poll_dispatch(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(crate::owned::VC<KP>, ())>, KP::Error>> {
+            unreachable!()
+        }
+
+        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+            let (kc, k) = hit!(kp.deserialize_key::<K, _>(()).await);
+            self.pending_key = Some(k);
+            Ok(Probe::Hit((0, kc)))
+        }
+
+        async fn dispatch_value(
+            &mut self,
+            _arm_index: usize,
+            vp: crate::owned::VP<KP>,
+        ) -> Result<Probe<(crate::owned::VC<KP>, ())>, KP::Error> {
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch_value without pending key");
+            match vp.deserialize_value::<V, _>(()).await? {
+                Probe::Hit((vc, v)) => {
+                    self.out.insert(k, v);
+                    Ok(Probe::Hit((vc, ())))
+                }
+                Probe::Miss => Ok(Probe::Miss),
+            }
+        }
+
+        fn take_outputs(&mut self) -> Self::Outputs {
+            core::mem::take(&mut self.out)
         }
     }
 
@@ -1425,10 +1684,8 @@ mod alloc_impls {
                 if let Probe::Hit((claim, t)) = e1.deserialize_value::<&'a T, ()>(()).await? {
                     return Ok(Probe::Hit((claim, Cow::Borrowed(t))));
                 }
-                match e2.deserialize_value::<T::Owned, ()>(()).await? {
-                    Probe::Hit((claim, owned)) => Ok(Probe::Hit((claim, Cow::Owned(owned)))),
-                    Probe::Miss => Ok(Probe::Miss),
-                }
+                let (claim, owned) = hit!(e2.deserialize_value::<T::Owned, ()>(()).await);
+                Ok(Probe::Hit((claim, Cow::Owned(owned))))
             })
             .await
         }
@@ -1436,11 +1693,11 @@ mod alloc_impls {
 
     // --- Cow<'a, T> (owned family: always Cow::Owned) ---
 
-    impl<'s, 'a, T: ?Sized + ToOwned> DeserializeOwned<'s> for Cow<'a, T>
+    impl<'a, T: ?Sized + ToOwned> DeserializeOwned for Cow<'a, T>
     where
-        T::Owned: DeserializeOwned<'s>,
+        T::Owned: DeserializeOwned,
     {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1476,8 +1733,8 @@ mod alloc_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for CString {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for CString {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1529,11 +1786,11 @@ mod alloc_impls {
             }
         }
 
-        impl<'s, T: ?Sized> DeserializeOwned<'s> for Rc<T>
+        impl<T: ?Sized> DeserializeOwned for Rc<T>
         where
-            Box<T>: DeserializeOwned<'s>,
+            Box<T>: DeserializeOwned,
         {
-            async fn deserialize<D: DeserializerOwned<'s>>(
+            async fn deserialize<D: DeserializerOwned>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1557,11 +1814,11 @@ mod alloc_impls {
             }
         }
 
-        impl<'s, T: ?Sized> DeserializeOwned<'s> for Arc<T>
+        impl<T: ?Sized> DeserializeOwned for Arc<T>
         where
-            Box<T>: DeserializeOwned<'s>,
+            Box<T>: DeserializeOwned,
         {
-            async fn deserialize<D: DeserializerOwned<'s>>(
+            async fn deserialize<D: DeserializerOwned>(
                 d: D,
                 _extra: (),
             ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1582,12 +1839,12 @@ mod std_impls {
     extern crate std;
 
     use crate::borrow::{
-        Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry, SeqAccess,
-        SeqEntry,
+        Deserialize, Deserializer, Entry, MapAccess, MapArmStack, MapKeyProbe, MapValueProbe,
+        SeqAccess, SeqEntry, VC, VP,
     };
     use crate::owned::{
-        DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-        MapValueEntryOwned, SeqAccessOwned, SeqEntryOwned,
+        DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapValueProbeOwned,
+        SeqAccessOwned, SeqEntryOwned,
     };
     use crate::{Chunk, DeserializeError, Probe, hit, or_miss};
     use core::hash::{BuildHasher, Hash};
@@ -1597,6 +1854,96 @@ mod std_impls {
     use alloc::{boxed::Box, string::String};
 
     // --- HashMap<K, V, S> ---
+
+    struct CollectHashMapBorrowArm<K, V, S> {
+        pending_key: Option<K>,
+        out: HashMap<K, V, S>,
+    }
+
+    impl<K, V, S: BuildHasher + Default> CollectHashMapBorrowArm<K, V, S> {
+        fn new() -> Self {
+            Self {
+                pending_key: None,
+                out: HashMap::with_hasher(S::default()),
+            }
+        }
+    }
+
+    impl<'de, KP, K, V, S> MapArmStack<'de, KP> for CollectHashMapBorrowArm<K, V, S>
+    where
+        KP: MapKeyProbe<'de>,
+        K: Deserialize<'de> + Eq + core::hash::Hash,
+        V: Deserialize<'de>,
+        S: BuildHasher + Default,
+    {
+        const SIZE: usize = 1;
+        type Outputs = HashMap<K, V, S>;
+
+        fn unsatisfied_count(&self) -> usize {
+            0
+        }
+        fn open_count(&self) -> usize {
+            0
+        }
+
+        type RaceState = ();
+        type RaceDone = ();
+        fn init_race(&mut self, _kp: KP) -> ((), ()) {
+            unreachable!()
+        }
+        fn race_all_done(_done: &()) -> bool {
+            unreachable!()
+        }
+        fn poll_race_one(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _done: &mut (),
+            _arm_index: usize,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+            unreachable!()
+        }
+
+        type DispatchState = ();
+        fn init_dispatch(&mut self, _arm_index: usize, _vp: VP<'de, KP>) -> () {
+            unreachable!()
+        }
+        fn poll_dispatch(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+            unreachable!()
+        }
+
+        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+            let (kc, k) = hit!(kp.deserialize_key::<K, _>(()).await);
+            self.pending_key = Some(k);
+            Ok(Probe::Hit((0, kc)))
+        }
+
+        async fn dispatch_value(
+            &mut self,
+            _arm_index: usize,
+            vp: VP<'de, KP>,
+        ) -> Result<Probe<(VC<'de, KP>, ())>, KP::Error> {
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch_value without pending key");
+            match vp.deserialize_value::<V, _>(()).await? {
+                Probe::Hit((vc, v)) => {
+                    self.out.insert(k, v);
+                    Ok(Probe::Hit((vc, ())))
+                }
+                Probe::Miss => Ok(Probe::Miss),
+            }
+        }
+
+        fn take_outputs(&mut self) -> Self::Outputs {
+            core::mem::take(&mut self.out)
+        }
+    }
 
     impl<'de, K, V, S> Deserialize<'de> for HashMap<K, V, S>
     where
@@ -1612,38 +1959,22 @@ mod std_impls {
             D::Error: DeserializeError,
         {
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut out = HashMap::with_hasher(S::default());
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, k, v) = hit!(
-                                ke.key((), |_k, [ve]| async { ve.value::<V, _>(()).await })
-                                    .await
-                            );
-                            Ok(Probe::Hit((claim, (k, v))))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, (k, v))) => {
-                            out.insert(k, v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+                let collector = CollectHashMapBorrowArm::<K, V, S>::new();
+                let (claim, out) = hit!(map.iterate(collector).await);
+                Ok(Probe::Hit((claim, out)))
             })
             .await
         }
     }
 
-    impl<'s, K, V, S> DeserializeOwned<'s> for HashMap<K, V, S>
+    impl<K, V, S> DeserializeOwned for HashMap<K, V, S>
     where
-        K: DeserializeOwned<'s> + Eq + Hash,
-        V: DeserializeOwned<'s>,
+        K: DeserializeOwned + Eq + Hash,
+        V: DeserializeOwned,
         S: BuildHasher + Default,
     {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1651,28 +1982,103 @@ mod std_impls {
             D::Error: DeserializeError,
         {
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut out = HashMap::with_hasher(S::default());
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, k, v) = hit!(
-                                ke.key((), |_k, [ve]| async { ve.value::<V, _>(()).await })
-                                    .await
-                            );
-                            Ok(Probe::Hit((claim, (k, v))))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, (k, v))) => {
-                            out.insert(k, v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, out))),
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+                let collector = CollectHashMapArm::<K, V, S>::new();
+                let (claim, out) = hit!(map.iterate(collector).await);
+                Ok(Probe::Hit((claim, out)))
             })
             .await
+        }
+    }
+
+    struct CollectHashMapArm<K, V, S> {
+        pending_key: Option<K>,
+        out: HashMap<K, V, S>,
+    }
+
+    impl<K, V, S: BuildHasher + Default> CollectHashMapArm<K, V, S> {
+        fn new() -> Self {
+            Self {
+                pending_key: None,
+                out: HashMap::with_hasher(S::default()),
+            }
+        }
+    }
+
+    impl<KP, K, V, S> crate::owned::MapArmStackOwned<KP> for CollectHashMapArm<K, V, S>
+    where
+        KP: crate::owned::MapKeyProbeOwned,
+        K: DeserializeOwned + Eq + Hash,
+        V: DeserializeOwned,
+        S: BuildHasher + Default,
+    {
+        const SIZE: usize = 1;
+        type Outputs = HashMap<K, V, S>;
+
+        fn unsatisfied_count(&self) -> usize {
+            0
+        }
+        fn open_count(&self) -> usize {
+            1
+        } // always hungry
+
+        // CollectHashMapArm is never used inside StackConcat.
+        type RaceState = ();
+        type RaceDone = ();
+        fn init_race(&mut self, _kp: KP) -> ((), ()) {
+            unreachable!()
+        }
+        fn race_all_done(_done: &()) -> bool {
+            unreachable!()
+        }
+        fn poll_race_one(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _done: &mut (),
+            _arm_index: usize,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+            unreachable!()
+        }
+
+        type DispatchState = ();
+        fn init_dispatch(&mut self, _arm_index: usize, _vp: crate::owned::VP<KP>) -> () {
+            unreachable!()
+        }
+        fn poll_dispatch(
+            &mut self,
+            _state: core::pin::Pin<&mut ()>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Result<Probe<(crate::owned::VC<KP>, ())>, KP::Error>> {
+            unreachable!()
+        }
+
+        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+            let (kc, k) = hit!(kp.deserialize_key::<K, _>(()).await);
+            self.pending_key = Some(k);
+            Ok(Probe::Hit((0, kc)))
+        }
+
+        async fn dispatch_value(
+            &mut self,
+            _arm_index: usize,
+            vp: crate::owned::VP<KP>,
+        ) -> Result<Probe<(crate::owned::VC<KP>, ())>, KP::Error> {
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch_value without pending key");
+            match vp.deserialize_value::<V, _>(()).await? {
+                Probe::Hit((vc, v)) => {
+                    self.out.insert(k, v);
+                    Ok(Probe::Hit((vc, ())))
+                }
+                Probe::Miss => Ok(Probe::Miss),
+            }
+        }
+
+        fn take_outputs(&mut self) -> Self::Outputs {
+            core::mem::take(&mut self.out)
         }
     }
 
@@ -1710,12 +2116,12 @@ mod std_impls {
         }
     }
 
-    impl<'s, T, S> DeserializeOwned<'s> for HashSet<T, S>
+    impl<T, S> DeserializeOwned for HashSet<T, S>
     where
-        T: DeserializeOwned<'s> + Eq + Hash,
+        T: DeserializeOwned + Eq + Hash,
         S: BuildHasher + Default,
     {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
@@ -1755,8 +2161,8 @@ mod std_impls {
         }
     }
 
-    impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for std::sync::Mutex<T> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<T: DeserializeOwned> DeserializeOwned for std::sync::Mutex<T> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1777,8 +2183,8 @@ mod std_impls {
         }
     }
 
-    impl<'s, T: DeserializeOwned<'s>> DeserializeOwned<'s> for std::sync::RwLock<T> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl<T: DeserializeOwned> DeserializeOwned for std::sync::RwLock<T> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1801,8 +2207,8 @@ mod std_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for std::path::PathBuf {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for std::path::PathBuf {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1823,8 +2229,8 @@ mod std_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for std::ffi::OsString {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for std::ffi::OsString {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -1847,14 +2253,16 @@ mod std_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for Box<std::path::Path> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for Box<std::path::Path> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<std::path::PathBuf as DeserializeOwned>::deserialize_owned(d, ())
-                .await?
-                .map(|(c, p)| (c, p.into_boxed_path())))
+            Ok(
+                <std::path::PathBuf as DeserializeOwned>::deserialize_owned(d, ())
+                    .await?
+                    .map(|(c, p)| (c, p.into_boxed_path())),
+            )
         }
     }
 
@@ -1869,14 +2277,16 @@ mod std_impls {
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for Box<std::ffi::OsStr> {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for Box<std::ffi::OsStr> {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-            Ok(<std::ffi::OsString as DeserializeOwned>::deserialize_owned(d, ())
-                .await?
-                .map(|(c, s)| (c, s.into_boxed_os_str())))
+            Ok(
+                <std::ffi::OsString as DeserializeOwned>::deserialize_owned(d, ())
+                    .await?
+                    .map(|(c, s)| (c, s.into_boxed_os_str())),
+            )
         }
     }
 
@@ -1895,11 +2305,6 @@ mod std_impls {
 
     // --- SystemTime ---
 
-    enum SysTimeField {
-        Secs(u64),
-        Nanos(u32),
-    }
-
     impl<'de> Deserialize<'de> for std::time::SystemTime {
         async fn deserialize<D: Deserializer<'de>>(
             d: D,
@@ -1908,119 +2313,69 @@ mod std_impls {
         where
             D::Error: DeserializeError,
         {
+            use crate::borrow::{KP, MapKeyProbe as _, MapValueProbe as _};
+
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut secs: Option<u64> = None;
-                let mut nanos: Option<u32> = None;
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, _k, r) = hit!(
-                                ke.key((), |k, [ve]| {
-                                    let field = match *k {
-                                        "secs_since_epoch" => 0u8,
-                                        "nanos_since_epoch" => 1u8,
-                                        _ => 2u8,
-                                    };
-                                    async move {
-                                        match field {
-                                            0 => {
-                                                let (claim, v) = hit!(ve.value::<u64, _>(()).await);
-                                                Ok(Probe::Hit((claim, SysTimeField::Secs(v))))
-                                            }
-                                            1 => {
-                                                let (claim, v) = hit!(ve.value::<u32, _>(()).await);
-                                                Ok(Probe::Hit((claim, SysTimeField::Nanos(v))))
-                                            }
-                                            _ => Ok(Probe::Miss),
-                                        }
-                                    }
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, r)))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, SysTimeField::Secs(v))) => {
-                            secs = Some(v);
-                            map = m;
-                        }
-                        Chunk::Data((m, SysTimeField::Nanos(v))) => {
-                            nanos = Some(v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => {
-                            let s = or_miss!(secs);
-                            let n = or_miss!(nanos);
-                            let dur = core::time::Duration::new(s, n);
-                            return Ok(Probe::Hit((claim, std::time::UNIX_EPOCH + dur)));
-                        }
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+
+                let arms = crate::map_arms! {
+                    |kp: KP<'de, D>| kp.deserialize_key::<crate::Match, &str>("secs_since_epoch")
+                    => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<u64, _>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                    |kp: KP<'de, D>| kp.deserialize_key::<crate::Match, &str>("nanos_since_epoch")
+                    => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<u32, _>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                };
+
+                let (claim, crate::map_outputs!(opt_secs, opt_nanos)) =
+                    hit!(map.iterate(arms).await);
+
+                let s = or_miss!(opt_secs.map(|(_, v)| v));
+                let n = or_miss!(opt_nanos.map(|(_, v)| v));
+                let dur = core::time::Duration::new(s, n);
+                Ok(Probe::Hit((claim, std::time::UNIX_EPOCH + dur)))
             })
             .await
         }
     }
 
-    impl<'s> DeserializeOwned<'s> for std::time::SystemTime {
-        async fn deserialize_owned<D: DeserializerOwned<'s>>(
+    impl DeserializeOwned for std::time::SystemTime {
+        async fn deserialize_owned<D: DeserializerOwned>(
             d: D,
             _extra: (),
         ) -> Result<Probe<(D::Claim, Self)>, D::Error>
         where
             D::Error: DeserializeError,
         {
+            use crate::owned::{self, MapKeyProbeOwned, MapValueProbeOwned};
+
             d.entry(|[e]| async {
-                let mut map = hit!(e.deserialize_map().await);
-                let mut secs: Option<u64> = None;
-                let mut nanos: Option<u32> = None;
-                loop {
-                    match hit!(
-                        map.next_kv(|[ke]| async {
-                            let (claim, _k, r) = hit!(
-                                ke.key((), |k: &String, [ve]| {
-                                    let field = match k.as_str() {
-                                        "secs_since_epoch" => 0u8,
-                                        "nanos_since_epoch" => 1u8,
-                                        _ => 2u8,
-                                    };
-                                    async move {
-                                        match field {
-                                            0 => {
-                                                let (claim, v) = hit!(ve.value::<u64, _>(()).await);
-                                                Ok(Probe::Hit((claim, SysTimeField::Secs(v))))
-                                            }
-                                            1 => {
-                                                let (claim, v) = hit!(ve.value::<u32, _>(()).await);
-                                                Ok(Probe::Hit((claim, SysTimeField::Nanos(v))))
-                                            }
-                                            _ => Ok(Probe::Miss),
-                                        }
-                                    }
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((claim, r)))
-                        })
-                        .await
-                    ) {
-                        Chunk::Data((m, SysTimeField::Secs(v))) => {
-                            secs = Some(v);
-                            map = m;
-                        }
-                        Chunk::Data((m, SysTimeField::Nanos(v))) => {
-                            nanos = Some(v);
-                            map = m;
-                        }
-                        Chunk::Done(claim) => {
-                            let s = or_miss!(secs);
-                            let n = or_miss!(nanos);
-                            let dur = core::time::Duration::new(s, n);
-                            return Ok(Probe::Hit((claim, std::time::UNIX_EPOCH + dur)));
-                        }
-                    }
-                }
+                let map = hit!(e.deserialize_map().await);
+
+                let arms = crate::map_arms! {
+                    |kp: owned::KP<D>| kp.deserialize_key::<crate::Match, &str>("secs_since_epoch")
+                    => |vp: owned::VP2<D>, k: crate::Match| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<u64, _>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                    |kp: owned::KP<D>| kp.deserialize_key::<crate::Match, &str>("nanos_since_epoch")
+                    => |vp: owned::VP2<D>, k: crate::Match| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<u32, _>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                };
+
+                let (claim, crate::map_outputs!(opt_secs, opt_nanos)) =
+                    hit!(map.iterate(arms).await);
+
+                let s = or_miss!(opt_secs.map(|(_, v)| v));
+                let n = or_miss!(opt_nanos.map(|(_, v)| v));
+                let dur = core::time::Duration::new(s, n);
+                Ok(Probe::Hit((claim, std::time::UNIX_EPOCH + dur)))
             })
             .await
         }
@@ -2041,8 +2396,8 @@ mod std_impls {
                 }
             }
 
-            impl<'s> DeserializeOwned<'s> for $atomic {
-                async fn deserialize_owned<D: DeserializerOwned<'s>>(
+            impl DeserializeOwned for $atomic {
+                async fn deserialize_owned<D: DeserializerOwned>(
                     d: D,
                     _extra: (),
                 ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -2088,15 +2443,11 @@ mod std_impls {
 /// already-opened map to a variant's `Deserialize` impl.
 pub mod map_facade {
     use crate::{
-        Chunk, Probe,
-        borrow::{Deserialize, Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry},
-        hit,
-        owned::{
-            DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-            MapValueEntryOwned,
-        },
+        Probe,
+        borrow::{Deserialize, Deserializer, Entry, MapAccess, VP},
+        utils::repeat,
     };
-    use core::{array, future::Future, marker::PhantomData};
+    use core::{future::Future, marker::PhantomData};
 
     // -----------------------------------------------------------------------
     // Borrow family
@@ -2110,14 +2461,14 @@ pub mod map_facade {
     /// When the inner type calls `d.entry(|[e]| e.deserialize_map())` the
     /// facade returns the wrapped map directly.  Any other probe returns Miss.
     pub struct MapDeserializer<'de, M: MapAccess<'de>> {
-        pub map: Option<M>,
+        pub map: M,
         pub _marker: core::marker::PhantomData<&'de ()>,
     }
 
     impl<'de, M: MapAccess<'de>> MapDeserializer<'de, M> {
         pub fn new(map: M) -> Self {
             Self {
-                map: Some(map),
+                map,
                 _marker: core::marker::PhantomData,
             }
         }
@@ -2125,44 +2476,38 @@ pub mod map_facade {
 
     impl<'de, M: MapAccess<'de>> Deserializer<'de> for MapDeserializer<'de, M> {
         type Error = M::Error;
-        type Claim = M::Claim;
+        type Claim = M::MapClaim;
+        type EntryClaim = M::MapClaim;
         type Entry = MapDeserializerEntry<'de, M>;
 
         async fn entry<const N: usize, F, Fut, R>(
-            mut self,
+            self,
             mut f: F,
         ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
         where
             F: FnMut([Self::Entry; N]) -> Fut,
-            Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+            Fut: Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>,
         {
-            let entries: [_; N] = array::from_fn(|i| {
-                let map = if i == N - 1 {
-                    self.map.as_mut().map(|m| m.fork())
-                } else {
-                    self.map.take()
-                };
-                MapDeserializerEntry {
-                    map,
-                    _marker: PhantomData,
-                }
+            let entries = repeat(self.map, M::fork).map(|map| MapDeserializerEntry {
+                map,
+                _marker: PhantomData,
             });
             f(entries).await
         }
     }
 
     pub struct MapDeserializerEntry<'de, M: MapAccess<'de>> {
-        pub(crate) map: Option<M>,
+        pub(crate) map: M,
         pub(crate) _marker: PhantomData<&'de ()>,
     }
 
     impl<'de, M: MapAccess<'de>> Entry<'de> for MapDeserializerEntry<'de, M> {
         type Error = M::Error;
-        type Claim = M::Claim;
-        type StrChunks = crate::Never<'de, M::Claim, M::Error>;
-        type BytesChunks = crate::Never<'de, M::Claim, M::Error>;
+        type Claim = M::MapClaim;
+        type StrChunks = crate::Never<'de, M::MapClaim, M::Error>;
+        type BytesChunks = crate::Never<'de, M::MapClaim, M::Error>;
         type Map = M;
-        type Seq = crate::Never<'de, M::Claim, M::Error>;
+        type Seq = crate::Never<'de, M::MapClaim, M::Error>;
 
         async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
             Ok(Probe::Miss)
@@ -2226,10 +2571,7 @@ pub mod map_facade {
         }
 
         async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-            match self.map {
-                Some(m) => Ok(Probe::Hit(m)),
-                None => Ok(Probe::Miss),
-            }
+            Ok(Probe::Hit(self.map))
         }
 
         async fn deserialize_option<T: Deserialize<'de, Extra>, Extra>(
@@ -2248,101 +2590,387 @@ pub mod map_facade {
 
         fn fork(&mut self) -> Self {
             Self {
-                map: self.map.as_mut().map(|v| v.fork()),
+                map: self.map.fork(),
                 _marker: PhantomData,
             }
         }
 
         async fn skip(self) -> Result<Self::Claim, Self::Error> {
-            match self.map {
-                Some(mut m) => loop {
-                    match m
-                        .next_kv::<1, _, _, ()>(|[ke]| async {
-                            let (c, _, ()) = hit!(
-                                ke.key((), |_k: &&'de str, [ve]| async {
-                                    let c = ve.skip().await?;
-                                    Ok(Probe::Hit((c, ())))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((c, ())))
-                        })
-                        .await?
-                    {
-                        Probe::Hit(Chunk::Done(c)) => return Ok(c),
-                        Probe::Hit(Chunk::Data((new_m, ()))) => {
-                            m = new_m;
-                        }
-                        Probe::Miss => panic!("unexpected Miss draining map"),
+            let arms = crate::SkipUnknown!(
+                crate::MapArmBase,
+                <M as MapAccess<'de>>::KeyProbe,
+                VP<'de, <M as MapAccess<'de>>::KeyProbe>
+            );
+            match self.map.iterate(arms).await? {
+                Probe::Hit((claim, ())) => Ok(claim),
+                Probe::Miss => panic!("MapDeserializerEntry::skip: iterate returned Miss"),
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Tag-filtering map facades (used by #[strede(tag)] derive output)
+// ===========================================================================
+
+pub mod tag_facade {
+    use crate::{
+        Never, Probe,
+        borrow::{Deserializer, Entry, MapAccess, MapArmStack},
+        owned::{
+            DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapArmStackOwned,
+        },
+        utils::repeat,
+    };
+    use core::cell::Cell;
+    use core::{future::Future, marker::PhantomData};
+
+    pub use super::map_facade::{MapDeserializer, MapDeserializerEntry};
+
+    // -----------------------------------------------------------------------
+    // Borrow family - TagAwareMap
+    // -----------------------------------------------------------------------
+    //
+    // Mirrors TagAwareMapOwned from the owned family. When `iterate(arms)`
+    // is called, it wraps `arms` with a TagInjectingStackOwned that captures the
+    // tag field value, then checks it against `expected_variant`.
+
+    /// A `MapAccess` that injects a tag-capturing arm into any arm stack
+    /// before delegating to the real inner map (borrow family).
+    pub struct TagAwareMap<'de, 'v, M: MapAccess<'de>, const N: usize> {
+        pub inner: M,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
+        pub _marker: PhantomData<&'de ()>,
+    }
+
+    impl<'de, 'v, M: MapAccess<'de>, const N: usize> MapAccess<'de> for TagAwareMap<'de, 'v, M, N> {
+        type Error = M::Error;
+        type MapClaim = M::MapClaim;
+        type KeyProbe = M::KeyProbe;
+
+        fn fork(&mut self) -> Self {
+            Self {
+                inner: self.inner.fork(),
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
+                _marker: PhantomData,
+            }
+        }
+
+        async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
+            self,
+            arms: S,
+        ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+            let injected = crate::TagInjectingStack!(
+                arms,
+                self.tag_field,
+                self.tag_candidates,
+                self.tag_value,
+                Self::KeyProbe,
+                crate::borrow::VP<'de, Self::KeyProbe>
+            );
+            let result = self.inner.iterate(injected).await?;
+            match result {
+                Probe::Hit((claim, outputs)) => {
+                    if self.tag_value.get() == Some(self.expected_variant) {
+                        Ok(Probe::Hit((claim, outputs)))
+                    } else {
+                        Ok(Probe::Miss)
                     }
-                },
-                None => panic!("MapDeserializerEntry::skip called with no map"),
+                }
+                Probe::Miss => Ok(Probe::Miss),
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Owned family
-    // -----------------------------------------------------------------------
-
-    /// Owned counterpart to `MapDeserializer`.
-    pub struct MapDeserializerOwned<'s, M: MapAccessOwned<'s>> {
+    /// Entry type for [`TagAwareDeserializer`]. Only `deserialize_map` is
+    /// supported; all other probes return `Miss`.
+    pub struct TagAwareEntry<'de, 'v, M: MapAccess<'de>, const N: usize> {
         pub map: M,
-        pub _marker: core::marker::PhantomData<&'s ()>,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
+        pub _marker: PhantomData<&'de ()>,
     }
 
-    impl<'s, M: MapAccessOwned<'s>> MapDeserializerOwned<'s, M> {
-        pub fn new(map: M) -> Self {
+    impl<'de, 'v, M: MapAccess<'de>, const N: usize> Entry<'de> for TagAwareEntry<'de, 'v, M, N> {
+        type Error = M::Error;
+        type Claim = M::MapClaim;
+        type StrChunks = Never<'de, M::MapClaim, M::Error>;
+        type BytesChunks = Never<'de, M::MapClaim, M::Error>;
+        type Map = TagAwareMap<'de, 'v, M, N>;
+        type Seq = Never<'de, M::MapClaim, M::Error>;
+
+        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_str(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_bytes(self) -> Result<Probe<(Self::Claim, &'de [u8])>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_option<T: crate::Deserialize<'de, Extra>, Extra>(
+            self,
+            _extra: Extra,
+        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_value<T: crate::Deserialize<'de, Extra>, Extra>(
+            self,
+            _extra: Extra,
+        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+
+        async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
+            Ok(Probe::Hit(TagAwareMap {
+                inner: self.map,
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
+                _marker: PhantomData,
+            }))
+        }
+
+        fn fork(&mut self) -> Self {
+            Self {
+                map: self.map.fork(),
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
+                _marker: PhantomData,
+            }
+        }
+        async fn skip(self) -> Result<Self::Claim, Self::Error> {
+            panic!("TagAwareEntry::skip - no real token to skip")
+        }
+    }
+
+    /// A `Deserializer` facade backed by a `MapAccess` (borrow family).
+    ///
+    /// Its entry only supports `deserialize_map`. Create one per non-unit
+    /// variant in a `select_probe!`; each has its own `expected_variant`
+    /// so only the tag-matching variant wins.
+    pub struct TagAwareDeserializer<'de, 'v, M: MapAccess<'de>, const N: usize> {
+        pub map: M,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
+        pub _marker: PhantomData<&'de ()>,
+    }
+
+    impl<'de, 'v, M: MapAccess<'de>, const N: usize> TagAwareDeserializer<'de, 'v, M, N> {
+        pub fn new(
+            map: M,
+            tag_field: &'static str,
+            tag_candidates: [(&'static str, usize); N],
+            expected_variant: usize,
+            tag_value: &'v Cell<Option<usize>>,
+        ) -> Self {
             Self {
                 map,
-                _marker: core::marker::PhantomData,
+                tag_field,
+                tag_candidates,
+                expected_variant,
+                tag_value,
+                _marker: PhantomData,
             }
         }
     }
 
-    impl<'s, M: MapAccessOwned<'s>> DeserializerOwned<'s> for MapDeserializerOwned<'s, M> {
+    impl<'de, 'v, M: MapAccess<'de>, const N: usize> Deserializer<'de>
+        for TagAwareDeserializer<'de, 'v, M, N>
+    {
         type Error = M::Error;
-        type Claim = M::Claim;
-        type Entry = MapDeserializerEntryOwned<'s, M>;
+        type Claim = M::MapClaim;
+        type EntryClaim = M::MapClaim;
+        type Entry = TagAwareEntry<'de, 'v, M, N>;
 
-        async fn entry<const N: usize, F, Fut, R>(
+        async fn entry<const K: usize, F, Fut, R>(
             self,
             mut f: F,
         ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
         where
-            F: FnMut([Self::Entry; N]) -> Fut,
-            Fut: Future<
-                Output = Result<Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>, Self::Error>,
-            >,
+            F: FnMut([Self::Entry; K]) -> Fut,
+            Fut: Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>,
         {
-            let mut map = Some(self.map);
-            let entries: [_; N] = array::from_fn(|i| {
-                let map = if i == N - 1 {
-                    map.as_mut().unwrap().fork()
-                } else {
-                    map.take().unwrap()
-                };
-                MapDeserializerEntryOwned {
-                    map,
-                    _marker: core::marker::PhantomData,
-                }
-            });
+            let mut map = self.map;
+            let tag_field = self.tag_field;
+            let tag_candidates = self.tag_candidates;
+            let expected_variant = self.expected_variant;
+            let tag_value = self.tag_value;
+            let entries: [TagAwareEntry<'de, 'v, M, N>; K] =
+                core::array::from_fn(|_| TagAwareEntry {
+                    map: map.fork(),
+                    tag_field,
+                    tag_candidates,
+                    expected_variant,
+                    tag_value,
+                    _marker: PhantomData,
+                });
             f(entries).await
         }
     }
 
-    pub struct MapDeserializerEntryOwned<'s, M: MapAccessOwned<'s>> {
-        pub map: M,
-        pub _marker: core::marker::PhantomData<&'s ()>,
+    // -----------------------------------------------------------------------
+    // Map tag-aware types (owned family)
+    // -----------------------------------------------------------------------
+    //
+    // Pattern (from the derive macro):
+    //
+    //   let tag_value: Cell<Option<usize>> = Cell::new(None);
+    //   select_probe! {
+    //       async move {
+    //           let d0 = TagAwareDeserializerOwned::new(map.fork(), "type", CANDS, 0, &tag_value);
+    //           hit!(VariantType0::deserialize_owned(d0, ()).await)
+    //       },
+    //       async move {
+    //           let d1 = TagAwareDeserializerOwned::new(map.fork(), "type", CANDS, 1, &tag_value);
+    //           hit!(VariantType1::deserialize_owned(d1, ()).await)
+    //       },
+    //       @miss => Ok(Probe::Miss),
+    //   }
+    //
+    // Each variant's DeserializeOwned calls d.entry(|[e]| e.deserialize_map()).
+    // TagAwareEntryOwned::deserialize_map() returns a TagAwareMapOwned.
+    // TagAwareMapOwned::iterate(their_arms) wraps with TagInjectingStackOwned,
+    // calls inner.iterate, then checks captured tag == expected_variant.
+
+    /// A `MapAccessOwned` that injects a tag-capturing arm into any
+    /// arm stack before delegating to the real inner map.
+    ///
+    /// After `iterate` completes, if the captured tag index equals
+    /// `expected_variant`, the result is passed through; otherwise `Miss` is
+    /// returned so the outer `select_probe!` can try other variants.
+    pub struct TagAwareMapOwned<'v, M: MapAccessOwned, const N: usize> {
+        pub inner: M,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
     }
 
-    impl<'s, M: MapAccessOwned<'s>> EntryOwned<'s> for MapDeserializerEntryOwned<'s, M> {
+    impl<'v, M: MapAccessOwned, const N: usize> MapAccessOwned for TagAwareMapOwned<'v, M, N> {
         type Error = M::Error;
-        type Claim = M::Claim;
-        type StrChunks = crate::Never<'s, M::Claim, M::Error>;
-        type BytesChunks = crate::Never<'s, M::Claim, M::Error>;
-        type Map = M;
-        type Seq = crate::Never<'s, M::Claim, M::Error>;
+        type MapClaim = M::MapClaim;
+        type KeyProbe = M::KeyProbe;
+
+        fn fork(&mut self) -> Self {
+            Self {
+                inner: self.inner.fork(),
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
+            }
+        }
+
+        async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
+            self,
+            arms: S,
+        ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+            let injected = crate::TagInjectingStackOwned!(
+                arms,
+                self.tag_field,
+                self.tag_candidates,
+                self.tag_value,
+                Self::KeyProbe,
+                crate::owned::VP<Self::KeyProbe>
+            );
+            let result = self.inner.iterate(injected).await?;
+            match result {
+                Probe::Hit((claim, outputs)) => {
+                    if self.tag_value.get() == Some(self.expected_variant) {
+                        Ok(Probe::Hit((claim, outputs)))
+                    } else {
+                        Ok(Probe::Miss)
+                    }
+                }
+                Probe::Miss => Ok(Probe::Miss),
+            }
+        }
+    }
+
+    /// The entry type for [`TagAwareDeserializerOwned`].
+    ///
+    /// All probes return `Miss` except `deserialize_map`, which wraps
+    /// the stored map in a [`TagAwareMapOwned`] that injects the tag arm.
+    pub struct TagAwareEntryOwned<'v, M: MapAccessOwned, const N: usize> {
+        pub map: M,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
+    }
+
+    impl<'v, M: MapAccessOwned, const N: usize> EntryOwned for TagAwareEntryOwned<'v, M, N> {
+        type Error = M::Error;
+        type Claim = M::MapClaim;
+        type StrChunks = Never<'static, M::MapClaim, M::Error>;
+        type BytesChunks = Never<'static, M::MapClaim, M::Error>;
+        type Map = TagAwareMapOwned<'v, M, N>;
+        type Seq = Never<'static, M::MapClaim, M::Error>;
 
         async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
             Ok(Probe::Miss)
@@ -2398,13 +3026,13 @@ pub mod map_facade {
         async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
             Ok(Probe::Miss)
         }
-        async fn deserialize_option<T: DeserializeOwned<'s, Extra>, Extra>(
+        async fn deserialize_option<T: DeserializeOwned<Extra>, Extra>(
             self,
             _extra: Extra,
         ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
             Ok(Probe::Miss)
         }
-        async fn deserialize_value<T: DeserializeOwned<'s, Extra>, Extra>(
+        async fn deserialize_value<T: DeserializeOwned<Extra>, Extra>(
             self,
             _extra: Extra,
         ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
@@ -2412,1226 +3040,95 @@ pub mod map_facade {
         }
 
         async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-            Ok(Probe::Hit(self.map))
+            Ok(Probe::Hit(TagAwareMapOwned {
+                inner: self.map,
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
+            }))
         }
 
         fn fork(&mut self) -> Self {
             Self {
                 map: self.map.fork(),
-                _marker: PhantomData,
+                tag_field: self.tag_field,
+                tag_candidates: self.tag_candidates,
+                expected_variant: self.expected_variant,
+                tag_value: self.tag_value,
             }
         }
-
-        async fn skip(mut self) -> Result<Self::Claim, Self::Error> {
-            loop {
-                match self
-                    .map
-                    .next_kv::<1, _, _, ()>(|[ke]| async {
-                        let (c, _, ()) = hit!(
-                            ke.key((), |_k: &crate::Skip, [ve]| async {
-                                let c = ve.skip().await?;
-                                Ok(Probe::Hit((c, ())))
-                            })
-                            .await
-                        );
-                        Ok(Probe::Hit((c, ())))
-                    })
-                    .await?
-                {
-                    Probe::Hit(Chunk::Done(c)) => return Ok(c),
-                    Probe::Hit(Chunk::Data((new_m, ()))) => {
-                        self.map = new_m;
-                    }
-                    Probe::Miss => panic!("unexpected Miss"),
-                }
-            }
+        async fn skip(self) -> Result<Self::Claim, Self::Error> {
+            panic!("TagAwareEntryOwned::skip - no real token to skip")
         }
     }
-}
 
-// ===========================================================================
-// Key facade — feed a real MapKeyEntryOwned into a DeserializeOwned expecting a map
-// ===========================================================================
-
-pub mod key_facade {
-    //! Inversion-of-control bridge between a `MapAccessOwned` key loop and a
-    //! `DeserializeOwned` impl that wants to drive a *full* deserializer.
-    //!
-    //! # Pattern
-    //!
-    //! ```ignore
-    //! let comms = FutureComms::new();
-    //! let fut = pin!(async {
-    //!     let kd = KeyDeserializer::new(&comms);
-    //!     let (c, v) = hit!(Foo::deserialize(kd, ()).await);
-    //!     Ok(Probe::Hit((c, v)))
-    //! });
-    //! loop {
-    //!     match hit!(map.next_kv(|[ke]| async {
-    //!         let claim = hit!(comms.input(ke, &mut fut).await);
-    //!         Ok(Probe::Hit((claim, ())))
-    //!     }).await) {
-    //!         Chunk::Data((m, ())) => map = m,
-    //!         Chunk::Done(real_claim) => return comms.finish(real_claim, &mut fut).await,
-    //!     }
-    //! }
-    //! ```
-
-    use crate::{
-        Chunk, Never, Probe,
-        owned::{
-            DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-            MapValueEntryOwned,
-        },
-    };
-    use core::{
-        array,
-        cell::Cell,
-        future::{Future, poll_fn},
-        marker::PhantomData,
-        pin::Pin,
-        task::{Poll, Waker},
-    };
-    use std::cell::RefCell;
-
-    // -----------------------------------------------------------------------
-    // State shared between KeyDeserializer (inner) and the outer loop
-    // -----------------------------------------------------------------------
-
-    /// State machine for the KE/Claim handshake channel.
+    /// A `DeserializerOwned` facade backed by a `MapAccessOwned`.
     ///
-    /// Transitions (outer = FutureComms, inner = CommsMap::next_kv):
+    /// Its entry only supports `deserialize_map` (all other probes
+    /// return `Miss`). When a variant's `DeserializeOwned` calls
+    /// `d.entry(|[e]| e.deserialize_map())`, it gets back a
+    /// [`TagAwareMapOwned`] that injects the tag arm and validates
+    /// `expected_variant` before returning `Hit`.
     ///
-    ///   Started → Awaiting          inner drives itself to Awaiting before parking
-    ///   Awaiting → Proceed(KE)      outer deposits a KE and wakes inner
-    ///   Proceed(KE) → Running       inner takes the KE (replaces with Running)
-    ///   Running → Ran(Claim)        inner deposits the claim and wakes outer
-    ///   Ran(Claim) → Awaiting       outer takes the claim (replaces with Awaiting)
-    ///   Awaiting → Done(Claim)      outer signals exhaustion (finish)
-    ///   Done(Claim) → …             inner sees Done, takes claim, returns Chunk::Done
-    enum SlotState<KE, Claim> {
-        /// Initial state; inner will drive to Awaiting before first park.
-        Started,
-        /// Inner is parked, waiting for a KE or Done.
-        Awaiting,
-        /// Outer deposited a KE; inner should take it.
-        Proceed(KE),
-        /// Inner took the KE and is currently processing it.
-        Running,
-        /// Inner deposited a Claim; outer should take it.
-        Ran(Claim),
-        /// Outer signaled map exhaustion with the final Claim.
-        Done(Claim),
+    /// Create one per non-unit variant in the `select_probe!` arms; each has
+    /// its own `expected_variant` index so only the tag-matching variant wins.
+    pub struct TagAwareDeserializerOwned<'v, M: MapAccessOwned, const N: usize> {
+        pub map: M,
+        pub tag_field: &'static str,
+        pub tag_candidates: [(&'static str, usize); N],
+        pub expected_variant: usize,
+        pub tag_value: &'v Cell<Option<usize>>,
     }
 
-    struct Inner<'s, KE: MapKeyEntryOwned<'s>> {
-        /// Combined KE/Claim handshake slot.
-        slot: Cell<SlotState<KE, KE::Claim>>,
-        /// Waker for the inner task (waiting for Proceed or Done).
-        inner_waker: Cell<Option<Waker>>,
-        /// Waker for the outer task (waiting for Ran).
-        outer_waker: Cell<Option<Waker>>,
-        _marker: PhantomData<&'s ()>,
-    }
-
-    impl<'s, KE: MapKeyEntryOwned<'s>> Inner<'s, KE> {
-        fn new() -> Self {
-            Self {
-                slot: Cell::new(SlotState::Started),
-                inner_waker: Cell::new(None),
-                outer_waker: Cell::new(None),
-                _marker: PhantomData,
-            }
-        }
-        
-        fn get_slot_state(&self) -> SlotState<(), ()> {
-            // This gets compiled down to a single CMP instruction, so there really isn't a window
-            // where the intermediary state is visible.
-            let s = self.slot.replace(SlotState::Started);
-            let r = match s {
-                SlotState::Started => SlotState::Started,
-                SlotState::Awaiting => SlotState::Awaiting,
-                SlotState::Proceed(_) => SlotState::Proceed(()),
-                SlotState::Running => SlotState::Running,
-                SlotState::Ran(_) => SlotState::Ran(()),
-                SlotState::Done(_) => SlotState::Done(()),
-            };
-            self.slot.set(s);
-            r
-        }
-
-    }
-
-    // -----------------------------------------------------------------------
-    // FutureComms — the bridge object held by the outer loop
-    // -----------------------------------------------------------------------
-
-    /// Bridge between the outer `next_kv` loop and the inner `DeserializeOwned`
-    /// future.  Create one, then build a [`KeyDeserializer`] from a shared
-    /// reference to it.
-    pub struct FutureCommsStorage<'s, KE: MapKeyEntryOwned<'s>> {
-        inner: Inner<'s, KE>,
-    }
-
-    impl<'s, KE: MapKeyEntryOwned<'s>> FutureCommsStorage<'s, KE> {
-        pub fn new() -> Self {
-            Self { inner: Inner::new() }
-        }
-
-        fn inner(&self) -> &Inner<'s, KE> {
-            &self.inner
-        }
-    }
-
-    pub struct FutureComms<'f, 's, KE: MapKeyEntryOwned<'s>, Fut> {
-        inner: &'f Inner<'s, KE>,
-        fut: &'f RefCell<Pin<&'f mut Option<Fut>>>,
-        killed: Cell<bool>,
-    }
-
-    impl<'f, 's, KE: MapKeyEntryOwned<'s>, Fut> FutureComms<'f, 's, KE, Fut> {
-        /// # Safety
-        ///
-        /// `fut` must be the future that was constructed using the
-        /// [`KeyDeserializer`] built from `storage`.  Passing a future that
-        /// communicates through a different `FutureCommsStorage` is undefined
-        /// behavior: the two sides will read and write unrelated slots,
-        /// leading to data races on the interior-mutable channel state.
-        pub fn new_unsafe(storage: &'f FutureCommsStorage<'s, KE>, fut: &'f RefCell<Pin<&'f mut Option<Fut>>>) -> Self {
-            Self { inner: storage.inner(), fut, killed: Cell::new(false) }
-        }
-
-        /// Mark this future to be dropped the next time it is safe to do so.
-        pub fn kill(&self) {
-            self.killed.set(true);
-        }
-
-        /// Returns `true` if [`kill`] was called and the future has been dropped
-        /// (or is about to be).
-        /// 
-        /// [`Self::input`] checks this and returns a miss if true.
-        pub fn is_killed(&self) -> bool {
-            self.killed.get()
-        }
-
-        fn drop_fut(&self) {
-            self.fut.borrow_mut().as_mut().set(None);
-        }
-
-        /// Feed one real `KE` into the inner future and wait for the inner
-        /// future to consume it and return a `Claim`.
-        ///
-        /// Drive `fut` forward on each poll (it is the pinned inner future).
-        /// Returns the `Claim` produced by the inner `next_kv` arm, which
-        /// the outer caller should thread back to the real `next_kv`.
-        pub async fn input<R, E>(
-            &self,
-            ke: KE,
-        ) -> Result<Probe<KE::Claim>, E>
-        where
-            Fut: Future<Output = Result<Probe<(KE::Claim, R)>, E>>,
-        {
-            if self.killed.get() {
-                self.drop_fut();
-                return Ok(Probe::Miss);
-            }
-
-            // Drive inner from Started → Awaiting before depositing a KE, so
-            // we never leave a stale KE in the slot from a prior half-step.
-            if matches!(self.inner.get_slot_state(), SlotState::Started) {
-                let early: Option<Result<Probe<(KE::Claim, R)>, E>> = poll_fn(|cx| {
-                    self.inner.outer_waker.set(Some(cx.waker().clone()));
-                    match self.fut.borrow_mut().as_mut().as_pin_mut().unwrap().poll(cx) {
-                        Poll::Ready(res) => Poll::Ready(Some(res)),
-                        Poll::Pending => {
-                            if matches!(self.inner.get_slot_state(), SlotState::Awaiting) {
-                                Poll::Ready(None)
-                            } else {
-                                Poll::Pending
-                            }
-                        }
-                    }
-                })
-                .await;
-                if let Some(res) = early {
-                    return res.map(|p| p.map(|(c, _)| c));
-                }
-            }
-
-            // If inner already ran and deposited a claim, return it immediately
-            // without overwriting anything.
-            if matches!(self.inner.get_slot_state(), SlotState::Ran(())) {
-                if let SlotState::Ran(claim) = self.inner.slot.replace(SlotState::Awaiting) {
-                    return Ok(Probe::Hit(claim));
-                }
-            }
-
-            // Deposit the KE and wake inner.
-            self.inner.slot.replace(SlotState::Proceed(ke));
-            if let Some(w) = self.inner.inner_waker.take() {
-                w.wake();
-            }
-
-            // Poll fut until inner deposits Ran(claim).
-            poll_fn(|cx| {
-                self.inner.outer_waker.set(Some(cx.waker().clone()));
-
-                // Drive the inner future forward.
-                match self.fut.borrow_mut().as_mut().as_pin_mut().unwrap().poll(cx) {
-                    Poll::Ready(res) => {
-                        return Poll::Ready(res.map(|p| p.map(|(c, _)| c)));
-                    }
-                    Poll::Pending => {}
-                }
-
-                // Check if inner deposited a claim.
-                if matches!(self.inner.get_slot_state(), SlotState::Ran(())) {
-                    if let SlotState::Ran(claim) = self.inner.slot.replace(SlotState::Awaiting) {
-                        return Poll::Ready(Ok(Probe::Hit(claim)));
-                    }
-                }
-                Poll::Pending
-            })
-            .await
-        }
-
-        /// Signal that the real map is exhausted (outer got `Chunk::Done`),
-        /// then drive `fut` to completion and return its final output.
-        pub async fn finish<R, E>(
-            &self,
-            done_claim: KE::Claim,
-        ) -> Result<Probe<(KE::Claim, R)>, E>
-        where
-            Fut: Future<Output = Result<Probe<(KE::Claim, R)>, E>>,
-        {
-            self.inner.slot.replace(SlotState::Done(done_claim));
-            if let Some(w) = self.inner.inner_waker.take() {
-                w.wake();
-            }
-
-            // Drive fut to completion.
-            poll_fn(|cx| self.fut.borrow_mut().as_mut().as_pin_mut().unwrap().poll(cx)).await
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CommsMap — fake MapAccessOwned backed by FutureComms
-    // -----------------------------------------------------------------------
-
-    /// A `MapAccessOwned` whose `next_kv` suspends until the outer loop feeds
-    /// it a real `KE` via `FutureComms::input`, or returns `Chunk::Done` when
-    /// `FutureComms::finish` is called.
-    pub struct CommsMap<'comms, 's, KE: MapKeyEntryOwned<'s>> {
-        inner: &'comms Inner<'s, KE>,
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> CommsMap<'comms, 's, KE> {
-        fn new(inner: &'comms Inner<'s, KE>) -> Self {
-            Self { inner }
-        }
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> MapAccessOwned<'s> for CommsMap<'comms, 's, KE> {
-        type Error = KE::Error;
-        type Claim = KE::Claim;
-        type KeyEntry = CommsKeyEntry<'comms, 's, KE>;
-
-        fn fork(&mut self) -> Self {
-            Self { inner: self.inner }
-        }
-
-        async fn next_kv<const N: usize, F, Fut, R>(
-            self,
-            mut f: F,
-        ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
-        where
-            F: FnMut([Self::KeyEntry; N]) -> Fut,
-            Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-        {
-            // Signal to outer that we are ready, then wait for Proceed or Done.
-            let slot: SlotState<KE, KE::Claim> = poll_fn(|cx| {
-                match self.inner.get_slot_state() {
-                    // Already have work to do — take it immediately.
-                    SlotState::Proceed(()) | SlotState::Done(()) => {
-                        Poll::Ready(self.inner.slot.replace(SlotState::Running))
-                    }
-                    // Transitional states that need us to signal Awaiting.
-                    SlotState::Started | SlotState::Running => {
-                        self.inner.slot.replace(SlotState::Awaiting);
-                        if let Some(w) = self.inner.outer_waker.take() {
-                            w.wake();
-                        }
-                        self.inner.inner_waker.set(Some(cx.waker().clone()));
-                        Poll::Pending
-                    }
-                    // Claim deposited or already Awaiting — just park.
-                    SlotState::Ran(()) | SlotState::Awaiting => {
-                        self.inner.inner_waker.set(Some(cx.waker().clone()));
-                        Poll::Pending
-                    }
-                }
-            })
-            .await;
-
-            match slot {
-                SlotState::Done(claim) => {
-                    return Ok(Probe::Hit(Chunk::Done(claim)));
-                }
-                SlotState::Proceed(ke) => {
-                    // Build N entry handles (all backed by the same ke via fork).
-                    let mut ke_opt = Some(ke);
-                    let entries: [CommsKeyEntry<'comms, 's, KE>; N] = array::from_fn(|i| {
-                        let k = if i == N - 1 {
-                            ke_opt.as_mut().unwrap().fork()
-                        } else {
-                            ke_opt.take().unwrap()
-                        };
-                        CommsKeyEntry { ke: k, inner: self.inner }
-                    });
-
-                    match f(entries).await? {
-                        Probe::Hit((claim, r)) => {
-                            // Deposit claim and wake outer.
-                            self.inner.slot.replace(SlotState::Ran(claim));
-                            if let Some(w) = self.inner.outer_waker.take() {
-                                w.wake();
-                            }
-                            // Suspend until next Proceed or Done arrives.
-                            poll_fn(|cx| {
-                                match self.inner.get_slot_state() {
-                                    SlotState::Proceed(()) | SlotState::Done(()) => Poll::Ready(()),
-                                    _ => {
-                                        self.inner.inner_waker.set(Some(cx.waker().clone()));
-                                        Poll::Pending
-                                    }
-                                }
-                            })
-                            .await;
-                            Ok(Probe::Hit(Chunk::Data((CommsMap { inner: self.inner }, r))))
-                        }
-                        Probe::Miss => Ok(Probe::Miss),
-                    }
-                }
-                // Reached only if outer called finish before inner first ran —
-                // inner transitioned Awaiting → Running but slot was Done.
-                SlotState::Awaiting | SlotState::Running | SlotState::Ran(_) | SlotState::Started => {
-                    unreachable!()
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CommsKeyEntry — forwards ke probes to the real KE
-    // -----------------------------------------------------------------------
-
-    pub struct CommsKeyEntry<'comms, 's, KE: MapKeyEntryOwned<'s>> {
-        ke: KE,
-        inner: &'comms Inner<'s, KE>,
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> MapKeyEntryOwned<'s> for CommsKeyEntry<'comms, 's, KE> {
-        type Error = KE::Error;
-        type Claim = KE::Claim;
-        type ValueEntry = CommsValueEntry<'comms, 's, KE>;
-
-        fn fork(&mut self) -> Self {
-            Self { ke: self.ke.fork(), inner: self.inner }
-        }
-
-        async fn key<K: DeserializeOwned<'s, KExtra>, KExtra, const N: usize, F, Fut, R>(
-            self,
-            extra: KExtra,
-            mut f: F,
-        ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
-        where
-            F: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
-            Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-        {
-            let inner = self.inner;
-            self.ke
-                .key::<K, KExtra, N, _, _, R>(extra, |k, ves| {
-                    let wrapped: [CommsValueEntry<'comms, 's, KE>; N] =
-                        ves.map(|ve| CommsValueEntry { ve, inner });
-                    f(k, wrapped)
-                })
-                .await
-        }
-    }
-
-    pub struct CommsValueEntry<'comms, 's, KE: MapKeyEntryOwned<'s>> {
-        ve: KE::ValueEntry,
-        inner: &'comms Inner<'s, KE>,
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> MapValueEntryOwned<'s>
-        for CommsValueEntry<'comms, 's, KE>
-    {
-        type Error = KE::Error;
-        type Claim = KE::Claim;
-
-        fn fork(&mut self) -> Self {
-            Self { ve: self.ve.fork(), inner: self.inner }
-        }
-
-        async fn value<V: DeserializeOwned<'s, Extra>, Extra>(
-            self,
-            extra: Extra,
-        ) -> Result<Probe<(Self::Claim, V)>, Self::Error> {
-            self.ve.value::<V, Extra>(extra).await
-        }
-
-        async fn skip(self) -> Result<Self::Claim, Self::Error> {
-            self.ve.skip().await
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // KeyDeserializer — top-level Deserializer wrapping FutureComms
-    // -----------------------------------------------------------------------
-
-    /// The `DeserializerOwned` handed to the inner `DeserializeOwned` impl.
-    /// All entry probes return `Miss` except `deserialize_map`, which returns
-    /// the `CommsMap` fake map.
-    pub struct KeyDeserializer<'comms, 's, KE: MapKeyEntryOwned<'s>> {
-        comms: &'comms FutureCommsStorage<'s, KE>,
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> KeyDeserializer<'comms, 's, KE> {
-        pub fn new(comms: &'comms FutureCommsStorage<'s, KE>) -> Self {
-            Self { comms }
-        }
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> DeserializerOwned<'s>
-        for KeyDeserializer<'comms, 's, KE>
-    {
-        type Error = KE::Error;
-        type Claim = KE::Claim;
-        type Entry = KeyDeserializerEntry<'comms, 's, KE>;
-
-        async fn entry<const N: usize, F, Fut, R>(
-            self,
-            mut f: F,
-        ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
-        where
-            F: FnMut([Self::Entry; N]) -> Fut,
-            Fut: Future<
-                Output = Result<
-                    Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>,
-                    Self::Error,
-                >,
-            >,
-        {
-            let comms = self.comms;
-            let entries: [KeyDeserializerEntry<'comms, 's, KE>; N] =
-                array::from_fn(|_| KeyDeserializerEntry { comms });
-            f(entries).await
-        }
-    }
-
-    pub struct KeyDeserializerEntry<'comms, 's, KE: MapKeyEntryOwned<'s>> {
-        comms: &'comms FutureCommsStorage<'s, KE>,
-    }
-
-    impl<'comms, 's, KE: MapKeyEntryOwned<'s>> EntryOwned<'s>
-        for KeyDeserializerEntry<'comms, 's, KE>
-    {
-        type Error = KE::Error;
-        type Claim = KE::Claim;
-        type StrChunks = Never<'s, KE::Claim, KE::Error>;
-        type BytesChunks = Never<'s, KE::Claim, KE::Error>;
-        type Map = CommsMap<'comms, 's, KE>;
-        type Seq = Never<'s, KE::Claim, KE::Error>;
-
-        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> { Ok(Probe::Miss) }
-        async fn deserialize_option<T: DeserializeOwned<'s, Extra>, Extra>(
-            self,
-            _extra: Extra,
-        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
-            Ok(Probe::Miss)
-        }
-        async fn deserialize_value<T: DeserializeOwned<'s, Extra>, Extra>(
-            self,
-            _extra: Extra,
-        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-            Ok(Probe::Miss)
-        }
-
-        async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-            Ok(Probe::Hit(CommsMap::new(self.comms.inner())))
-        }
-
-        fn fork(&mut self) -> Self {
-            Self { comms: self.comms }
-        }
-
-        async fn skip(self) -> Result<Self::Claim, Self::Error> {
-            panic!("KeyDeserializerEntry::skip — no real token to skip")
-        }
-    }
-}
-
-// ===========================================================================
-// Tag-filtering map facades (used by #[strede(tag)] derive output)
-// ===========================================================================
-
-pub mod tag_facade {
-    use super::Match;
-    use crate::{
-        Chunk, Probe, Skip,
-        borrow::{Deserializer, Entry, MapAccess, MapKeyEntry, MapValueEntry},
-        hit, or_miss,
-        owned::{
-            DeserializeOwned, DeserializerOwned, EntryOwned, MapAccessOwned, MapKeyEntryOwned,
-            MapValueEntryOwned,
-        },
-    };
-    use core::{cell::RefCell, future::Future, marker::PhantomData};
-    use std::cell::Cell;
-
-    pub use super::map_facade::{
-        MapDeserializer, MapDeserializerEntry, MapDeserializerEntryOwned, MapDeserializerOwned,
-    };
-
-    // -----------------------------------------------------------------------
-    // Borrow family
-    // -----------------------------------------------------------------------
-
-    /// A `Deserializer` wrapper that wraps any `Deserializer` and produces
-    /// `TagFilteredMapEntry` handles. When those handles' `deserialize_map`
-    /// is called the resulting `MapAccess` is wrapped in `TagFilteredMap`.
-    pub struct TagFilteredMapDeserializer<'de, D: Deserializer<'de>> {
-        pub inner: D,
-        pub tag_key: &'static str,
-        pub _marker: PhantomData<&'de ()>,
-    }
-
-    impl<'de, D: Deserializer<'de>> TagFilteredMapDeserializer<'de, D> {
-        pub fn new(inner: D, tag_key: &'static str) -> Self {
-            Self { inner, tag_key, _marker: PhantomData }
-        }
-    }
-
-    impl<'de, D: Deserializer<'de>> Deserializer<'de> for TagFilteredMapDeserializer<'de, D> {
-        type Error = D::Error;
-        type Claim = D::Claim;
-        type Entry = TagFilteredMapEntry<'de, D::Entry>;
-
-        async fn entry<const N: usize, F, Fut, R>(
-            self,
-            mut f: F,
-        ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
-        where
-            F: FnMut([Self::Entry; N]) -> Fut,
-            Fut: Future<
-                Output = Result<Probe<(<Self::Entry as Entry<'de>>::Claim, R)>, Self::Error>,
-            >,
-        {
-            let tag_key = self.tag_key;
-            self.inner
-                .entry::<N, _, _, R>(|entries| {
-                    let wrapped = entries.map(|e| TagFilteredMapEntry {
-                        inner: e,
-                        tag_key,
-                        _marker: PhantomData,
-                    });
-                    f(wrapped)
-                })
-                .await
-        }
-    }
-
-    /// An `Entry` wrapper that delegates all probes to the inner entry, but
-    /// wraps map accesses in `TagFilteredMap`.
-    pub struct TagFilteredMapEntry<'de, E: Entry<'de>> {
-        pub inner: E,
-        pub tag_key: &'static str,
-        pub _marker: PhantomData<&'de ()>,
-    }
-
-    impl<'de, E: Entry<'de>> Entry<'de> for TagFilteredMapEntry<'de, E> {
-        type Error = E::Error;
-        type Claim = E::Claim;
-        type StrChunks = E::StrChunks;
-        type BytesChunks = E::BytesChunks;
-        type Map = TagFilteredMap<'de, E::Map>;
-        type Seq = E::Seq;
-
-        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
-            self.inner.deserialize_bool().await
-        }
-        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
-            self.inner.deserialize_u8().await
-        }
-        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
-            self.inner.deserialize_u16().await
-        }
-        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
-            self.inner.deserialize_u32().await
-        }
-        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
-            self.inner.deserialize_u64().await
-        }
-        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
-            self.inner.deserialize_u128().await
-        }
-        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
-            self.inner.deserialize_i8().await
-        }
-        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
-            self.inner.deserialize_i16().await
-        }
-        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
-            self.inner.deserialize_i32().await
-        }
-        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
-            self.inner.deserialize_i64().await
-        }
-        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
-            self.inner.deserialize_i128().await
-        }
-        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
-            self.inner.deserialize_f32().await
-        }
-        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
-            self.inner.deserialize_f64().await
-        }
-        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
-            self.inner.deserialize_char().await
-        }
-        async fn deserialize_str(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
-            self.inner.deserialize_str().await
-        }
-        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
-            self.inner.deserialize_str_chunks().await
-        }
-        async fn deserialize_bytes(
-            self,
-        ) -> Result<Probe<(Self::Claim, &'de [u8])>, Self::Error> {
-            self.inner.deserialize_bytes().await
-        }
-        async fn deserialize_bytes_chunks(
-            self,
-        ) -> Result<Probe<Self::BytesChunks>, Self::Error> {
-            self.inner.deserialize_bytes_chunks().await
-        }
-        async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-            let tag_key = self.tag_key;
-            self.inner.deserialize_map().await.map(|p| match p {
-                Probe::Hit(m) => Probe::Hit(TagFilteredMap::new(m, tag_key)),
-                Probe::Miss => Probe::Miss,
-            })
-        }
-        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
-            self.inner.deserialize_seq().await
-        }
-        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
-            self.inner.deserialize_null().await
-        }
-        async fn deserialize_option<T: crate::Deserialize<'de, Extra>, Extra>(
-            self,
-            extra: Extra,
-        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
-            self.inner.deserialize_option::<T, Extra>(extra).await
-        }
-        async fn deserialize_value<T: crate::Deserialize<'de, Extra>, Extra>(
-            self,
-            extra: Extra,
-        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-            self.inner.deserialize_value::<T, Extra>(extra).await
-        }
-        fn fork(&mut self) -> Self {
-            Self {
-                inner: self.inner.fork(),
-                tag_key: self.tag_key,
-                _marker: PhantomData,
-            }
-        }
-        async fn skip(self) -> Result<Self::Claim, Self::Error> {
-            self.inner.skip().await
-        }
-    }
-
-    /// A `MapAccess` wrapper that skips one specific key (the tag field) and
-    /// passes everything else through unchanged.
-    pub struct TagFilteredMap<'de, M: MapAccess<'de>> {
-        pub inner: M,
-        pub tag_key: &'static str,
-        pub _marker: core::marker::PhantomData<&'de ()>,
-    }
-
-    impl<'de, M: MapAccess<'de>> TagFilteredMap<'de, M> {
-        pub fn new(inner: M, tag_key: &'static str) -> Self {
-            Self {
-                inner,
-                tag_key,
-                _marker: core::marker::PhantomData,
-            }
-        }
-    }
-
-    impl<'de, M: MapAccess<'de>> MapAccess<'de> for TagFilteredMap<'de, M> {
-        type Error = M::Error;
-        type Claim = M::Claim;
-        type KeyEntry = M::KeyEntry;
-
-        fn fork(&mut self) -> Self {
-            Self {
-                inner: self.inner.fork(),
-                tag_key: self.tag_key,
-                _marker: core::marker::PhantomData,
-            }
-        }
-
-        async fn next_kv<const N: usize, F, Fut, R>(
-            self,
-            mut f: F,
-        ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
-        where
-            F: FnMut([Self::KeyEntry; N]) -> Fut,
-            Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-        {
-            let tag_key = self.tag_key;
-            let mut inner = self.inner;
-            loop {
-                let tag_check = inner
-                    .fork()
-                    .next_kv::<1, _, _, bool>(|[ke]| async move {
-                        let result = ke
-                            .key((), |k: &&'de str, [ve]| {
-                                let is_tag = *k == tag_key;
-                                async move {
-                                    let c = ve.skip().await?;
-                                    Ok(Probe::Hit((c, is_tag)))
-                                }
-                            })
-                            .await?;
-                        match result {
-                            Probe::Hit((c, _, is_tag)) => Ok(Probe::Hit((c, is_tag))),
-                            Probe::Miss => Ok(Probe::Miss),
-                        }
-                    })
-                    .await?;
-
-                match tag_check {
-                    Probe::Hit(Chunk::Done(_)) => {
-                        // Map exhausted via fork — drain real inner to get the claim.
-                        return inner
-                            .next_kv::<1, _, _, ()>(|[_ke]| async move { Ok(Probe::Miss) })
-                            .await
-                            .map(|p| match p {
-                                Probe::Hit(Chunk::Done(c)) => Probe::Hit(Chunk::Done(c)),
-                                Probe::Hit(Chunk::Data(_)) => Probe::Miss,
-                                Probe::Miss => Probe::Miss,
-                            });
-                    }
-                    Probe::Hit(Chunk::Data((_, true))) => {
-                        // This key IS the tag — skip it on the real inner and loop.
-                        let skipped = inner
-                            .next_kv::<1, _, _, ()>(|[ke]| async {
-                                let (c, _, ()) = hit!(
-                                    ke.key((), |_k: &&'de str, [ve]| async {
-                                        let c = ve.skip().await?;
-                                        Ok(Probe::Hit((c, ())))
-                                    })
-                                    .await
-                                );
-                                Ok(Probe::Hit((c, ())))
-                            })
-                            .await?;
-                        match skipped {
-                            Probe::Hit(Chunk::Data((new_inner, ()))) => {
-                                inner = new_inner;
-                            }
-                            Probe::Hit(Chunk::Done(c)) => return Ok(Probe::Hit(Chunk::Done(c))),
-                            Probe::Miss => return Ok(Probe::Miss),
-                        }
-                    }
-                    Probe::Hit(Chunk::Data((_, false))) | Probe::Miss => {
-                        // Not the tag — delegate to f on real inner.
-                        return inner.next_kv(|keys| f(keys)).await.map(|p| match p {
-                            Probe::Hit(Chunk::Data((new_inner, r))) => Probe::Hit(Chunk::Data((
-                                TagFilteredMap {
-                                    inner: new_inner,
-                                    tag_key,
-                                    _marker: core::marker::PhantomData,
-                                },
-                                r,
-                            ))),
-                            Probe::Hit(Chunk::Done(c)) => Probe::Hit(Chunk::Done(c)),
-                            Probe::Miss => Probe::Miss,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Owned family
-    // -----------------------------------------------------------------------
-
-    /// Owned counterpart to `TagFilteredMap`.
-    pub struct TagFilteredMapOwned<'s, 'v, M: MapAccessOwned<'s>, V = Skip, TagExtra: Copy = ()> {
-        pub inner: M,
-        pub tag_key: &'static str,
-        pub tag_value: &'v Cell<Option<V>>,
-        pub extra: TagExtra,
-        pub _marker: core::marker::PhantomData<fn() -> &'s ()>,
-    }
-
-    impl<'s, 'v, M: MapAccessOwned<'s>, V, TagExtra: Copy> TagFilteredMapOwned<'s, 'v, M, V, TagExtra> {
+    impl<'v, M: MapAccessOwned, const N: usize> TagAwareDeserializerOwned<'v, M, N> {
         pub fn new(
-            inner: M,
-            tag_key: &'static str,
-            tag_value: &'v Cell<Option<V>>,
-            extra: TagExtra,
+            map: M,
+            tag_field: &'static str,
+            tag_candidates: [(&'static str, usize); N],
+            expected_variant: usize,
+            tag_value: &'v Cell<Option<usize>>,
         ) -> Self {
             Self {
-                inner,
-                tag_key,
+                map,
+                tag_field,
+                tag_candidates,
+                expected_variant,
                 tag_value,
-                extra,
-                _marker: core::marker::PhantomData,
             }
         }
     }
 
-    impl<'s, 'v, M: MapAccessOwned<'s>> TagFilteredMapOwned<'s, 'v, M, Skip, ()> {
-        pub fn new_skip(
-            inner: M,
-            tag_key: &'static str,
-            tag_value: &'v Cell<Option<Skip>>,
-        ) -> Self {
-            Self::new(inner, tag_key, tag_value, ())
-        }
-    }
-
-    impl<'s, 'v, M: MapAccessOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
-        MapAccessOwned<'s> for TagFilteredMapOwned<'s, 'v, M, V, TagExtra>
+    impl<'v, M: MapAccessOwned, const N: usize> DeserializerOwned
+        for TagAwareDeserializerOwned<'v, M, N>
     {
         type Error = M::Error;
-        type Claim = M::Claim;
-        type KeyEntry = M::KeyEntry;
+        type Claim = M::MapClaim;
+        type EntryClaim = M::MapClaim;
+        type Entry = TagAwareEntryOwned<'v, M, N>;
 
-        fn fork(&mut self) -> Self {
-            Self {
-                inner: self.inner.fork(),
-                tag_key: self.tag_key,
-                tag_value: self.tag_value,
-                extra: self.extra,
-                _marker: core::marker::PhantomData,
-            }
-        }
-
-        async fn next_kv<const N: usize, F, Fut, R>(
-            mut self,
-            f: F,
-        ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
-        where
-            F: FnMut([Self::KeyEntry; N]) -> Fut,
-            Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
-        {
-            let f = RefCell::new(f);
-            let f = &f;
-            let extra = self.extra;
-            // If we're only looking for the tag we have to do a special case
-            if N == 0 {
-                let tag_key = self.tag_key;
-                let result = hit!(
-                    self.inner
-                        .next_kv(async |[ke]| {
-                            let (c, _, v) = hit!(
-                                ke.key(tag_key, |_: &Match, [ve]| async move {
-                                    let (c, v) = hit!(ve.value::<V, TagExtra>(extra).await);
-                                    Ok(Probe::Hit((c, v)))
-                                })
-                                .await
-                            );
-                            Ok(Probe::Hit((c, v)))
-                        })
-                        .await
-                );
-                let (next_inner, v) = or_miss!(result.data());
-                self.tag_key = "";
-                self.tag_value.set(Some(v));
-                self.inner = next_inner;
-            }
-
-            // Try to read the tag until we do
-            while !self.tag_key.is_empty() {
-                let tag_key = self.tag_key;
-                let result = hit!(self.inner.next_kv(|mut keys| async move {
-                    let ke = keys[0].fork();
-                    let f_fut = f.borrow_mut()(keys);
-                    let (c, outcome) = hit!(crate::select_probe! {
-                        // Arm 0: check if this key is the tag on a fork.
-                        async move {
-                            let (c, _, v) = hit!(ke.key(tag_key, |_: &Match, [ve]| async move {
-                                kill!(1);
-                                let (c, v) = hit!(ve.value::<V, TagExtra>(extra).await);
-                                Ok(Probe::Hit((c, v)))
-                            }).await);
-                            Ok(Probe::Hit((c, (Some(v), None::<R>))))
-                        },
-                        // Arm 1: delegate to f.
-                        async move {
-                            let (c, r) = hit!(f_fut.await);
-                            Ok(Probe::Hit((c, (None::<V>, Some(r)))))
-                        },
-                    });
-                    Ok(Probe::Hit((c, outcome)))
-                }).await);
-                match or_miss!(result.data()) {
-                    (next_inner, (Some(v), None)) => {
-                        self.tag_key = "";
-                        self.tag_value.set(Some(v));
-                        self.inner = next_inner;
-                    }
-                    (next_inner, (None, Some(r))) => {
-                        self.inner = next_inner;
-                        return Ok(Probe::Hit(Chunk::Data((self, r))));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
-            // Read everything else normally; extract tag_value before consuming self.
-            let tag_key = self.tag_key;
-            let tag_value = self.tag_value;
-            return self
-                .inner
-                .next_kv(|keys| f.borrow_mut()(keys))
-                .await
-                .map(|p| match p {
-                    Probe::Hit(Chunk::Data((new_inner, r))) => Probe::Hit(Chunk::Data((
-                        Self {
-                            inner: new_inner,
-                            tag_key,
-                            tag_value,
-                            extra,
-                            _marker: PhantomData,
-                        },
-                        r,
-                    ))),
-                    Probe::Hit(Chunk::Done(c)) => Probe::Hit(Chunk::Done(c)),
-                    Probe::Miss => Probe::Miss,
-                });
-        }
-    }
-
-    /// A `DeserializerOwned` wrapper that wraps any `DeserializerOwned` and produces
-    /// `TagFilteredMapEntryOwned` handles. When those handles' `deserialize_map`
-    /// is called the resulting `MapAccessOwned` is wrapped in `TagFilteredMapOwned`.
-    pub struct TagFilteredMapDeserializerOwned<
-        's,
-        'v,
-        D: DeserializerOwned<'s>,
-        V = Skip,
-        TagExtra: Copy = (),
-    > {
-        pub inner: D,
-        pub tag_key: &'static str,
-        pub tag_value: &'v Cell<Option<V>>,
-        pub extra: TagExtra,
-        pub _marker: PhantomData<fn() -> &'s ()>,
-    }
-
-    impl<'s, 'v, D: DeserializerOwned<'s>, V, TagExtra: Copy>
-        TagFilteredMapDeserializerOwned<'s, 'v, D, V, TagExtra>
-    {
-        pub fn new(
-            inner: D,
-            tag_key: &'static str,
-            tag_value: &'v Cell<Option<V>>,
-            extra: TagExtra,
-        ) -> Self {
-            Self { inner, tag_key, tag_value, extra, _marker: PhantomData }
-        }
-    }
-
-    impl<'s, 'v, D: DeserializerOwned<'s>> TagFilteredMapDeserializerOwned<'s, 'v, D, Skip, ()> {
-        pub fn new_skip(
-            inner: D,
-            tag_key: &'static str,
-            tag_value: &'v Cell<Option<Skip>>,
-        ) -> Self {
-            Self::new(inner, tag_key, tag_value, ())
-        }
-    }
-
-    impl<'s, 'v, D: DeserializerOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
-        DeserializerOwned<'s> for TagFilteredMapDeserializerOwned<'s, 'v, D, V, TagExtra>
-    {
-        type Error = D::Error;
-        type Claim = D::Claim;
-        type Entry = TagFilteredMapEntryOwned<'s, 'v, D::Entry, V, TagExtra>;
-
-        async fn entry<const N: usize, F, Fut, R>(
+        async fn entry<const K: usize, F, Fut, R>(
             self,
             mut f: F,
         ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
         where
-            F: FnMut([Self::Entry; N]) -> Fut,
+            F: FnMut([Self::Entry; K]) -> Fut,
             Fut: Future<
-                Output = Result<
-                    Probe<(<Self::Entry as EntryOwned<'s>>::Claim, R)>,
-                    Self::Error,
-                >,
+                Output = Result<Probe<(<Self::Entry as EntryOwned>::Claim, R)>, Self::Error>,
             >,
         {
-            let tag_key = self.tag_key;
+            let tag_field = self.tag_field;
+            let tag_candidates = self.tag_candidates;
+            let expected_variant = self.expected_variant;
             let tag_value = self.tag_value;
-            let extra = self.extra;
-            self.inner
-                .entry::<N, _, _, R>(|entries| {
-                    let wrapped = entries.map(|e| TagFilteredMapEntryOwned {
-                        inner: e,
-                        tag_key,
-                        tag_value,
-                        extra,
-                        _marker: PhantomData,
-                    });
-                    f(wrapped)
-                })
-                .await
-        }
-    }
-
-    /// An `EntryOwned` wrapper that delegates all probes to the inner entry, but
-    /// wraps map accesses in `TagFilteredMapOwned`.
-    pub struct TagFilteredMapEntryOwned<
-        's,
-        'v,
-        E: EntryOwned<'s>,
-        V = Skip,
-        TagExtra: Copy = (),
-    > {
-        pub inner: E,
-        pub tag_key: &'static str,
-        pub tag_value: &'v Cell<Option<V>>,
-        pub extra: TagExtra,
-        pub _marker: PhantomData<fn() -> &'s ()>,
-    }
-
-    impl<'s, 'v, E: EntryOwned<'s>, V: DeserializeOwned<'s, TagExtra>, TagExtra: Copy>
-        EntryOwned<'s> for TagFilteredMapEntryOwned<'s, 'v, E, V, TagExtra>
-    {
-        type Error = E::Error;
-        type Claim = E::Claim;
-        type StrChunks = E::StrChunks;
-        type BytesChunks = E::BytesChunks;
-        type Map = TagFilteredMapOwned<'s, 'v, E::Map, V, TagExtra>;
-        type Seq = E::Seq;
-
-        async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
-            self.inner.deserialize_bool().await
-        }
-        async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
-            self.inner.deserialize_u8().await
-        }
-        async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
-            self.inner.deserialize_u16().await
-        }
-        async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
-            self.inner.deserialize_u32().await
-        }
-        async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
-            self.inner.deserialize_u64().await
-        }
-        async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
-            self.inner.deserialize_u128().await
-        }
-        async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
-            self.inner.deserialize_i8().await
-        }
-        async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
-            self.inner.deserialize_i16().await
-        }
-        async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
-            self.inner.deserialize_i32().await
-        }
-        async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
-            self.inner.deserialize_i64().await
-        }
-        async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
-            self.inner.deserialize_i128().await
-        }
-        async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
-            self.inner.deserialize_f32().await
-        }
-        async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
-            self.inner.deserialize_f64().await
-        }
-        async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
-            self.inner.deserialize_char().await
-        }
-        async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
-            self.inner.deserialize_str_chunks().await
-        }
-        async fn deserialize_bytes_chunks(
-            self,
-        ) -> Result<Probe<Self::BytesChunks>, Self::Error> {
-            self.inner.deserialize_bytes_chunks().await
-        }
-        async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-            let tag_key = self.tag_key;
-            let tag_value = self.tag_value;
-            let extra = self.extra;
-            self.inner.deserialize_map().await.map(|p| match p {
-                Probe::Hit(m) => {
-                    Probe::Hit(TagFilteredMapOwned::new(m, tag_key, tag_value, extra))
-                }
-                Probe::Miss => Probe::Miss,
-            })
-        }
-        async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
-            self.inner.deserialize_seq().await
-        }
-        async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
-            self.inner.deserialize_null().await
-        }
-        async fn deserialize_option<T: DeserializeOwned<'s, Extra>, Extra>(
-            self,
-            extra: Extra,
-        ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
-            self.inner.deserialize_option::<T, Extra>(extra).await
-        }
-        async fn deserialize_value<T: DeserializeOwned<'s, Extra>, Extra>(
-            self,
-            extra: Extra,
-        ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
-            self.inner.deserialize_value::<T, Extra>(extra).await
-        }
-        fn fork(&mut self) -> Self {
-            Self {
-                inner: self.inner.fork(),
-                tag_key: self.tag_key,
-                tag_value: self.tag_value,
-                extra: self.extra,
-                _marker: PhantomData,
-            }
-        }
-        async fn skip(self) -> Result<Self::Claim, Self::Error> {
-            self.inner.skip().await
+            let entries = repeat(self.map, M::fork).map(|map| TagAwareEntryOwned {
+                map,
+                tag_field,
+                tag_candidates,
+                expected_variant,
+                tag_value,
+            });
+            f(entries).await
         }
     }
 }

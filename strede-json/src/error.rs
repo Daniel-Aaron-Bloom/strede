@@ -3,6 +3,7 @@ use strede::DeserializeError;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum JsonError {
+    UnsupportedSkip,
     UnexpectedEnd,
     UnexpectedByte { byte: u8 },
     InvalidNumber,
@@ -15,6 +16,7 @@ pub enum JsonError {
 impl fmt::Display for JsonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedSkip => write!(f, "unsupported skip"),
             Self::UnexpectedEnd => write!(f, "unexpected end of input"),
             Self::UnexpectedByte { byte } => {
                 write!(f, "unexpected byte {byte:#x}")

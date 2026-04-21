@@ -31,7 +31,7 @@ struct PartialLiteral(&'static [u8], SimpleToken);
 /// the returned [`Token::Simple`], or (for strings/numbers) a fresh
 /// [`Tokenizer::new`] is available once the access handle is exhausted.
 ///
-/// Not `Copy` — clone explicitly when you need to branch.
+/// Not `Copy` - clone explicitly when you need to branch.
 #[derive(Debug, Clone)]
 pub(crate) struct Tokenizer {
     mode: Option<PartialLiteral>,

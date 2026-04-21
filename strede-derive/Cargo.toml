@@ -10,6 +10,9 @@ description = "Derive macros for strede"
 [lib]
 proc-macro = true
 
+[features]
+alloc = []
+
 [dependencies]
 syn  = { version = "2", features = ["full"] }
 quote = "1"

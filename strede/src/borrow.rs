@@ -1,9 +1,17 @@
 use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
+use crate::map_arm::{
+    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicatesOwned,
+    MapArmBase, MapArmSlot, NextKey, SlotDispatchProj, SlotDispatchState, SlotRaceState,
+    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStackOwned, TagRaceState,
+    VirtualArmSlot, WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
+};
 use crate::{Chunk, DeserializeError, Probe};
 
 // ---------------------------------------------------------------------------
-// Deserialize — the "what"  (mirrors serde::Deserialize)
+// Deserialize - the "what"  (mirrors serde::Deserialize)
 // ---------------------------------------------------------------------------
 
 /// Types that can deserialize themselves from a [`Deserializer`] stream.
@@ -13,15 +21,15 @@ use crate::{Chunk, DeserializeError, Probe};
 /// the fully constructed value, or a fatal format error.
 ///
 /// The `Extra` type parameter is side-channel context passed into
-/// [`Entry::deserialize_value`], [`SeqEntry::get`], [`MapKeyEntry::key`], and
-/// [`MapValueEntry::value`] at the call site.  Defaults to `()` for types that
+/// [`Entry::deserialize_value`], [`SeqEntry::get`], [`MapKeyProbe::deserialize_key`], and
+/// [`MapValueProbe::deserialize_value`] at the call site.  Defaults to `()` for types that
 /// need no extra context.
 pub trait Deserialize<'de, Extra = ()>: Sized {
     /// Deserialize `Self` from `d`, with caller-supplied side-channel `extra`.
     ///
-    /// - `Ok(Probe::Hit((claim, value)))` — succeeded; thread `claim` back to the caller.
-    /// - `Ok(Probe::Miss)` — token type didn't match; stream not advanced.
-    /// - `Err(e)` — fatal format error (malformed data, I/O failure).
+    /// - `Ok(Probe::Hit((claim, value)))` - succeeded; thread `claim` back to the caller.
+    /// - `Ok(Probe::Miss)` - token type didn't match; stream not advanced.
+    /// - `Err(e)` - fatal format error (malformed data, I/O failure).
     async fn deserialize<D: Deserializer<'de>>(
         d: D,
         extra: Extra,
@@ -29,12 +37,12 @@ pub trait Deserialize<'de, Extra = ()>: Sized {
 }
 
 // ---------------------------------------------------------------------------
-// Deserializer — stream handle
+// Deserializer - stream handle
 // ---------------------------------------------------------------------------
 
 /// A stream of tokens that can be decoded into Rust values.
 ///
-/// The deserializer owns the stream and is the sole means of advancing it —
+/// The deserializer owns the stream and is the sole means of advancing it -
 /// all advancement goes through [`Deserializer::entry`].  Type probing is done
 /// through [`Entry`] handles handed to the closure.
 pub trait Deserializer<'de>: Sized {
@@ -44,8 +52,13 @@ pub trait Deserializer<'de>: Sized {
     /// Proof-of-consumption token returned from [`Deserializer::entry`].
     type Claim: 'de;
 
+    /// The claim type produced by entry handles ([`Entry::Claim`]).
+    /// Distinct from `Claim` to allow implementations to use different claim
+    /// types at the deserializer level vs the entry level (e.g. flatten facades).
+    type EntryClaim: 'de;
+
     /// Owned handle for one item slot.  See [`Entry`].
-    type Entry: Entry<'de, Error = Self::Error>;
+    type Entry: Entry<'de, Claim = Self::EntryClaim, Error = Self::Error>;
 
     /// Advance to the next item in the stream.
     ///
@@ -65,11 +78,11 @@ pub trait Deserializer<'de>: Sized {
     ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
     where
         F: FnMut([Self::Entry; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(<Self::Entry as Entry<'de>>::Claim, R)>, Self::Error>>;
+        Fut: Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>;
 }
 
 // ---------------------------------------------------------------------------
-// Entry — type-probing handle for one item slot
+// Entry - type-probing handle for one item slot
 // ---------------------------------------------------------------------------
 
 /// Owned handle for one item slot, passed into the closure of [`Deserializer::entry`].
@@ -81,7 +94,7 @@ pub trait Deserializer<'de>: Sized {
 ///
 /// # For implementors
 ///
-/// Type mismatches **must** return `Ok(Probe::Miss)` — never `Err`.  `Err` is
+/// Type mismatches **must** return `Ok(Probe::Miss)` - never `Err`.  `Err` is
 /// reserved for fatal format errors (malformed data, I/O failure).
 ///
 /// Use `N > 1` in `entry` to race arms via [`select_probe!`](crate::select_probe):
@@ -113,8 +126,8 @@ pub trait Entry<'de>: Sized {
 
     type StrChunks: StrAccess<Claim = Self::Claim, Error = Self::Error>;
     type BytesChunks: BytesAccess<Claim = Self::Claim, Error = Self::Error>;
-    type Map: MapAccess<'de, Claim = Self::Claim, Error = Self::Error>;
-    type Seq: SeqAccess<'de, Claim = Self::Claim, Error = Self::Error>;
+    type Map: MapAccess<'de, MapClaim = Self::Claim, Error = Self::Error>;
+    type Seq: SeqAccess<'de, SeqClaim = Self::Claim, Error = Self::Error>;
 
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error>;
@@ -147,7 +160,7 @@ pub trait Entry<'de>: Sized {
     /// Attempt a **zero-copy** string borrow.
     ///
     /// Hits only when the format can return the entire string as a single
-    /// contiguous `&'de str` slice — i.e. with no escape sequences or
+    /// contiguous `&'de str` slice - i.e. with no escape sequences or
     /// transcoding.  Returns `Ok(Probe::Miss)` when the token is a string
     /// but cannot be represented that way (e.g. JSON `"\n"`), so that a
     /// concurrent [`Entry::deserialize_str_chunks`] arm can take over via
@@ -175,7 +188,7 @@ pub trait Entry<'de>: Sized {
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
     /// Begin reading a map.  The [`Entry::Claim`] is returned by
-    /// [`MapAccess::next_kv`] when the map is exhausted.
+    /// [`MapAccess::iterate`] when the map is exhausted.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error>;
     /// Begin reading a sequence.  The [`Entry::Claim`] is returned by
@@ -196,9 +209,9 @@ pub trait Entry<'de>: Sized {
 
     /// Probe for a null token.
     ///
-    /// - `Ok(Probe::Hit(claim))` — null token consumed.
-    /// - `Ok(Probe::Miss)` — token is not null.
-    /// - `Err(e)` — fatal format error.
+    /// - `Ok(Probe::Hit(claim))` - null token consumed.
+    /// - `Ok(Probe::Miss)` - token is not null.
+    /// - `Err(e)` - fatal format error.
     async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error>;
 
     /// Delegate to `T::deserialize` from this entry handle, forwarding `extra`.
@@ -232,7 +245,7 @@ pub trait Entry<'de>: Sized {
 
 /// Streams a string in zero-copy chunks.  Obtained from [`Entry::deserialize_str_chunks`].
 ///
-/// Strings are primitives — the type is already known, so no probing or
+/// Strings are primitives - the type is already known, so no probing or
 /// racing is needed.  This adapter exists solely for formats that cannot
 /// deliver the value as a single contiguous slice (e.g. escape-sequence
 /// synthesis in JSON).
@@ -263,10 +276,10 @@ pub trait StrAccess: Sized {
 
     /// Advance to the next chunk, passing it to `f`.
     ///
-    /// - `Ok(Chunk::Data((self, r)))` — next chunk processed; accessor returned for the next call.
-    /// - `Ok(Chunk::Done(claim))` — string exhausted; claim is now valid.
-    /// - `Err(e)` — fatal format error.
-    /// - `Pending` — no data yet.
+    /// - `Ok(Chunk::Data((self, r)))` - next chunk processed; accessor returned for the next call.
+    /// - `Ok(Chunk::Done(claim))` - string exhausted; claim is now valid.
+    /// - `Err(e)` - fatal format error.
+    /// - `Pending` - no data yet.
     async fn next_str<R>(
         self,
         f: impl FnOnce(&str) -> R,
@@ -279,7 +292,7 @@ pub trait StrAccess: Sized {
 
 /// Streams a byte string in zero-copy chunks.  Obtained from [`Entry::deserialize_bytes_chunks`].
 ///
-/// Byte strings are primitives — the type is already known, so no probing or
+/// Byte strings are primitives - the type is already known, so no probing or
 /// racing is needed.  This adapter exists solely for formats that cannot
 /// deliver the value as a single contiguous slice.
 ///
@@ -307,10 +320,10 @@ pub trait BytesAccess: Sized {
 
     /// Advance to the next chunk, passing it to `f`.
     ///
-    /// - `Ok(Chunk::Data((self, r)))` — next chunk processed; accessor returned for the next call.
-    /// - `Ok(Chunk::Done(claim))` — byte string exhausted; claim is now valid.
-    /// - `Err(e)` — fatal format error.
-    /// - `Pending` — no data yet.
+    /// - `Ok(Chunk::Data((self, r)))` - next chunk processed; accessor returned for the next call.
+    /// - `Ok(Chunk::Done(claim))` - byte string exhausted; claim is now valid.
+    /// - `Err(e)` - fatal format error.
+    /// - `Pending` - no data yet.
     async fn next_bytes<R>(
         self,
         f: impl FnOnce(&[u8]) -> R,
@@ -318,7 +331,64 @@ pub trait BytesAccess: Sized {
 }
 
 // ---------------------------------------------------------------------------
-// MapAccess
+// Map access - new design
+// ---------------------------------------------------------------------------
+
+/// A key probe for a single map key in the borrow family. Forkable for racing multiple arms.
+pub trait MapKeyProbe<'de>: Sized {
+    type Error: DeserializeError;
+    type KeyClaim: MapKeyClaim<'de, Error = Self::Error>;
+
+    fn fork(&mut self) -> Self;
+
+    async fn deserialize_key<K: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error>;
+}
+
+/// Proof that a key was consumed. Converts into a value probe.
+pub trait MapKeyClaim<'de>: Sized {
+    type Error: DeserializeError;
+    type MapClaim: 'de;
+    type ValueProbe: MapValueProbe<'de, MapClaim = Self::MapClaim, Error = Self::Error>;
+
+    /// Consume this key claim and produce a value probe for the corresponding
+    /// map value. Format-specific (e.g. JSON reads `:` and the value start token).
+    async fn into_value_probe(self) -> Result<Self::ValueProbe, Self::Error>;
+}
+
+/// A value probe that can deserialize a value or skip it (borrow family).
+pub trait MapValueProbe<'de>: Sized {
+    type Error: DeserializeError;
+    type MapClaim: 'de;
+    type ValueClaim: MapValueClaim<'de, MapClaim = Self::MapClaim, Error = Self::Error>;
+
+    fn fork(&mut self) -> Self;
+
+    async fn deserialize_value<V: Deserialize<'de, Extra>, Extra>(
+        self,
+        extra: Extra,
+    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>;
+
+    async fn skip(self) -> Result<Self::ValueClaim, Self::Error>;
+}
+
+/// Proof that a value was consumed. Advances to the next key or ends the map (borrow family).
+pub trait MapValueClaim<'de>: Sized {
+    type Error: DeserializeError;
+    type KeyProbe: MapKeyProbe<'de, Error = Self::Error>;
+    type MapClaim: 'de;
+
+    async fn next_key(
+        self,
+        unsatisfied: usize,
+        open: usize,
+    ) -> Result<NextKey<Self::KeyProbe, Self::MapClaim>, Self::Error>;
+}
+
+// ---------------------------------------------------------------------------
+// MapAccess - iterates key-value pairs via arm stacks
 // ---------------------------------------------------------------------------
 
 /// Iterates the key-value pairs of a map.  Obtained from [`Entry::deserialize_map`].
@@ -328,118 +398,1053 @@ pub trait MapAccess<'de>: Sized {
 
     /// Proof-of-consumption token returned on map exhaustion; must match
     /// the enclosing [`Entry::Claim`].
-    type Claim: 'de;
+    type MapClaim: 'de;
 
-    /// Owned handle for reading one key.  See [`MapKeyEntry`].
-    type KeyEntry: MapKeyEntry<'de, Claim = Self::Claim, Error = Self::Error>;
+    type KeyProbe: MapKeyProbe<'de, Error = Self::Error>;
 
-    /// Fork a sibling accessor at the same map position.
-    ///
-    /// Both `self` and the returned accessor are independent iterators
-    /// starting from the current pair.  Each must consume all remaining
-    /// pairs (or be dropped) independently.
     fn fork(&mut self) -> Self;
 
-    /// Advance to the next key-value pair, passing `N` owned [`MapKeyEntry`]
-    /// handles to `f`.  The closure must return `Ok(Probe::Hit((claim, r)))` where
-    /// `claim` is the [`MapValueEntry::Claim`] threaded out through
-    /// [`MapKeyEntry::key`], or `Ok(Probe::Miss)` if no key matched.
+    /// Drive the map iteration with the given arm stack.
     ///
-    /// Returns:
-    /// - `Ok(Probe::Hit(Chunk::Data((self, r))))` — a pair was consumed.
-    /// - `Ok(Probe::Hit(Chunk::Done(claim)))` — map exhausted.
-    /// - `Ok(Probe::Miss)` — closure returned Miss (no key probe matched).
-    /// - `Err(e)` — fatal format error.
-    /// - `Pending` — no data yet.
-    async fn next_kv<const N: usize, F, Fut, R>(
+    /// Returns `Hit((MapClaim, Outputs))` on success, `Miss` if a value
+    /// type mismatched or a required field was missing, `Err` on format errors.
+    async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        f: F,
-    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
-    where
-        F: FnMut([Self::KeyEntry; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;
 }
 
-/// Owned handle for reading the key of one map pair.
-///
-/// `key` follows the same lambda pattern as [`Deserializer::entry`]: the closure
-/// receives `(&K, [ValueEntry; N])` — a reference to the decoded key and `N`
-/// owned [`MapValueEntry`] handles — so it can inspect the key and read the
-/// value, returning `Ok(Probe::Hit((ValueClaim, R)))` or `Ok(Probe::Miss)` for
-/// unknown keys.  `key` returns `Ok(Probe::Hit((Claim, K, R)))` on success.
-///
-/// ```rust,ignore
-/// let mut out = HashMap::new();
-/// loop {
-///     match map.next_kv(|[ke]| async {
-///         match ke.key(|_k: &String, [ve]| async {
-///             let (claim, v) = hit!(ve.value::<u32, ()>(()).await);
-///             Ok(Probe::Hit((claim, v)))
-///         }).await? {
-///             Probe::Hit((claim, k, v)) => Ok(Probe::Hit((claim, (k, v)))),
-///             Probe::Miss => Ok(Probe::Miss),
-///         }
-///     }).await? {
-///         Probe::Hit(Chunk::Data((k, v))) => { out.insert(k, v); }
-///         Probe::Hit(Chunk::Done(claim)) => return Ok(Probe::Hit((claim, out))),
-///         Probe::Miss => { /* unknown key */ }
-///     }
-/// }
-/// ```
-pub trait MapKeyEntry<'de> {
-    /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error: DeserializeError;
-    /// Proof-of-consumption token; must match the enclosing [`MapAccess::Claim`].
-    type Claim: 'de;
-    type ValueEntry: MapValueEntry<'de, Claim = Self::Claim, Error = Self::Error>;
+// ---------------------------------------------------------------------------
+// Type aliases for borrow map access
+// ---------------------------------------------------------------------------
 
-    /// Fork a sibling key-entry handle for the same map pair.
-    ///
-    /// Both handles refer to the same key slot; whichever resolves `key`
-    /// first claims the pair.
-    fn fork(&mut self) -> Self
-    where
-        Self: Sized;
+/// Shorthand for the key probe type reachable from a `Deserializer`.
+pub type KP<'de, D> =
+    <<<D as Deserializer<'de>>::Entry as Entry<'de>>::Map as MapAccess<'de>>::KeyProbe;
 
-    async fn key<K: Deserialize<'de, KExtra>, KExtra, const N: usize, F, Fut, R>(
-        self,
-        extra: KExtra,
-        f: F,
-    ) -> Result<Probe<(Self::Claim, K, R)>, Self::Error>
-    where
-        F: FnMut(&K, [Self::ValueEntry; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
+/// Shorthand for the value claim type reachable from a borrow key probe type.
+pub type VC<'de, KP> =
+    <<<KP as MapKeyProbe<'de>>::KeyClaim as MapKeyClaim<'de>>::ValueProbe as MapValueProbe<'de>>::ValueClaim;
+
+/// Shorthand for the value probe type reachable from a borrow key probe type.
+pub type VP<'de, KP> = <<KP as MapKeyProbe<'de>>::KeyClaim as MapKeyClaim<'de>>::ValueProbe;
+
+/// Shorthand for the value probe type reachable directly from a `Deserializer`.
+pub type VP2<'de, D> = <<KP<'de, D> as MapKeyProbe<'de>>::KeyClaim as MapKeyClaim<'de>>::ValueProbe;
+
+// ---------------------------------------------------------------------------
+// MapArmStack<'de, KP> - borrow-family arm stack
+// ---------------------------------------------------------------------------
+
+/// Borrow-family counterpart to [`crate::MapArmStackOwned`].
+///
+/// A left-nested tuple stack of [`MapArmSlot`]s parameterized by `'de`.
+/// The map impl drives the iteration loop using this trait's `init_race` /
+/// `poll_race_one` / `init_dispatch` / `poll_dispatch` methods.
+pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
+    const SIZE: usize;
+
+    /// Left-nested tuple of `Option<(K, V)>` for each arm.
+    type Outputs;
+
+    /// Number of arms that still require a value (required fields not yet matched).
+    /// Virtual arms are excluded.
+    fn unsatisfied_count(&self) -> usize;
+
+    /// Number of arms still willing to run, including virtual arms.
+    fn open_count(&self) -> usize;
+
+    type RaceState;
+    type RaceDone;
+
+    fn init_race(&mut self, kp: KP) -> (Self::RaceState, Self::RaceDone);
+    fn race_all_done(done: &Self::RaceDone) -> bool;
+    #[allow(clippy::type_complexity)]
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>>;
+
+    type DispatchState;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState;
+    #[allow(clippy::type_complexity)]
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>>;
+
+    /// Race all unsatisfied arms' key callbacks against the given key probe.
+    async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+        if Self::SIZE == 0 {
+            return Ok(Probe::Miss);
+        }
+        let (race_state, mut done) = self.init_race(kp);
+        let mut race_state = core::pin::pin!(race_state);
+        core::future::poll_fn(|cx| {
+            for i in 0..Self::SIZE {
+                match self.poll_race_one(race_state.as_mut(), &mut done, i, cx) {
+                    Poll::Ready(Ok(Probe::Hit(v))) => return Poll::Ready(Ok(Probe::Hit(v))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(Probe::Miss)) => {}
+                    Poll::Pending => {}
+                }
+            }
+            if Self::race_all_done(&done) {
+                return Poll::Ready(Ok(Probe::Miss));
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Dispatch the value probe to the arm at `arm_index`.
+    async fn dispatch_value(
+        &mut self,
+        arm_index: usize,
+        vp: VP<'de, KP>,
+    ) -> Result<Probe<(VC<'de, KP>, ())>, KP::Error> {
+        let dispatch_state = self.init_dispatch(arm_index, vp);
+        let mut dispatch_state = core::pin::pin!(dispatch_state);
+        core::future::poll_fn(|cx| self.poll_dispatch(dispatch_state.as_mut(), cx)).await
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs;
 }
 
-/// Owned handle for reading the value of one map pair.
+// --- MapArmBase impl ---
+
+impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
+    const SIZE: usize = 0;
+    type Outputs = ();
+
+    fn unsatisfied_count(&self) -> usize {
+        0
+    }
+    fn open_count(&self) -> usize {
+        0
+    }
+
+    type RaceState = ();
+    type RaceDone = ();
+
+    fn init_race(&mut self, _kp: KP) -> ((), ()) {
+        ((), ())
+    }
+    fn race_all_done(_done: &()) -> bool {
+        true
+    }
+    fn poll_race_one(
+        &mut self,
+        _state: Pin<&mut ()>,
+        _done: &mut (),
+        _arm_index: usize,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        unreachable!("poll_race_one called on MapArmBase (SIZE=0)")
+    }
+
+    type DispatchState = core::convert::Infallible;
+
+    fn init_dispatch(&mut self, _arm_index: usize, _vp: VP<'de, KP>) -> Self::DispatchState {
+        unreachable!("init_dispatch called on MapArmBase")
+    }
+    fn poll_dispatch(
+        &mut self,
+        _state: Pin<&mut Self::DispatchState>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        unreachable!("poll_dispatch called on MapArmBase")
+    }
+
+    fn take_outputs(&mut self) {}
+}
+
+// --- Recursive (Rest, Slot) impl ---
+
+impl<'de, KP, Rest, K, V, KeyFn, KeyFut, ValFn, ValFut> MapArmStack<'de, KP>
+    for (Rest, MapArmSlot<K, V, KeyFn, ValFn>)
+where
+    KP: MapKeyProbe<'de>,
+    Rest: MapArmStack<'de, KP>,
+    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+    ValFn: FnMut(VP<'de, KP>, K) -> ValFut,
+    ValFut: Future<Output = Result<Probe<(VC<'de, KP>, (K, V))>, KP::Error>>,
+{
+    const SIZE: usize = Rest::SIZE + 1;
+    type Outputs = (Rest::Outputs, Option<(K, V)>);
+
+    fn unsatisfied_count(&self) -> usize {
+        self.0.unsatisfied_count() + if self.1.state.is_done() { 0 } else { 1 }
+    }
+    fn open_count(&self) -> usize {
+        self.0.open_count() + if self.1.state.is_done() { 0 } else { 1 }
+    }
+
+    type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
+    type RaceDone = (Rest::RaceDone, bool);
+
+    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+        let this_done = self.1.state.is_done();
+        let rest_kp = kp.fork();
+        let this_fut = if this_done {
+            None
+        } else {
+            Some((self.1.key_fn)(kp))
+        };
+        let (rest_state, rest_done) = self.0.init_race(rest_kp);
+        (
+            SlotRaceState {
+                rest: rest_state,
+                this: this_fut,
+            },
+            (rest_done, this_done),
+        )
+    }
+
+    fn race_all_done(done: &Self::RaceDone) -> bool {
+        Rest::race_all_done(&done.0) && done.1
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index == Self::SIZE - 1 {
+            match poll_key_slot(projected.this, &mut done.1, cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.1.state = ArmState::Key(k);
+                    Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            self.0
+                .poll_race_one(projected.rest, &mut done.0, arm_index, cx)
+        }
+    }
+
+    type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
+        if arm_index == Self::SIZE - 1 {
+            let k = match core::mem::replace(&mut self.1.state, ArmState::Empty) {
+                ArmState::Key(k) => k,
+                _ => unreachable!("init_dispatch called but arm not in Key state"),
+            };
+            SlotDispatchState::ThisArm((self.1.val_fn)(vp, k))
+        } else {
+            SlotDispatchState::Delegated(self.0.init_dispatch(arm_index, vp))
+        }
+    }
+
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        match state.project() {
+            SlotDispatchProj::ThisArm(fut) => fut.poll(cx).map(|r| {
+                r.map(|probe| match probe {
+                    Probe::Hit((vc, (k, v))) => {
+                        self.1.state = ArmState::Done(k, v);
+                        Probe::Hit((vc, ()))
+                    }
+                    Probe::Miss => Probe::Miss,
+                })
+            }),
+            SlotDispatchProj::Delegated(rest_state) => self.0.poll_dispatch(rest_state, cx),
+        }
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs {
+        let out = match core::mem::replace(&mut self.1.state, ArmState::Empty) {
+            ArmState::Done(k, v) => Some((k, v)),
+            _ => None,
+        };
+        (self.0.take_outputs(), out)
+    }
+}
+
+// --- (Rest, VirtualArmSlot) impl ---
+
+impl<'de, KP, Rest, K, KeyFn, KeyFut, ValFn, ValFut> MapArmStack<'de, KP>
+    for (Rest, VirtualArmSlot<K, KeyFn, ValFn>)
+where
+    KP: MapKeyProbe<'de>,
+    Rest: MapArmStack<'de, KP>,
+    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+    ValFn: FnMut(VP<'de, KP>, K) -> ValFut,
+    ValFut: Future<Output = Result<Probe<(VC<'de, KP>, ())>, KP::Error>>,
+{
+    const SIZE: usize = Rest::SIZE + 1;
+    type Outputs = Rest::Outputs;
+
+    fn unsatisfied_count(&self) -> usize {
+        self.0.unsatisfied_count()
+    }
+    fn open_count(&self) -> usize {
+        self.0.open_count() + 1
+    }
+
+    type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
+    type RaceDone = (Rest::RaceDone, bool);
+
+    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+        let rest_kp = kp.fork();
+        let this_fut = (self.1.key_fn)(kp);
+        let (rest_state, rest_done) = self.0.init_race(rest_kp);
+        (
+            SlotRaceState {
+                rest: rest_state,
+                this: Some(this_fut),
+            },
+            (rest_done, false),
+        )
+    }
+
+    fn race_all_done(done: &Self::RaceDone) -> bool {
+        Rest::race_all_done(&done.0) && done.1
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index == Self::SIZE - 1 {
+            match poll_key_slot(projected.this, &mut done.1, cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.1.pending_key = Some(k);
+                    Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            self.0
+                .poll_race_one(projected.rest, &mut done.0, arm_index, cx)
+        }
+    }
+
+    type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
+        if arm_index == Self::SIZE - 1 {
+            let k = self
+                .1
+                .pending_key
+                .take()
+                .expect("init_dispatch on virtual arm without pending key");
+            SlotDispatchState::ThisArm((self.1.val_fn)(vp, k))
+        } else {
+            SlotDispatchState::Delegated(self.0.init_dispatch(arm_index, vp))
+        }
+    }
+
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        match state.project() {
+            SlotDispatchProj::ThisArm(fut) => fut.poll(cx),
+            SlotDispatchProj::Delegated(rest_state) => self.0.poll_dispatch(rest_state, cx),
+        }
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs {
+        self.0.take_outputs()
+    }
+}
+
+// --- DetectDuplicatesOwned impl ---
+
+impl<'de, KP, S, const M: usize, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStack<'de, KP>
+    for DetectDuplicatesOwned<S, M, KeyFn, SkipFn>
+where
+    KP: MapKeyProbe<'de>,
+    S: MapArmStack<'de, KP>,
+    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::MatchVals<usize>)>, KP::Error>>,
+    SkipFn: FnMut(VP<'de, KP>) -> SkipFut,
+    SkipFut: Future<Output = Result<VC<'de, KP>, KP::Error>>,
+{
+    const SIZE: usize = S::SIZE + 1;
+    type Outputs = S::Outputs;
+
+    fn unsatisfied_count(&self) -> usize {
+        self.inner.unsatisfied_count()
+    }
+    fn open_count(&self) -> usize {
+        self.inner.open_count() + 1
+    }
+
+    type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
+    type RaceDone = (S::RaceDone, bool);
+
+    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+        let dup_kp = kp.fork();
+        let dup_fut = (self.key_fn)(dup_kp);
+        let (inner_state, inner_done) = self.inner.init_race(kp);
+        (
+            WrapperRaceState {
+                inner: inner_state,
+                virtual_arm: Some(dup_fut),
+            },
+            (inner_done, false),
+        )
+    }
+
+    fn race_all_done(done: &Self::RaceDone) -> bool {
+        S::race_all_done(&done.0) && done.1
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index == Self::SIZE - 1 {
+            match poll_key_slot(projected.virtual_arm, &mut done.1, cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, matched)))) => {
+                    self.dup = self.wire_names[matched.0].0;
+                    Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            self.inner
+                .poll_race_one(projected.inner, &mut done.0, arm_index, cx)
+        }
+    }
+
+    type DispatchState = WrapperDispatchState<S::DispatchState, SkipFut>;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
+        if arm_index == Self::SIZE - 1 {
+            WrapperDispatchState::Virtual((self.skip_fn)(vp))
+        } else {
+            WrapperDispatchState::Inner(self.inner.init_dispatch(arm_index, vp))
+        }
+    }
+
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        match state.project() {
+            WrapperDispatchProj::Virtual(fut) => fut.poll(cx).map(|r| match r {
+                Ok(_vc) => Err(<KP::Error as crate::DeserializeError>::duplicate_field(
+                    self.dup,
+                )),
+                Err(e) => Err(e),
+            }),
+            WrapperDispatchProj::Inner(inner_state) => self.inner.poll_dispatch(inner_state, cx),
+        }
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs {
+        self.inner.take_outputs()
+    }
+}
+
+// --- TagInjectingStackOwned impl ---
+
+impl<'de, 'v, KP, S, const N: usize, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStack<'de, KP>
+    for TagInjectingStackOwned<'v, S, N, TagKeyFn, TagValFn>
+where
+    KP: MapKeyProbe<'de>,
+    S: MapArmStack<'de, KP>,
+    TagKeyFn: FnMut(KP) -> TagKeyFut,
+    TagKeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::Match)>, KP::Error>>,
+    TagValFn: FnMut(VP<'de, KP>) -> TagValFut,
+    TagValFut: Future<Output = Result<Probe<(VC<'de, KP>, crate::MatchVals<usize>)>, KP::Error>>,
+{
+    const SIZE: usize = S::SIZE + 1;
+    type Outputs = S::Outputs;
+
+    fn unsatisfied_count(&self) -> usize {
+        self.inner.unsatisfied_count()
+    }
+    fn open_count(&self) -> usize {
+        self.inner.open_count() + 1
+    }
+
+    type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
+    type RaceDone = (bool, S::RaceDone);
+
+    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+        let inner_kp = kp.fork();
+        let tag_fut = (self.tag_key_fn)(kp);
+        let (inner_state, inner_done) = self.inner.init_race(inner_kp);
+        (
+            TagRaceState {
+                tag_fut: Some(tag_fut),
+                inner: inner_state,
+            },
+            (false, inner_done),
+        )
+    }
+
+    fn race_all_done(done: &Self::RaceDone) -> bool {
+        done.0 && S::race_all_done(&done.1)
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index == 0 {
+            match poll_key_slot(projected.tag_fut, &mut done.0, cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, _match)))) => Poll::Ready(Ok(Probe::Hit((0, kc)))),
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            match self
+                .inner
+                .poll_race_one(projected.inner, &mut done.1, arm_index - 1, cx)
+            {
+                Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
+                    Poll::Ready(Ok(Probe::Hit((idx + 1, kc))))
+                }
+                other => other,
+            }
+        }
+    }
+
+    type DispatchState = TagDispatchState<TagValFut, S::DispatchState>;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
+        if arm_index == 0 {
+            TagDispatchState::Tag((self.tag_val_fn)(vp))
+        } else {
+            TagDispatchState::Inner(self.inner.init_dispatch(arm_index - 1, vp))
+        }
+    }
+
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        match state.project() {
+            TagDispatchProj::Tag(fut) => fut.poll(cx).map(|r| {
+                r.map(|probe| match probe {
+                    Probe::Hit((vc, crate::MatchVals(idx))) => {
+                        self.tag_value.set(Some(idx));
+                        Probe::Hit((vc, ()))
+                    }
+                    Probe::Miss => Probe::Miss,
+                })
+            }),
+            TagDispatchProj::Inner(inner_state) => self.inner.poll_dispatch(inner_state, cx),
+        }
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs {
+        self.inner.take_outputs()
+    }
+}
+
+// --- StackConcat impl ---
+
+impl<'de, KP, A, B> MapArmStack<'de, KP> for StackConcat<A, B>
+where
+    KP: MapKeyProbe<'de>,
+    A: MapArmStack<'de, KP>,
+    B: MapArmStack<'de, KP>,
+{
+    const SIZE: usize = A::SIZE + B::SIZE;
+    type Outputs = (A::Outputs, B::Outputs);
+
+    fn unsatisfied_count(&self) -> usize {
+        self.0.unsatisfied_count() + self.1.unsatisfied_count()
+    }
+    fn open_count(&self) -> usize {
+        self.0.open_count() + self.1.open_count()
+    }
+
+    type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
+    type RaceDone = (A::RaceDone, B::RaceDone);
+
+    fn init_race(&mut self, mut kp: KP) -> (Self::RaceState, Self::RaceDone) {
+        let b_kp = kp.fork();
+        let (a_state, a_done) = self.0.init_race(kp);
+        let (b_state, b_done) = self.1.init_race(b_kp);
+        (
+            ConcatRaceState {
+                a: a_state,
+                b: b_state,
+            },
+            (a_done, b_done),
+        )
+    }
+
+    fn race_all_done(done: &Self::RaceDone) -> bool {
+        A::race_all_done(&done.0) && B::race_all_done(&done.1)
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        done: &mut Self::RaceDone,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index < A::SIZE {
+            self.0
+                .poll_race_one(projected.a, &mut done.0, arm_index, cx)
+        } else {
+            match self
+                .1
+                .poll_race_one(projected.b, &mut done.1, arm_index - A::SIZE, cx)
+            {
+                Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
+                    Poll::Ready(Ok(Probe::Hit((A::SIZE + idx, kc))))
+                }
+                other => other,
+            }
+        }
+    }
+
+    type DispatchState = ConcatDispatchState<A::DispatchState, B::DispatchState>;
+
+    fn init_dispatch(&mut self, arm_index: usize, vp: VP<'de, KP>) -> Self::DispatchState {
+        if arm_index < A::SIZE {
+            ConcatDispatchState::InA(self.0.init_dispatch(arm_index, vp))
+        } else {
+            ConcatDispatchState::InB(self.1.init_dispatch(arm_index - A::SIZE, vp))
+        }
+    }
+
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
+        match state.project() {
+            ConcatDispatchProj::InA(a_state) => self.0.poll_dispatch(a_state, cx),
+            ConcatDispatchProj::InB(b_state) => self.1.poll_dispatch(b_state, cx),
+        }
+    }
+
+    fn take_outputs(&mut self) -> Self::Outputs {
+        (self.0.take_outputs(), self.1.take_outputs())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flatten infrastructure - borrow family
+// ---------------------------------------------------------------------------
+
+// Parallel to FlattenContOwned / FlattenDeserializerOwned / FlattenEntryOwned / FlattenMapAccessOwned
+// in the owned family, but parameterized over MapAccess<'de> and using
+// MapArmStack<'de, KP> instead of MapArmStackOwned<KP>.
+
+/// Continuation for [`FlattenMapAccess`]. Determines what happens after
+/// the outer and inner arm stacks are combined via [`StackConcat`].
 ///
-/// Constructed by the [`MapKeyEntry::key`] implementation and passed as the
-/// `[ValueEntry; N]` argument to its closure.
-pub trait MapValueEntry<'de> {
-    /// Fatal error type; must match the parent [`Deserializer::Error`].
-    type Error: DeserializeError;
-    /// Proof-of-consumption token; must match the enclosing [`MapAccess::Claim`].
-    type Claim: 'de;
+/// Terminal case: [`FlattenTerminal`] calls `map.iterate(SkipUnknown!(arms))`.
+/// Intermediate case: generated by the derive macro - calls the next flatten
+/// field's `Deserialize::deserialize` with a new [`FlattenDeserializer`].
+#[allow(async_fn_in_trait)]
+pub trait FlattenCont<'de, M: MapAccess<'de>> {
+    /// Extra result produced by the continuation (e.g., values from subsequent
+    /// flatten fields). `()` for the terminal case.
+    type Extra;
 
-    /// Deserialize the value as `V`, forwarding `extra` into `V::deserialize`.
-    /// Returns `Ok(Probe::Hit((claim, value)))`; the claim must be threaded out
-    /// through [`MapKeyEntry::key`] and back to [`MapAccess::next_kv`] to advance
-    /// the stream.  `Ok(Probe::Miss)` if `V::deserialize` misses; `Err` on
-    /// fatal format error only.
-    async fn value<V: Deserialize<'de, Extra>, Extra>(
-        self,
-        extra: Extra,
-    ) -> Result<Probe<(Self::Claim, V)>, Self::Error>;
-
-    /// Fork a sibling value-entry handle for the same map value slot.
+    /// Drive the combined arm stack to completion.
     ///
-    /// Both handles refer to the same value; whichever resolves `value`
-    /// first claims it.
-    fn fork(&mut self) -> Self;
+    /// `arms` is `StackConcat(outer_arms, inner_arms)`.
+    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
+        self,
+        map: M,
+        arms: Arms,
+    ) -> Result<Probe<(M::MapClaim, Arms::Outputs, Self::Extra)>, M::Error>;
+}
 
-    /// Consume and discard the value without deserializing it.
-    /// Returns the [`Claim`](MapValueEntry::Claim) so the stream can advance.
-    async fn skip(self) -> Result<Self::Claim, Self::Error>;
+impl<'de, M: MapAccess<'de>> FlattenCont<'de, M> for crate::FlattenTerminal {
+    type Extra = ();
+
+    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
+        self,
+        map: M,
+        arms: Arms,
+    ) -> Result<Probe<(M::MapClaim, Arms::Outputs, ())>, M::Error> {
+        let wrapped = crate::SkipUnknown!(arms, M::KeyProbe, VP<'de, M::KeyProbe>);
+        let (claim, out) = crate::hit!(map.iterate(wrapped).await);
+        Ok(Probe::Hit((claim, out, ())))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, M: MapAccess<'de>> FlattenCont<'de, M> for crate::FlattenTerminalBoxed {
+    type Extra = ();
+
+    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
+        self,
+        map: M,
+        arms: Arms,
+    ) -> Result<Probe<(M::MapClaim, Arms::Outputs, ())>, M::Error> {
+        let wrapped = crate::SkipUnknown!(arms, M::KeyProbe, VP<'de, M::KeyProbe>);
+        #[allow(clippy::type_complexity)]
+        let r: Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> =
+            alloc::boxed::Box::pin(map.iterate(wrapped)).await;
+        let (claim, out) = crate::hit!(r);
+        Ok(Probe::Hit((claim, out, ())))
+    }
+}
+
+/// Facade [`Deserializer<'de>`] used to implement `#[strede(flatten)]` for the borrow family.
+///
+/// Pass this as the deserializer to a flattened field's [`Deserialize`] impl. It
+/// intercepts `deserialize_map` → `iterate(inner_arms)`, prepends the outer
+/// struct's arms via [`StackConcat`], and delegates to the [`FlattenCont`]
+/// continuation. For the terminal case ([`FlattenTerminal`]) this drives the
+/// real map's `iterate`; for intermediate cases it chains to the next flatten field.
+pub struct FlattenDeserializer<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    pub map: M,
+    pub outer_arms: &'a core::cell::Cell<Option<OuterArms>>,
+    pub outer_outputs: &'a core::cell::Cell<Option<OuterArms::Outputs>>,
+    pub cont: Cont,
+    pub extra: &'a core::cell::Cell<Option<Cont::Extra>>,
+    pub _de: core::marker::PhantomData<&'de ()>,
+}
+
+impl<'a, 'de, M, OuterArms, Cont> FlattenDeserializer<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    pub fn new(
+        map: M,
+        outer_arms: &'a core::cell::Cell<Option<OuterArms>>,
+        outer_outputs: &'a core::cell::Cell<Option<OuterArms::Outputs>>,
+        cont: Cont,
+        extra: &'a core::cell::Cell<Option<Cont::Extra>>,
+    ) -> Self {
+        Self {
+            map,
+            outer_arms,
+            outer_outputs,
+            cont,
+            extra,
+            _de: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, 'de, M, OuterArms, Cont> Deserializer<'de>
+    for FlattenDeserializer<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    type Error = M::Error;
+    type Claim = M::MapClaim;
+    type EntryClaim = M::MapClaim;
+    type Entry = FlattenEntry<'a, 'de, M, OuterArms, Cont>;
+
+    async fn entry<const N: usize, F, Fut, R>(
+        self,
+        mut f: F,
+    ) -> Result<Probe<(Self::Claim, R)>, Self::Error>
+    where
+        F: FnMut([Self::Entry; N]) -> Fut,
+        Fut: core::future::Future<Output = Result<Probe<(Self::EntryClaim, R)>, Self::Error>>,
+    {
+        assert!(N == 1, "FlattenDeserializer only supports entry<1, ...>");
+        let entry = FlattenEntry {
+            map: self.map,
+            outer_arms: self.outer_arms,
+            outer_outputs: self.outer_outputs,
+            cont: self.cont,
+            extra: self.extra,
+            _de: core::marker::PhantomData,
+        };
+        let mut slot = Some(entry);
+        let entries: [Self::Entry; N] = core::array::from_fn(|_| slot.take().unwrap());
+        f(entries).await
+    }
+}
+
+/// Entry handle produced by [`FlattenDeserializer`].
+pub struct FlattenEntry<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    pub map: M,
+    pub outer_arms: &'a core::cell::Cell<Option<OuterArms>>,
+    pub outer_outputs: &'a core::cell::Cell<Option<OuterArms::Outputs>>,
+    pub cont: Cont,
+    pub extra: &'a core::cell::Cell<Option<Cont::Extra>>,
+    pub _de: core::marker::PhantomData<&'de ()>,
+}
+
+impl<'a, 'de, M, OuterArms, Cont> Entry<'de> for FlattenEntry<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    type Error = M::Error;
+    type Claim = M::MapClaim;
+    type StrChunks = crate::Never<'static, M::MapClaim, M::Error>;
+    type BytesChunks = crate::Never<'static, M::MapClaim, M::Error>;
+    type Map = FlattenMapAccess<'a, 'de, M, OuterArms, Cont>;
+    type Seq = crate::Never<'static, M::MapClaim, M::Error>;
+
+    async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
+        Ok(Probe::Hit(FlattenMapAccess {
+            map: self.map,
+            outer_arms: self.outer_arms,
+            outer_outputs: self.outer_outputs,
+            cont: self.cont,
+            extra: self.extra,
+            _de: core::marker::PhantomData,
+        }))
+    }
+
+    // All other entry methods return Miss - flatten only supports map-shaped types.
+    async fn deserialize_bool(self) -> Result<Probe<(Self::Claim, bool)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_u8(self) -> Result<Probe<(Self::Claim, u8)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_u16(self) -> Result<Probe<(Self::Claim, u16)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_u32(self) -> Result<Probe<(Self::Claim, u32)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_u64(self) -> Result<Probe<(Self::Claim, u64)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_u128(self) -> Result<Probe<(Self::Claim, u128)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_i8(self) -> Result<Probe<(Self::Claim, i8)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_i16(self) -> Result<Probe<(Self::Claim, i16)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_i32(self) -> Result<Probe<(Self::Claim, i32)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_i64(self) -> Result<Probe<(Self::Claim, i64)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_i128(self) -> Result<Probe<(Self::Claim, i128)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_f32(self) -> Result<Probe<(Self::Claim, f32)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_f64(self) -> Result<Probe<(Self::Claim, f64)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_char(self) -> Result<Probe<(Self::Claim, char)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_str(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_bytes(self) -> Result<Probe<(Self::Claim, &'de [u8])>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_null(self) -> Result<Probe<Self::Claim>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_option<T: Deserialize<'de, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_value<T: Deserialize<'de, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    fn fork(&mut self) -> Self {
+        panic!("FlattenEntry::fork called; flatten only supports N=1 entry")
+    }
+    async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        panic!("FlattenEntry::skip called on flatten entry")
+    }
+}
+
+/// [`MapAccess<'de>`] produced by [`FlattenEntry`].
+///
+/// When `iterate(inner_arms)` is called, it takes the outer arms from the
+/// `Cell`, builds `StackConcat(outer_arms, inner_arms)`, and delegates to
+/// `cont.finish(map, combined)`. The continuation either drives the real map
+/// (terminal) or chains to the next flatten field (intermediate).
+pub struct FlattenMapAccess<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    pub map: M,
+    pub outer_arms: &'a core::cell::Cell<Option<OuterArms>>,
+    pub outer_outputs: &'a core::cell::Cell<Option<OuterArms::Outputs>>,
+    pub cont: Cont,
+    pub extra: &'a core::cell::Cell<Option<Cont::Extra>>,
+    pub _de: core::marker::PhantomData<&'de ()>,
+}
+
+impl<'a, 'de, M, OuterArms, Cont> MapAccess<'de> for FlattenMapAccess<'a, 'de, M, OuterArms, Cont>
+where
+    M: MapAccess<'de>,
+    OuterArms: MapArmStack<'de, M::KeyProbe>,
+    Cont: FlattenCont<'de, M>,
+{
+    type Error = M::Error;
+    type MapClaim = M::MapClaim;
+    type KeyProbe = M::KeyProbe;
+
+    fn fork(&mut self) -> Self {
+        panic!("FlattenMapAccess::fork not supported")
+    }
+
+    async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        inner_arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        let outer_arms = self
+            .outer_arms
+            .take()
+            .expect("FlattenMapAccess::iterate called without outer arms");
+        let combined = StackConcat(outer_arms, inner_arms);
+        let (claim, (outer_out, inner_out), extra) =
+            crate::hit!(self.cont.finish(self.map, combined).await);
+        self.outer_outputs.set(Some(outer_out));
+        self.extra.set(Some(extra));
+        Ok(Probe::Hit((claim, inner_out)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Macros for borrow family
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`MapArmStack`] so that unknown map keys are silently consumed (borrow family).
+#[macro_export]
+macro_rules! SkipUnknown {
+    ($inner:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp: $kp| kp.deserialize_key::<$crate::Skip, _>(()),
+                |vp: $vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbe as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+    ($inner:expr) => {{
+        use $crate::MapKeyProbe as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp| kp.deserialize_key::<$crate::Skip, _>(()),
+                |vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbe as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStack`] to return a duplicate-field error (borrow family).
+#[macro_export]
+macro_rules! DetectDuplicates {
+    ($inner:expr, $wire_names:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        let __wn = $wire_names;
+        $crate::DetectDuplicatesOwned::new(
+            $inner,
+            __wn,
+            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize>, _>(__wn),
+            |vp: $vp| vp.skip(),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStack`] to intercept a tag field (borrow family).
+#[macro_export]
+macro_rules! TagInjectingStack {
+    ($inner:expr, $tag_field:expr, $tag_candidates:expr, $tag_value:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        use $crate::MapValueProbe as _;
+        let __tf = $tag_field;
+        let __tc = $tag_candidates;
+        $crate::TagInjectingStackOwned::new(
+            $inner,
+            __tf,
+            __tc,
+            $tag_value,
+            move |kp: $kp| kp.deserialize_key::<$crate::Match, &str>(__tf),
+            move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize>, _>(__tc),
+        )
+    }};
 }
 
 // ---------------------------------------------------------------------------
@@ -469,10 +1474,14 @@ pub trait SeqAccess<'de>: Sized {
 
     /// Proof-of-consumption token returned on sequence exhaustion; must match
     /// the enclosing [`Entry::Claim`].
-    type Claim: 'de;
+    type SeqClaim: 'de;
+
+    /// Proof-of-consumption token produced by [`SeqEntry`] probes; threaded
+    /// back through the closure return value to advance the sequence.
+    type ElemClaim: 'de;
 
     /// Owned handle for one sequence element.  See [`SeqEntry`].
-    type Elem: SeqEntry<'de, Claim = Self::Claim, Error = Self::Error>;
+    type Elem: SeqEntry<'de, Claim = Self::ElemClaim, Error = Self::Error>;
 
     /// Fork a sibling accessor at the same sequence position.
     ///
@@ -482,18 +1491,18 @@ pub trait SeqAccess<'de>: Sized {
     /// Advance to the next element, passing `N` owned [`SeqEntry`] handles to `f`.
     ///
     /// Returns:
-    /// - `Ok(Probe::Hit(Chunk::Data(r)))` — an element was consumed.
-    /// - `Ok(Probe::Hit(Chunk::Done(claim)))` — sequence exhausted.
-    /// - `Ok(Probe::Miss)` — closure returned Miss.
-    /// - `Err(e)` — fatal format error.
-    /// - `Pending` — no data yet.
+    /// - `Ok(Probe::Hit(Chunk::Data(r)))` - an element was consumed.
+    /// - `Ok(Probe::Hit(Chunk::Done(claim)))` - sequence exhausted.
+    /// - `Ok(Probe::Miss)` - closure returned Miss.
+    /// - `Err(e)` - fatal format error.
+    /// - `Pending` - no data yet.
     async fn next<const N: usize, F, Fut, R>(
         self,
         f: F,
-    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::SeqClaim>>, Self::Error>
     where
         F: FnMut([Self::Elem; N]) -> Fut,
-        Fut: Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>;
+        Fut: Future<Output = Result<Probe<(Self::ElemClaim, R)>, Self::Error>>;
 }
 
 /// Owned handle for one element in a sequence.
@@ -526,7 +1535,7 @@ pub trait SeqEntry<'de> {
 }
 
 // ---------------------------------------------------------------------------
-// Never impls — borrow family
+// Never impls - borrow family
 // ---------------------------------------------------------------------------
 
 impl<'n, C, E: DeserializeError> StrAccess for crate::Never<'n, C, E> {
@@ -559,7 +1568,8 @@ impl<'n, C, E: DeserializeError> BytesAccess for crate::Never<'n, C, E> {
 
 impl<'n, 'de, C: 'de, E: DeserializeError> SeqAccess<'de> for crate::Never<'n, C, E> {
     type Error = E;
-    type Claim = C;
+    type SeqClaim = C;
+    type ElemClaim = C;
     type Elem = crate::Never<'n, C, E>;
 
     fn fork(&mut self) -> Self {
@@ -568,10 +1578,10 @@ impl<'n, 'de, C: 'de, E: DeserializeError> SeqAccess<'de> for crate::Never<'n, C
     async fn next<const N: usize, F, Fut, R>(
         self,
         _f: F,
-    ) -> Result<Probe<Chunk<(Self, R), Self::Claim>>, Self::Error>
+    ) -> Result<Probe<Chunk<(Self, R), Self::SeqClaim>>, Self::Error>
     where
         F: FnMut([Self::Elem; N]) -> Fut,
-        Fut: core::future::Future<Output = Result<Probe<(Self::Claim, R)>, Self::Error>>,
+        Fut: core::future::Future<Output = Result<Probe<(Self::ElemClaim, R)>, Self::Error>>,
     {
         match self.0 {}
     }
@@ -590,6 +1600,77 @@ impl<'n, 'de, C: 'de, E: DeserializeError> SeqEntry<'de> for crate::Never<'n, C,
         match self.0 {}
     }
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> MapAccess<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type MapClaim = C;
+    type KeyProbe = crate::Never<'n, C, E>;
+
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+
+    async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        _arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> MapKeyProbe<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type KeyClaim = crate::Never<'n, C, E>;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn deserialize_key<K: Deserialize<'de, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> MapKeyClaim<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type MapClaim = C;
+    type ValueProbe = crate::Never<'n, C, E>;
+    async fn into_value_probe(self) -> Result<Self::ValueProbe, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> MapValueProbe<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type MapClaim = C;
+    type ValueClaim = crate::Never<'n, C, E>;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn deserialize_value<V: Deserialize<'de, Extra>, Extra>(
+        self,
+        _extra: Extra,
+    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error> {
+        match self.0 {}
+    }
+    async fn skip(self) -> Result<Self::ValueClaim, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, 'de, C: 'de, E: DeserializeError> MapValueClaim<'de> for crate::Never<'n, C, E> {
+    type Error = E;
+    type KeyProbe = crate::Never<'n, C, E>;
+    type MapClaim = C;
+    async fn next_key(
+        self,
+        _unsatisfied: usize,
+        _open: usize,
+    ) -> Result<NextKey<Self::KeyProbe, Self::MapClaim>, Self::Error> {
         match self.0 {}
     }
 }

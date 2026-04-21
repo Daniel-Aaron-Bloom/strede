@@ -1,4 +1,4 @@
-//! Shared buffer barrier — zero-alloc, no_std async multi-reader primitive.
+//! Shared buffer barrier - zero-alloc, no_std async multi-reader primitive.
 //!
 //! A [`SharedBuf`] holds a raw pointer to an externally-owned buffer slice
 //! and a loader closure that produces successive buffers.  Any number of
@@ -20,11 +20,12 @@
 //! [`Handle`] or pending wait future is alive (both hold `&'s SharedBuf`).
 //! [`Handle::fork`] takes `&mut self` on a [`Handle`], which can only exist
 //! when `remaining > 0`.  Together these make the only callable `fork` paths
-//! exactly the ones in which the load state is `Idle` — no waiter or
+//! exactly the ones in which the load state is `Idle` - no waiter or
 //! drop-triggered `Loading` state can race with `fork`.  The `remaining == 0`
 //! condition signals that a load is needed; once all waiters drop, `remaining`
 //! is already 0 and the current buffer is still valid.
 
+use core::cell::RefCell;
 use core::{
     cell::{Cell, UnsafeCell},
     future::Future,
@@ -32,7 +33,6 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use std::cell::RefCell;
 use pin_list::{InitializedNode, NodeData, PinList, id::Unchecked};
 use pin_project::{pin_project, pinned_drop};
 
@@ -72,18 +72,14 @@ impl Buffer for &mut [u8] {
 // pin-list type bundle
 // ---------------------------------------------------------------------------
 
-type WaiterTypes = dyn pin_list::Types<
-    Id = Unchecked,
-    Protected = Waker,
-    Removed = (),
-    Unprotected = usize,
->;
+type WaiterTypes =
+    dyn pin_list::Types<Id = Unchecked, Protected = Waker, Removed = (), Unprotected = usize>;
 
 // ---------------------------------------------------------------------------
-// List — safe Cell wrapper around PinList
+// List - safe Cell wrapper around PinList
 // ---------------------------------------------------------------------------
 
-// WakerLists was here — fields inlined into SharedBufData.
+// WakerLists was here - fields inlined into SharedBufData.
 
 // ---------------------------------------------------------------------------
 // LoadState
@@ -103,7 +99,7 @@ enum LoadState<F> {
 }
 
 // ---------------------------------------------------------------------------
-// LoaderGuard — drop guard that reinstates the loader on cancellation
+// LoaderGuard - drop guard that reinstates the loader on cancellation
 // ---------------------------------------------------------------------------
 
 /// Holds the loader while it is checked out of `load_state`.  On drop,
@@ -171,11 +167,10 @@ struct SharedBufData<B: Buffer, F: AsyncFnMut(&mut B)> {
 pub struct SharedBuf<'s, B: Buffer, F: AsyncFnMut(&mut B)>(&'s SharedBufData<B, F>);
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Clone for SharedBuf<'s, B, F> {
     fn clone(&self) -> Self {
-        Self(self.0)
+        *self
     }
 }
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Copy for SharedBuf<'s, B, F> {
-}
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Copy for SharedBuf<'s, B, F> {}
 
 // SAFETY: single-threaded use enforced by !Sync.
 unsafe impl<B: Send + Buffer, F: Send + AsyncFnMut(&mut B)> Send for SharedBufData<B, F> {}
@@ -244,7 +239,9 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     /// a waiter was woken, `false` if the list was empty.
     #[inline]
     fn wake_one(&self) -> bool {
-        let Some(waker) = self.remove_active_front() else { return false };
+        let Some(waker) = self.remove_active_front() else {
+            return false;
+        };
         waker.wake();
         true
     }
@@ -257,7 +254,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
         // The list is swapped out so waker.wake() cannot re-enter and append to the list
         self.active.swap(&self.clear);
         self.remaining.set(self.total.get());
-        // Drain wakers —
+        // Drain wakers -
         while let Some(waker) = self.remove_clear_front() {
             waker.wake();
         }
@@ -268,13 +265,24 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     }
 
     fn remove_active_front(&self) -> Option<Waker> {
-        self.active.borrow_mut().cursor_front_mut().remove_current(()).ok()
+        self.active
+            .borrow_mut()
+            .cursor_front_mut()
+            .remove_current(())
+            .ok()
     }
     fn remove_clear_front(&self) -> Option<Waker> {
-        self.clear.borrow_mut().cursor_front_mut().remove_current(()).ok()
+        self.clear
+            .borrow_mut()
+            .cursor_front_mut()
+            .remove_current(())
+            .ok()
     }
 
-    fn reset_node<'a, 'b: 'c, 'c>(&'a self, initialized: Pin<&'b mut InitializedNode<'c, WaiterTypes>>) -> (NodeData<WaiterTypes>, usize) {
+    fn reset_node<'a, 'b: 'c, 'c>(
+        &'a self,
+        initialized: Pin<&'b mut InitializedNode<'c, WaiterTypes>>,
+    ) -> (NodeData<WaiterTypes>, usize) {
         if *initialized.unprotected() == self.epoch.get() {
             initialized.reset(&mut *self.active.borrow_mut())
         } else {
@@ -316,7 +324,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     ///
     /// The loader mutates `self.buf` in place via an `&mut B` reborrowed from
     /// the `UnsafeCell`.  This is sound because loads only run when
-    /// `remaining == 0` — no live `Handle` exists, so no concurrent
+    /// `remaining == 0` - no live `Handle` exists, so no concurrent
     /// `Handle::buf()` can alias the `&mut`.
     async fn run_loader(&self) {
         let mut guard = self.checkout_loader();
@@ -348,7 +356,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
 ///
 /// Dropping a `Handle` without calling [`next`] is treated as if `next` were
 /// called (it decrements `remaining`), but the handle is permanently removed
-/// from the pool — `total` decrements too.
+/// from the pool - `total` decrements too.
 ///
 /// [`next`]: Handle::next
 pub struct Handle<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
@@ -386,7 +394,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
         let shared = self.shared;
         let id = self.id;
 
-        // Suppress the Drop impl — we handle counting manually below.
+        // Suppress the Drop impl - we handle counting manually below.
         mem::forget(self);
 
         let remaining = shared.remaining.get() - 1;
@@ -440,7 +448,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for Handle<'s, B, F> {
         self.shared.total.set(total.saturating_sub(1));
         if remaining == 0 && self.shared.total.get() > 0 {
             // WaitFutures are still alive.  The first one to re-poll will
-            // see remaining == 0 and drive the load.  Wake only ONE — the
+            // see remaining == 0 and drive the load.  Wake only ONE - the
             // loader takes time (async) and we don't want other waiters to
             // race ahead and observe a stale buffer before the load
             // completes.  After the load, wake_all is called from
@@ -458,8 +466,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Drop for Handle<'s, B, F> {
 /// non-last handles.  Resolves to a new [`Handle`] once the last handle
 /// calls the loader.
 ///
-/// Uses `pin_project` to safely project through to the pinned
-/// `pin_list::Node` without manual `unsafe` pin projections.
+/// Uses `pin_project` to safely project through to the pinned `pin_list::Node`.
 #[pin_project(PinnedDrop)]
 struct WaitFuture<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     shared: &'s SharedBufData<B, F>,
@@ -472,7 +479,8 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> WaitFuture<'s, B, F> {
         WaitFuture {
             shared,
             node: pin_list::Node::new(),
-        }.await
+        }
+        .await
     }
 }
 
@@ -485,8 +493,11 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
         if !this.node.is_initial() {
             // Re-poll path.  The node is initialized (linked or removed).
             // If it was removed by wake_one/wake_all, we were genuinely woken.
-            // If still linked, this is a spurious re-poll — refresh the waker.
-            let initialized = this.node.initialized_mut().expect("node must be initialized when waiting");
+            // If still linked, this is a spurious re-poll - refresh the waker.
+            let initialized = this
+                .node
+                .initialized_mut()
+                .expect("node must be initialized when waiting");
             let list = &mut *this.shared.active.borrow_mut();
             return match initialized.take_removed(list) {
                 Ok((_removed, _epoch)) => {
@@ -495,8 +506,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
                 }
                 Err(still_linked) => {
                     // Spurious re-poll; refresh the waker.
-                    *still_linked.protected_mut(list).unwrap() =
-                        cx.waker().clone();
+                    *still_linked.protected_mut(list).unwrap() = cx.waker().clone();
                     Poll::Pending
                 }
             };
@@ -512,7 +522,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Future for WaitFuture<'s, B, F> {
         // Insert into the waiter list and store the waker.
         // push_front = head insertion = LIFO order, matching original behavior.
         let waker = cx.waker().clone();
-        this.shared.active.borrow_mut().push_front(this.node, waker, epoch);
+        this.shared
+            .active
+            .borrow_mut()
+            .push_front(this.node, waker, epoch);
         Poll::Pending
     }
 }
@@ -523,18 +536,21 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> PinnedDrop for WaitFuture<'s, B, F> {
         let this = self.project();
 
         if this.node.is_initial() {
-            // Finished normally or never polled — nothing to clean up.
+            // Finished normally or never polled - nothing to clean up.
             return;
         }
 
         // The node is initialized.  Determine whether it was removed (woken)
         // or is still linked (not yet woken).
-        let initialized = this.node.initialized_mut().expect("node must be initialized when waiting");
+        let initialized = this
+            .node
+            .initialized_mut()
+            .expect("node must be initialized when waiting");
 
         match this.shared.reset_node(initialized) {
             // Were in the list, but never woken: `reset` unlinked us.
             // We've never been "alive", so not yet counted in the new epoch's remaining.
-            (pin_list::NodeData::Linked(_waker), epoch) if epoch == this.shared.epoch.get() => {},
+            (pin_list::NodeData::Linked(_waker), epoch) if epoch == this.shared.epoch.get() => {}
             // Were in the list, epoch has switch so we were about to be woken up,
             // but we dropped for some reason before our time. We were counted in remaining since
             // we were in the list at wake time. Decrement remaining since no Handle will be created.
@@ -554,7 +570,8 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> PinnedDrop for WaitFuture<'s, B, F> {
             // Removed from list by a wake-all
             (pin_list::NodeData::Removed(()), _epoch) => {
                 debug_assert_ne!(
-                    this.shared.phase(), LoadState::Loading,
+                    this.shared.phase(),
+                    LoadState::Loading,
                     "WaitFuture::drop: Phase::Loading should be unreachable"
                 );
                 // We're counted in the new epoch; decrement it now since
@@ -691,14 +708,14 @@ mod tests {
                 let mut h0 = shared.fork();
                 let h1 = h0.fork();
 
-                // h0 calls next first — not the last (remaining 2→1) → Pending.
+                // h0 calls next first - not the last (remaining 2→1) → Pending.
                 let mut fut0 = core::pin::pin!(h0.next());
                 match poll_once(fut0.as_mut()) {
                     Poll::Pending => {}
                     Poll::Ready(_) => panic!("h0 should pend"),
                 }
 
-                // h1 calls next — last (remaining 1→0) → loads b"defghi", wakes h0.
+                // h1 calls next - last (remaining 1→0) → loads b"defghi", wakes h0.
                 let mut fut1 = core::pin::pin!(h1.next());
                 let h1_new = match poll_once(fut1.as_mut()) {
                     Poll::Ready(h) => h,
@@ -810,7 +827,7 @@ mod tests {
                 let mut h0 = shared.fork(); // total=2, remaining=2
                 let h1 = h0.fork();
 
-                // Drop h0 without calling next — Drop decrements remaining.
+                // Drop h0 without calling next - Drop decrements remaining.
                 drop(h0);
 
                 // h1 is now the last (remaining=1 → 0 on next()).
@@ -856,7 +873,7 @@ mod tests {
                 assert_eq!(h0_new.buf(), b"loaded");
 
                 // The new Handle is in a consistent state: remaining=total=1.
-                // Verify by reading via the handle's shared ref — going through
+                // Verify by reading via the handle's shared ref - going through
                 // `shared` directly here would conflict with h0_new's borrow.
                 assert_eq!(h0_new.shared.total.get(), 1);
                 assert_eq!(h0_new.shared.remaining.get(), 1);
@@ -941,7 +958,7 @@ mod tests {
                 assert!(matches!(poll_once(fut1.as_mut()), Poll::Pending));
 
                 // fut0 was NOT woken.  Polling it spuriously must NOT advance
-                // — the load is still in progress, so it must stay Pending.
+                // - the load is still in progress, so it must stay Pending.
                 assert!(matches!(poll_once(fut0.as_mut()), Poll::Pending));
 
                 // Drive fut1 to completion: yield_now resolves, loader returns
@@ -1022,7 +1039,7 @@ mod tests {
 
     /// Regression: a waiter is woken because remaining==0, re-polls and enters
     /// `run_loader`, but is cancelled mid-load.  `LoaderGuard` restores `Idle`
-    /// and hands the baton to another queued waiter — otherwise remaining
+    /// and hands the baton to another queued waiter - otherwise remaining
     /// waiters deadlock (their stored waker is never fired again).
     #[test]
     fn cancelled_waiter_during_needs_load_hands_off_to_next_waiter() {
@@ -1059,7 +1076,7 @@ mod tests {
                 }
 
                 // fut0 must now be able to see remaining==0 and complete the
-                // load itself.  Bounded to avoid hanging on regression — the
+                // load itself.  Bounded to avoid hanging on regression - the
                 // loader only yields once, so completion needs at most 2 polls.
                 let mut h0_new = None;
                 for _ in 0..8 {
@@ -1109,7 +1126,7 @@ mod tests {
                     Poll::Pending => panic!("h2 should be Ready (last handle)"),
                 };
 
-                // Poll fut1 — it was woken (removed from list), returns Ready.
+                // Poll fut1 - it was woken (removed from list), returns Ready.
                 let _h1_new = match poll_once(fut1.as_mut()) {
                     Poll::Ready(h) => h,
                     Poll::Pending => panic!("fut1 should be Ready after wake"),
@@ -1117,7 +1134,8 @@ mod tests {
 
                 // Drop fut0 without re-polling.  Its node has epoch=1 but
                 // current epoch is 2, so reset_node must use the clear list.
-                // (banana — Removed, needs_load false)
+                // (banana - Removed, needs_load false)
+                #[allow(clippy::drop_non_drop)]
                 drop(fut0);
             },
         );
@@ -1165,64 +1183,15 @@ mod tests {
 
                 // Drop fut0: stale epoch, Removed, needs_load → mango branch.
                 // Must wake_one (no-op here since no other waiters).
+                #[allow(clippy::drop_non_drop)]
                 drop(fut0);
             },
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Re-entrant waker helpers
-    // -----------------------------------------------------------------------
-
-    /// A waker backed by a `Cell<Option<RawAction>>`.  When woken it takes
-    /// the stored action and calls it.  The action is a type-erased `FnOnce()`
-    /// stored as a raw pointer + caller pair, sidestepping `'static` bounds.
-    ///
-    /// SAFETY contract: the action must be consumed or dropped before the
-    /// captured data goes out of scope.  All uses in these tests fire
-    /// synchronously inside `load_and_wake`, which returns before the
-    /// captured pinned futures are dropped.
-    struct RawAction {
-        data: *mut (),
-        call: unsafe fn(*mut ()),
-    }
-    // SAFETY: single-threaded tests only.
-    unsafe impl Send for RawAction {}
-
-    impl RawAction {
-        /// Create from a concrete `FnOnce()`.  Caller must ensure `f` is
-        /// not dropped before `call` is invoked (or the RawAction is
-        /// discarded).
-        fn new<F: FnOnce()>(f: F) -> Self {
-            let boxed = Box::into_raw(Box::new(f));
-            RawAction {
-                data: boxed as *mut (),
-                call: |ptr| unsafe { Box::from_raw(ptr as *mut F)() },
-            }
-        }
-    }
-
-    fn reentrant_waker(slot: &Cell<Option<RawAction>>) -> Waker {
-        use std::task::{RawWaker, RawWakerVTable};
-
-        let ptr = slot as *const Cell<Option<RawAction>> as *const ();
-        unsafe fn clone(ptr: *const ()) -> RawWaker { RawWaker::new(ptr, &VTABLE) }
-        unsafe fn wake(ptr: *const ()) {
-            let cell = unsafe { &*(ptr as *const Cell<Option<RawAction>>) };
-            if let Some(action) = cell.take() { unsafe { (action.call)(action.data) }; }
-        }
-        unsafe fn wake_ref(ptr: *const ()) {
-            let cell = unsafe { &*(ptr as *const Cell<Option<RawAction>>) };
-            if let Some(action) = cell.take() { unsafe { (action.call)(action.data) }; }
-        }
-        unsafe fn drop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_ref, drop);
-        unsafe { Waker::from_raw(RawWaker::new(ptr, &VTABLE)) }
-    }
-
     /// Re-entrant wake during `load_and_wake`'s drain of the clear list.
     /// fut1 is at the head (pushed last via push_front).  Its re-entrant
-    /// waker synchronously polls fut1 to Ready, then drops fut0 — which is
+    /// waker synchronously polls fut1 to Ready, then drops fut0 - which is
     /// still linked in `clear` (not yet drained).  This exercises the apple
     /// branch (Linked + stale epoch) on the clear list.
     #[test]
@@ -1244,8 +1213,8 @@ mod tests {
                 // waker can poll fut1 and drop fut0 during the wake call.
                 // SAFETY: both futures are pinned on the stack and outlive the
                 // waker usage (the waker fires synchronously inside this scope).
-                let fut0_storage: Cell<Option<RawAction>> = Cell::new(None);
-                let _fut1_storage: Cell<Option<RawAction>> = Cell::new(None);
+                let fut0_storage: Cell<Option<strede_test_util::RawAction>> = Cell::new(None);
+                let _fut1_storage: Cell<Option<strede_test_util::RawAction>> = Cell::new(None);
 
                 // Poll fut1 with noop waker first (pushed first → tail of list).
                 // Wrapped in ManuallyDrop so the re-entrant drop_in_place
@@ -1263,7 +1232,7 @@ mod tests {
                 // When woken, the closure will drop fut1 (still linked at tail).
                 let mut fut0 = core::pin::pin!(h0.next());
                 {
-                    let w = reentrant_waker(&fut0_storage);
+                    let w = strede_test_util::reentrant_waker(&fut0_storage);
                     let mut cx = Context::from_waker(&w);
                     assert!(matches!(fut0.as_mut().poll(&mut cx), Poll::Pending));
                 }
@@ -1277,12 +1246,12 @@ mod tests {
                     unsafe { core::ptr::drop_in_place(ptr as *mut T) };
                 }
                 let token = type_token(unsafe { &**fut1.as_mut().get_unchecked_mut() });
-                let fut1_raw: *mut () = unsafe { &mut **fut1.as_mut().get_unchecked_mut() }
-                    as *mut _ as *mut ();
+                let fut1_raw: *mut () =
+                    unsafe { &mut **fut1.as_mut().get_unchecked_mut() } as *mut _ as *mut ();
                 // SAFETY: the raw pointer targets a pinned stack future that
                 // is alive when the re-entrant waker fires (synchronously
                 // during load_and_wake, before this scope exits).
-                fut0_storage.set(Some(RawAction::new(move || {
+                fut0_storage.set(Some(strede_test_util::RawAction::new(move || {
                     drop_erased(token, fut1_raw);
                 })));
 
@@ -1297,7 +1266,7 @@ mod tests {
 
                 // fut1 was already drop_in_place'd inside the re-entrant
                 // wake.  ManuallyDrop prevents a second drop at scope exit.
-                // fut0 is still alive — its waker fired but it was never
+                // fut0 is still alive - its waker fired but it was never
                 // polled to Ready.  Let it drop normally.
             },
         );

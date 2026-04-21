@@ -1,6 +1,18 @@
 use convert_case::{Case, Casing};
 use syn::{Fields, Token};
 
+/// Whether a field is flattened and, if so, whether it opts into heap allocation
+/// to break deeply-nested async state-machine chains that would overflow the stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlattenMode {
+    /// Not flattened.
+    None,
+    /// `#[strede(flatten)]` - zero-alloc; may stack-overflow with 3+ flatten fields.
+    Plain,
+    /// `#[strede(flatten(boxed))]` - heap-allocates to break the async chain.
+    Boxed,
+}
+
 // ---------------------------------------------------------------------------
 // Variant classification
 // ---------------------------------------------------------------------------
@@ -101,7 +113,7 @@ pub fn classify_variants<'a>(
         });
     }
 
-    // `other` cannot coexist with untagged variants — the fallback semantics conflict.
+    // `other` cannot coexist with untagged variants - the fallback semantics conflict.
     if out.iter().any(|cv| cv.other) && out.iter().any(|cv| cv.untagged) {
         let other_variant = out.iter().find(|cv| cv.other).unwrap();
         return Err(syn::Error::new_spanned(
@@ -206,14 +218,17 @@ pub struct ContainerAttrs {
     /// When `Some`, replaces all auto-generated where-clause predicates in the
     /// outer `impl` block.  An empty `Vec` suppresses all bounds.
     pub bound: Option<Vec<syn::WherePredicate>>,
-    /// `#[strede(from = "FromType")]` — deserialize `FromType`, then call `Self::from(v)`.
+    /// `#[strede(from = "FromType")]` - deserialize `FromType`, then call `Self::from(v)`.
     pub from: Option<syn::Type>,
-    /// `#[strede(try_from = "FromType")]` — deserialize `FromType`, then call
+    /// `#[strede(try_from = "FromType")]` - deserialize `FromType`, then call
     /// `Self::try_from(v).ok()`, returning `Probe::Miss` on failure.
     pub try_from: Option<syn::Type>,
-    /// `#[strede(tag = "field")]` — internally tagged enum; the named field in the map
+    /// `#[strede(tag = "field")]` - internally tagged enum; the named field in the map
     /// is the variant discriminant.
     pub tag: Option<String>,
+    /// `#[strede(content = "field")]` - adjacently tagged enum; the named field holds
+    /// the variant payload. Requires `tag` to also be set.
+    pub content: Option<String>,
 }
 
 pub struct VariantAttrs {
@@ -223,29 +238,60 @@ pub struct VariantAttrs {
     pub other: bool,
 }
 
+/// Controls how `'de: 'lifetime` bounds are inferred for borrow-family derives.
+#[derive(Clone)]
+pub enum BorrowAttr {
+    /// `#[strede(borrow)]` - emit `'de: 'a` for every lifetime in the field type.
+    All,
+    /// `#[strede(borrow = "'a, 'b")]` - emit `'de: 'a` only for the listed lifetimes.
+    Explicit(Vec<syn::Lifetime>),
+}
+
 pub struct FieldAttrs {
     pub rename: Option<String>,
     pub aliases: Vec<String>,
     pub default: Option<DefaultAttr>,
     pub skip_deserializing: bool,
+    pub flatten: FlattenMode,
     pub deserialize_with: Option<syn::ExprPath>,
     pub deserialize_owned_with: Option<syn::ExprPath>,
     /// When `Some`, replaces the auto-generated bound for this field's type.
     /// An empty `Vec` suppresses the bound entirely.
     pub bound: Option<Vec<syn::WherePredicate>>,
-    /// `#[strede(from = "FromType")]` — deserialize `FromType`, then call `FieldType::from(v)`.
+    /// `#[strede(from = "FromType")]` - deserialize `FromType`, then call `FieldType::from(v)`.
     pub from: Option<syn::Type>,
-    /// `#[strede(try_from = "FromType")]` — deserialize `FromType`, then call
+    /// `#[strede(try_from = "FromType")]` - deserialize `FromType`, then call
     /// `FieldType::try_from(v).ok()`, returning `Probe::Miss` on failure.
     pub try_from: Option<syn::Type>,
+    /// Controls `'de: 'a` bound inference for the borrow-family derive.
+    pub borrow: Option<BorrowAttr>,
 }
 
 pub enum DefaultAttr {
-    /// `#[strede(default)]` — calls `Default::default()`
+    /// `#[strede(default)]` - calls `Default::default()`
     Trait,
-    /// `#[strede(default = "expr")]` — evaluates `expr` via `DefaultWrapper`.
+    /// `#[strede(default = "expr")]` - evaluates `expr` via `DefaultWrapper`.
     /// If `expr` is a function path it gets called; otherwise the value is used as-is.
     Expr(syn::Expr),
+}
+
+fn parse_borrow_lifetimes(lit: &syn::LitStr) -> syn::Result<Vec<syn::Lifetime>> {
+    let s = lit.value();
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    // Split on '+' or ',' (supports both "'a + 'b" and "'a, 'b").
+    let mut lifetimes = Vec::new();
+    for part in s.split(['+', ',']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let lt: syn::Lifetime = syn::parse_str(part).map_err(|e| syn::Error::new(lit.span(), e))?;
+        lifetimes.push(lt);
+    }
+    Ok(lifetimes)
 }
 
 fn parse_bound_predicates(lit: &syn::LitStr) -> syn::Result<Vec<syn::WherePredicate>> {
@@ -269,6 +315,7 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
     let mut from: Option<syn::Type> = None;
     let mut try_from: Option<syn::Type> = None;
     let mut tag: Option<String> = None;
+    let mut content: Option<String> = None;
     for attr in attrs {
         if !attr.path().is_ident("strede") {
             continue;
@@ -320,6 +367,11 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
                 let s: syn::LitStr = value.parse()?;
                 tag = Some(s.value());
                 Ok(())
+            } else if meta.path.is_ident("content") {
+                let value = meta.value()?;
+                let s: syn::LitStr = value.parse()?;
+                content = Some(s.value());
+                Ok(())
             } else {
                 Err(meta.error("unknown strede attribute"))
             }
@@ -332,6 +384,12 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
             "cannot use both #[strede(from)] and #[strede(try_from)] on the same item",
         ));
     }
+    if content.is_some() && tag.is_none() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[strede(content)] requires #[strede(tag)] to also be set",
+        ));
+    }
     Ok(ContainerAttrs {
         untagged,
         allow_unknown_fields,
@@ -342,6 +400,7 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
         from,
         try_from,
         tag,
+        content,
     })
 }
 
@@ -389,12 +448,14 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
     let mut aliases = Vec::new();
     let mut default = None;
     let mut skip_deserializing = false;
+    let mut flatten = FlattenMode::None;
     let mut deserialize_with = None;
     let mut deserialize_owned_with = None;
     let mut with_module: Option<syn::ExprPath> = None;
     let mut bound: Option<Vec<syn::WherePredicate>> = None;
     let mut from: Option<syn::Type> = None;
     let mut try_from: Option<syn::Type> = None;
+    let mut borrow: Option<BorrowAttr> = None;
     for attr in attrs {
         if !attr.path().is_ident("strede") {
             continue;
@@ -422,6 +483,20 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 Ok(())
             } else if meta.path.is_ident("skip_deserializing") {
                 skip_deserializing = true;
+                Ok(())
+            } else if meta.path.is_ident("flatten") {
+                if meta.input.peek(syn::token::Paren) {
+                    // flatten(boxed)
+                    let inner;
+                    syn::parenthesized!(inner in meta.input);
+                    let ident: syn::Ident = inner.parse()?;
+                    if ident != "boxed" {
+                        return Err(syn::Error::new_spanned(ident, "expected `flatten(boxed)`"));
+                    }
+                    flatten = FlattenMode::Boxed;
+                } else {
+                    flatten = FlattenMode::Plain;
+                }
                 Ok(())
             } else if meta.path.is_ident("deserialize_with") {
                 let value = meta.value()?;
@@ -453,6 +528,15 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 let s: syn::LitStr = value.parse()?;
                 try_from = Some(s.parse()?);
                 Ok(())
+            } else if meta.path.is_ident("borrow") {
+                if meta.input.peek(syn::Token![=]) {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    borrow = Some(BorrowAttr::Explicit(parse_borrow_lifetimes(&lit)?));
+                } else {
+                    borrow = Some(BorrowAttr::All);
+                }
+                Ok(())
             } else {
                 Err(meta.error("unknown strede attribute"))
             }
@@ -483,18 +567,64 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
              #[strede(deserialize_with)] / #[strede(deserialize_owned_with)] / #[strede(with)]",
         ));
     }
+    if flatten != FlattenMode::None {
+        if rename.is_some() || !aliases.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[strede(flatten)] cannot be combined with #[strede(rename)] or #[strede(alias)]",
+            ));
+        }
+        if default.is_some() || skip_deserializing {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[strede(flatten)] cannot be combined with #[strede(default)] or #[strede(skip_deserializing)]",
+            ));
+        }
+        if deserialize_with.is_some() || deserialize_owned_with.is_some() || has_from {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[strede(flatten)] cannot be combined with #[strede(deserialize_with)] / #[strede(with)] / #[strede(from)] / #[strede(try_from)]",
+            ));
+        }
+    }
 
     Ok(FieldAttrs {
         rename,
         aliases,
         default,
         skip_deserializing,
+        flatten,
         deserialize_with,
         deserialize_owned_with,
         bound,
         from,
         try_from,
+        borrow,
     })
+}
+
+/// Extend `wc` with `'de: 'a` bounds for one field in the borrow family.
+///
+/// Priority:
+/// 1. If `field_bound` is `Some(preds)`: use those (empty = suppress).
+/// 2. Else if `has_custom_deserializer`: skip (the wrapper handles its own bound).
+/// 3. Else: extract lifetimes from the type and emit `'de: 'lt` for each.
+pub fn apply_borrow_field_bound(
+    wc: &mut syn::WhereClause,
+    ty: &syn::Type,
+    field_bound: &Option<Vec<syn::WherePredicate>>,
+    has_custom_deserializer: bool,
+    borrow_attr: &Option<BorrowAttr>,
+) {
+    match field_bound {
+        Some(preds) => wc.predicates.extend(preds.iter().cloned()),
+        None if has_custom_deserializer => {}
+        None => {
+            for lt in borrow_lifetimes(ty, borrow_attr) {
+                wc.predicates.push(syn::parse_quote!('de: #lt));
+            }
+        }
+    }
 }
 
 /// Extend `wc` with the appropriate predicates for one field.
@@ -538,12 +668,15 @@ pub struct ClassifiedField {
     pub aliases: Vec<String>,
     pub default: Option<DefaultAttr>,
     pub skip_deserializing: bool,
+    pub flatten: FlattenMode,
     pub deserialize_with: Option<syn::ExprPath>,
     pub deserialize_owned_with: Option<syn::ExprPath>,
     /// When `Some`, replaces the auto-generated bound for this field's type.
     pub bound: Option<Vec<syn::WherePredicate>>,
     pub from: Option<syn::Type>,
     pub try_from: Option<syn::Type>,
+    /// Controls `'de: 'a` bound inference for the borrow-family derive.
+    pub borrow: Option<BorrowAttr>,
 }
 
 /// Classify struct fields, extracting wire names, default, and skip attributes.
@@ -573,12 +706,125 @@ pub fn classify_fields(
                 aliases: attrs.aliases,
                 default: attrs.default,
                 skip_deserializing: attrs.skip_deserializing,
+                flatten: attrs.flatten,
                 deserialize_with: attrs.deserialize_with,
                 deserialize_owned_with: attrs.deserialize_owned_with,
                 bound: attrs.bound,
                 from: attrs.from,
                 try_from: attrs.try_from,
+                borrow: attrs.borrow,
             })
         })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Borrow-family lifetime extraction
+// ---------------------------------------------------------------------------
+
+/// Collect all lifetimes that appear anywhere in a type.
+fn all_lifetimes_in_type(ty: &syn::Type) -> Vec<syn::Lifetime> {
+    let mut out = Vec::new();
+    collect_lifetimes_recursive(ty, &mut out);
+    out
+}
+
+fn collect_lifetimes_recursive(ty: &syn::Type, out: &mut Vec<syn::Lifetime>) {
+    match ty {
+        syn::Type::Reference(r) => {
+            if let Some(lt) = &r.lifetime
+                && !out.iter().any(|l| l.ident == lt.ident)
+            {
+                out.push(lt.clone());
+            }
+            collect_lifetimes_recursive(&r.elem, out);
+        }
+        syn::Type::Path(p) => {
+            if let Some(qself) = &p.qself {
+                collect_lifetimes_recursive(&qself.ty, out);
+            }
+            for seg in &p.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        match arg {
+                            syn::GenericArgument::Lifetime(lt) => {
+                                if !out.iter().any(|l| l.ident == lt.ident) {
+                                    out.push(lt.clone());
+                                }
+                            }
+                            syn::GenericArgument::Type(t) => {
+                                collect_lifetimes_recursive(t, out);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        syn::Type::Tuple(t) => {
+            for elem in &t.elems {
+                collect_lifetimes_recursive(elem, out);
+            }
+        }
+        syn::Type::Array(a) => collect_lifetimes_recursive(&a.elem, out),
+        syn::Type::Slice(s) => collect_lifetimes_recursive(&s.elem, out),
+        syn::Type::Paren(p) => collect_lifetimes_recursive(&p.elem, out),
+        syn::Type::Group(g) => collect_lifetimes_recursive(&g.elem, out),
+        _ => {}
+    }
+}
+
+/// Collect lifetimes from the "obvious" borrowing positions in a type:
+/// `&'a T`, `&'a mut T`, and `Cow<'a, T>`.  Does not recurse into nested
+/// generics beyond the outermost layer - only picks up lifetimes that are
+/// directly visible at the top-level type structure.
+fn auto_borrow_lifetimes(ty: &syn::Type) -> Vec<syn::Lifetime> {
+    let mut out = Vec::new();
+    auto_borrow_lifetimes_inner(ty, &mut out);
+    out
+}
+
+fn auto_borrow_lifetimes_inner(ty: &syn::Type, out: &mut Vec<syn::Lifetime>) {
+    match ty {
+        syn::Type::Reference(r) => {
+            if let Some(lt) = &r.lifetime
+                && !out.iter().any(|l| l.ident == lt.ident)
+            {
+                out.push(lt.clone());
+            }
+        }
+        syn::Type::Path(p) => {
+            // Check for Cow<'a, ...>
+            if let Some(seg) = p.path.segments.last()
+                && seg.ident == "Cow"
+                && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+            {
+                for arg in &args.args {
+                    if let syn::GenericArgument::Lifetime(lt) = arg
+                        && !out.iter().any(|l| l.ident == lt.ident)
+                    {
+                        out.push(lt.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Determine which `'de: 'a` bounds to emit for a field type in the borrow family.
+///
+/// Returns a list of lifetimes for which `'de: 'lifetime` should be added.
+/// Excludes `'de` itself (no need for `'de: 'de`).
+pub fn borrow_lifetimes(ty: &syn::Type, borrow_attr: &Option<BorrowAttr>) -> Vec<syn::Lifetime> {
+    let lifetimes = match borrow_attr {
+        Some(BorrowAttr::All) => all_lifetimes_in_type(ty),
+        Some(BorrowAttr::Explicit(lts)) => lts.clone(),
+        None => auto_borrow_lifetimes(ty),
+    };
+    // Filter out 'de - `'de: 'de` is trivially true.
+    lifetimes
+        .into_iter()
+        .filter(|lt| lt.ident != "de")
         .collect()
 }

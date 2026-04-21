@@ -13,7 +13,7 @@ readme = "../README.md"
 [features]
 default = ["std"]
 std = ["alloc"]
-alloc = []
+alloc = ["strede-derive/alloc"]
 rc = []
 
 [dependencies]

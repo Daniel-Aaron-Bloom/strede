@@ -15,7 +15,7 @@ pub(crate) enum StrChunk<'a> {
 /// State saved when an escape sequence is split across buffer boundaries.
 ///
 /// - `Backslash`: the `\` was the last byte in the buffer; the escape character
-///   (`n`, `"`, `u`, …) arrives in the next buffer.
+///   (`n`, `"`, `u`, ...) arrives in the next buffer.
 /// - `Unicode { digits, value }`: `\u` plus `digits` hex digits were available;
 ///   `4 - digits` more hex digits are expected in the next buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,7 @@ fn parse_hex_digit(b: u8) -> Option<u32> {
 ///
 /// When a buffer boundary falls inside an escape sequence, `next_chunk` saves the
 /// partial state in `self.partial` and returns
-/// `Ok(Some(StrChunk::Slice("")))` — an empty slice that lets the caller feed the
+/// `Ok(Some(StrChunk::Slice("")))` - an empty slice that lets the caller feed the
 /// next buffer without ending or erroring the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StrAccess {
@@ -209,14 +209,14 @@ impl StrAccess {
 
     /// Yield the next chunk of the current JSON string.
     ///
-    /// - `Ok(Some(Slice(s)))` — unescaped content (zero-copy); `s` may be empty
+    /// - `Ok(Some(Slice(s)))` - unescaped content (zero-copy); `s` may be empty
     ///   when an escape sequence was split across a buffer boundary (call again
     ///   with the next buffer).
-    /// - `Ok(Some(Char(c)))` — a fully-decoded escape sequence.
-    /// - `Ok(None)` — closing `"` was just consumed. Use [`Tokenizer::new`] to
+    /// - `Ok(Some(Char(c)))` - a fully-decoded escape sequence.
+    /// - `Ok(None)` - closing `"` was just consumed. Use [`Tokenizer::new`] to
     ///   continue parsing the stream.
-    /// - `Err(InvalidUtf8)` — encoding error.
-    /// - `Err(UnexpectedEnd)` — stream ended inside a string with no closing `"`.
+    /// - `Err(InvalidUtf8)` - encoding error.
+    /// - `Err(UnexpectedEnd)` - stream ended inside a string with no closing `"`.
     pub(crate) fn next_chunk<'a>(
         &mut self,
         src: &mut &'a [u8],
@@ -528,12 +528,12 @@ mod tests {
 
     #[test]
     fn err_lone_high_surrogate() -> Result<(), JsonError> {
-        // High surrogate followed immediately by closing quote — no low surrogate.
+        // High surrogate followed immediately by closing quote - no low surrogate.
         let mut src: &[u8] = b"\\uD834\"";
         let mut access = StrAccess::start();
         // First call suspends after the high surrogate (empty slice).
         assert_eq!(access.next_chunk(&mut src)?, Some(StrChunk::Slice("")));
-        // Next byte is `"`, not `\` — invalid.
+        // Next byte is `"`, not `\` - invalid.
         assert_eq!(
             access.next_chunk(&mut src).unwrap_err(),
             JsonError::InvalidEscape
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn err_high_then_non_low_surrogate_u() -> Result<(), JsonError> {
-        // \uD834 followed by \u0041 ('A') — second escape is not a low surrogate.
+        // \uD834 followed by \u0041 ('A') - second escape is not a low surrogate.
         let mut src: &[u8] = b"\\uD834\\u0041\"";
         let mut access = StrAccess::start();
         assert_eq!(access.next_chunk(&mut src)?, Some(StrChunk::Slice(""))); // suspends at high
@@ -667,12 +667,12 @@ mod tests {
         let mut buf = [0u8; 64];
         let mut src1: &[u8] = b"hello\\";
         let mut access = StrAccess::start();
-        // Emits "hello" from the unescaped prefix …
+        // Emits "hello" from the unescaped prefix ...
         assert_eq!(
             access.next_chunk(&mut src1)?,
             Some(StrChunk::Slice("hello"))
         );
-        // … then suspends at `\` with an empty slice (partial state saved).
+        // ... then suspends at `\` with an empty slice (partial state saved).
         assert_eq!(access.next_chunk(&mut src1)?, Some(StrChunk::Slice("")));
         // Feed second buffer: `\n` completes, then closing quote.
         let mut src2: &[u8] = b"n\"";
