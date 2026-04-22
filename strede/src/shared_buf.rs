@@ -33,6 +33,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use arrayvec::{ArrayString, ArrayVec};
 use pin_list::{InitializedNode, NodeData, PinList, id::Unchecked};
 use pin_project::{pin_project, pinned_drop};
 
@@ -47,22 +48,37 @@ pub trait Buffer {
     fn as_slice(&self) -> &[u8];
 }
 
-impl<const N: usize> Buffer for [u8; N] {
-    #[inline]
+impl<const N: usize> Buffer for ArrayVec<u8, N> {
+    #[inline(always)]
     fn as_slice(&self) -> &[u8] {
-        &self[..]
+        self.as_slice()
+    }
+}
+
+impl<const N: usize> Buffer for ArrayString<N> {
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Buffer for alloc::vec::Vec<u8> {
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
 impl Buffer for &[u8] {
-    #[inline]
+    #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         self
     }
 }
 
 impl Buffer for &mut [u8] {
-    #[inline]
+    #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         self
     }
@@ -166,6 +182,7 @@ struct SharedBufData<B: Buffer, F: AsyncFnMut(&mut B)> {
 /// mutates it in place on each cycle.  `F` is the loader's type.
 pub struct SharedBuf<'s, B: Buffer, F: AsyncFnMut(&mut B)>(&'s SharedBufData<B, F>);
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Clone for SharedBuf<'s, B, F> {
+    #[inline(always)]
     fn clone(&self) -> Self {
         *self
     }
@@ -176,6 +193,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Copy for SharedBuf<'s, B, F> {}
 unsafe impl<B: Send + Buffer, F: Send + AsyncFnMut(&mut B)> Send for SharedBufData<B, F> {}
 
 impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
+    #[inline(always)]
     fn new(initial: B, loader: F) -> Self {
         Self {
             buf: UnsafeCell::new(initial),
@@ -197,6 +215,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
     /// Run `f` with a shared buffer state initialized with `initial`.  The
     /// loader fires whenever the last handle calls [`Handle::next`], mutating
     /// the buffer in place.
+    #[inline(always)]
     pub fn with<R>(initial: B, loader: F, f: impl FnOnce(SharedBuf<'_, B, F>) -> R) -> R {
         let shared = SharedBufData::new(initial, loader);
         f(SharedBuf(&shared))
@@ -207,6 +226,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
     /// `shared` and the loader live inside the pinned async state machine,
     /// so all buffer pointers and waiter node addresses are stable for the
     /// entire poll sequence.
+    #[inline(always)]
     pub async fn with_async<R>(
         initial: B,
         loader: F,
@@ -223,6 +243,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
     /// exists (both borrow `SharedBuf` shared); that condition guarantees
     /// the load state is `Idle`.  Use [`Handle::fork`] to create siblings
     /// while another handle is alive.
+    #[inline(always)]
     pub fn fork(self) -> Handle<'s, B, F> {
         self.0.fork_helper()
     }
@@ -237,7 +258,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
 impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     /// Wake exactly one waiter and remove it from the list.  Returns `true` if
     /// a waiter was woken, `false` if the list was empty.
-    #[inline]
+    #[inline(always)]
     fn wake_one(&self) -> bool {
         let Some(waker) = self.remove_active_front() else {
             return false;
@@ -260,6 +281,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
         }
     }
 
+    #[inline(always)]
     fn needs_load(&self) -> bool {
         self.remaining.get() == 0
     }
@@ -279,6 +301,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
             .ok()
     }
 
+    #[inline(always)]
     fn reset_node<'a, 'b: 'c, 'c>(
         &'a self,
         initialized: Pin<&'b mut InitializedNode<'c, WaiterTypes>>,
@@ -291,7 +314,7 @@ impl<B: Buffer, F: AsyncFnMut(&mut B)> SharedBufData<B, F> {
     }
 
     /// Current load phase, ignoring the loader payload.
-    #[inline]
+    #[inline(always)]
     fn phase(&self) -> LoadState<()> {
         // This gets compiled down to a single CMP instruction, so there really isn't a window
         // where the intermediary state is visible.
@@ -366,6 +389,7 @@ pub struct Handle<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
     /// Borrow the current buffer slice.
+    #[inline(always)]
     pub fn buf(&self) -> &[u8] {
         // SAFETY: while this Handle is alive, no load can run (loads require
         // remaining == 0 → no Handle), so no &mut B into self.shared.buf is
@@ -380,6 +404,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> Handle<'s, B, F> {
     /// can outlive each other.  Takes `&mut self` to serialize the call
     /// against other operations on `self`; because a live `Handle` keeps
     /// `remaining > 0`, the load state is necessarily `Idle` here.
+    #[inline(always)]
     pub fn fork(&mut self) -> Handle<'s, B, F> {
         self.shared.fork_helper()
     }
@@ -475,6 +500,7 @@ struct WaitFuture<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> WaitFuture<'s, B, F> {
+    #[inline(always)]
     async fn wait(shared: &'s SharedBufData<B, F>) -> &'s SharedBufData<B, F> {
         WaitFuture {
             shared,
@@ -631,9 +657,9 @@ mod tests {
         let values: &[&[u8; 5]] = &[b"world", b"xxxxx"];
         let mut i = 0usize;
         SharedBuf::with(
-            *b"hello",
-            async |b: &mut [u8; 5]| {
-                *b = *values[i];
+            b"hello".as_slice(),
+            async |b| {
+                *b = values[i];
                 i += 1;
             },
             |shared| {
