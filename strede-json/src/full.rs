@@ -26,8 +26,8 @@ use crate::{
 
 use strede::{
     BytesAccess, Chunk, Deserialize, Deserializer, Entry, MapAccess, MapArmStack, MapKeyClaim,
-    MapKeyProbe, MapValueClaim, MapValueProbe, Probe, SeqAccess, SeqEntry, StrAccess, hit,
-    utils::repeat,
+    MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, Probe, SeqAccess, SeqEntry, StrAccess,
+    hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -261,6 +261,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     type Claim = JsonClaim<'de>;
     type StrChunks = JsonStrAccess<'de>;
     type BytesChunks = JsonBytesAccess<'de>;
+    type NumberChunks = JsonNumberAccess<'de>;
     type Map = JsonMapAccess<'de>;
     type Seq = JsonSeqAccess<'de>;
 
@@ -415,6 +416,45 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
                 access,
                 src: self.src,
                 char_buf: [0; 4],
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    // ---- Number (arbitrary precision) ----------------------------------------
+
+    async fn deserialize_number(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
+        match self.token {
+            Token::Number(mut access) => {
+                let mut src = self.src;
+                match access.next_chunk(&mut src)? {
+                    Some(chunk) => {
+                        // For in-memory JSON the number is always a single contiguous slice.
+                        // If for some reason there's a second chunk, fall back to Miss
+                        // so a concurrent deserialize_number_chunks arm can handle it.
+                        if access.next_chunk(&mut src)?.is_some() {
+                            return Ok(Probe::Miss);
+                        }
+                        Ok(Probe::Hit((
+                            JsonClaim {
+                                tokenizer: Tokenizer::new(),
+                                src,
+                            },
+                            chunk,
+                        )))
+                    }
+                    None => Err(JsonError::InvalidNumber),
+                }
+            }
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+        match self.token {
+            Token::Number(access) => Ok(Probe::Hit(JsonNumberAccess {
+                access,
+                src: self.src,
             })),
             _ => Ok(Probe::Miss),
         }
@@ -613,6 +653,42 @@ impl<'de> BytesAccess for JsonBytesAccess<'de> {
                 let r = f(c.encode_utf8(&mut self.char_buf).as_bytes());
                 Ok(Chunk::Data((self, r)))
             }
+            Ok(None) => Ok(Chunk::Done(JsonClaim {
+                tokenizer: Tokenizer::new(),
+                src: self.src,
+            })),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JsonNumberAccess
+// ---------------------------------------------------------------------------
+
+pub struct JsonNumberAccess<'de> {
+    access: crate::token::NumberAccess,
+    src: &'de [u8],
+}
+
+impl<'de> NumberAccess for JsonNumberAccess<'de> {
+    type Claim = JsonClaim<'de>;
+    type Error = JsonError;
+
+    #[inline(always)]
+    fn fork(&mut self) -> Self {
+        Self {
+            access: self.access,
+            src: self.src,
+        }
+    }
+
+    async fn next_number_chunk<R>(
+        mut self,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.access.next_chunk(&mut self.src) {
+            Ok(Some(chunk)) => Ok(Chunk::Data((self, f(chunk)))),
             Ok(None) => Ok(Chunk::Done(JsonClaim {
                 tokenizer: Tokenizer::new(),
                 src: self.src,

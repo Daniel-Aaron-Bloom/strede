@@ -20,8 +20,8 @@ use crate::Probe;
 // NextKey - shared by both families' value-claim traits
 // ---------------------------------------------------------------------------
 
-/// Returned by the value-claim's `next_key` method to either continue or end
-/// map iteration.  Used by both [`crate::ValueClaim`] and [`crate::MapValueClaim`].
+/// Returned by [`crate::MapValueClaim::next_key`] / [`crate::MapValueClaimOwned::next_key`]
+/// to either yield the next key probe or signal map exhaustion.
 pub enum NextKey<KeyProbe, MapClaim> {
     /// Another KV pair is available; here is the key probe.
     Entry(KeyProbe),
@@ -74,7 +74,7 @@ impl<K, V, KeyFn, ValFn> MapArmSlot<K, V, KeyFn, ValFn> {
 /// Base of the arm tuple stack. Analogous to `SelectProbeBase`.
 pub struct MapArmBase;
 
-/// Wrapper that marks a [`MapArmSlot`] as one arm in a [`map_arms!`] call.
+/// Wrapper that marks a [`MapArmSlot`] as one arm in a [`crate::map_arms!`] call.
 ///
 /// Used with `+` on [`MapArmBase`] to build the arm stack without recursive macros:
 /// `MapArmBase + MapArm(slot0) + MapArm(slot1) + ...`

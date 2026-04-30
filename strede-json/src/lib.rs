@@ -9,6 +9,7 @@
 pub mod chunked;
 mod error;
 pub mod full;
+pub mod number;
 pub(crate) mod token;
 
 pub use error::JsonError;
@@ -17,3 +18,4 @@ pub use full::{
     JsonMapKeyProbe, JsonMapValueClaim, JsonMapValueProbe, JsonSeqAccess, JsonSeqEntry,
     JsonStrAccess,
 };
+pub use number::{NumberBorrowed, NumberOwned};

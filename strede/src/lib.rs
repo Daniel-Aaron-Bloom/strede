@@ -100,7 +100,7 @@ pub struct FlattenTerminalBoxed;
 pub use borrow::{
     BytesAccess, Deserialize, Deserializer, Entry, FlattenCont, FlattenDeserializer, FlattenEntry,
     FlattenMapAccess, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
-    MapValueProbe, SeqAccess, SeqEntry, StrAccess,
+    MapValueProbe, NumberAccess, SeqAccess, SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -162,8 +162,8 @@ pub use owned::{
     EntryOwned, FlattenContOwned, FlattenDeserializerOwned, FlattenEntryOwned,
     FlattenMapAccessOwned, MapAccessOwned, MapArm, MapArmBase, MapArmSlot, MapArmStackOwned,
     MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned, NextKey,
-    SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned,
-    VirtualArmSlot,
+    NumberAccessOwned, SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned,
+    TagInjectingStackOwned, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]

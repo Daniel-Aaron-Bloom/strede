@@ -123,6 +123,7 @@ pub trait EntryOwned: Sized {
 
     type StrChunks: StrAccessOwned<Claim = Self::Claim, Error = Self::Error>;
     type BytesChunks: BytesAccessOwned<Claim = Self::Claim, Error = Self::Error>;
+    type NumberChunks: NumberAccessOwned<Claim = Self::Claim, Error = Self::Error>;
     type Map: MapAccessOwned<MapClaim = Self::Claim, Error = Self::Error>;
     type Seq: SeqAccessOwned<SeqClaim = Self::Claim, Error = Self::Error>;
 
@@ -143,6 +144,7 @@ pub trait EntryOwned: Sized {
 
     async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error>;
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
+    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error>;
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error>;
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error>;
 
@@ -171,7 +173,7 @@ pub trait EntryOwned: Sized {
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
 
-/// Owned counterpart to [`StrAccess`]. Takes `self` by value and a sync
+/// Owned counterpart to [`crate::StrAccess`]. Takes `self` by value and a sync
 /// closure that borrows the chunk `&str`. The closure maps the short-lived
 /// borrow to an owned `R`; the accessor is handed back alongside `R` on
 /// `Data` and the claim emerges on `Done`.
@@ -204,7 +206,7 @@ pub trait StrAccessOwned: Sized {
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
-/// Owned counterpart to [`BytesAccess`]. Same closure pattern as
+/// Owned counterpart to [`crate::BytesAccess`]. Same closure pattern as
 /// [`StrAccessOwned`].
 ///
 /// **Callers:** forked accessors must be driven concurrently.
@@ -228,6 +230,26 @@ pub trait BytesAccessOwned: Sized {
     async fn next_bytes<R>(
         self,
         f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
+}
+
+/// Owned counterpart to [`crate::NumberAccess`]. Same closure pattern as
+/// [`StrAccessOwned`].
+///
+/// **Callers:** forked accessors must be driven concurrently.
+/// See [`StrAccessOwned`] for the deadlock hazard.
+pub trait NumberAccessOwned: Sized {
+    type Claim;
+    type Error: DeserializeError;
+
+    /// Fork a sibling accessor at the same read position.
+    ///
+    /// Same contract as [`StrAccessOwned::fork`].
+    fn fork(&mut self) -> Self;
+
+    async fn next_number_chunk<R>(
+        self,
+        f: impl FnOnce(&str) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
@@ -365,11 +387,11 @@ pub type VP2<D> = <<KP<D> as MapKeyProbeOwned>::KeyClaim as MapKeyClaimOwned>::V
 /// A left-nested tuple stack of [`MapArmSlot`]s: `((MapArmBase, Slot0), Slot1)`.
 ///
 /// The map impl drives the iteration loop. Each round it calls the
-/// [`race_keys`] free function which forks the key probe, creates per-arm
-/// key futures via [`init_race`](MapArmStackOwned::init_race), and polls them
-/// flat via [`poll_race_one`](MapArmStackOwned::poll_race_one). On a hit,
-/// [`dispatch_value`] converts the key claim to a value probe and polls
-/// the winning arm's value callback via [`poll_dispatch`](MapArmStackOwned::poll_dispatch).
+/// [`race_keys`](Self::race_keys) free function which forks the key probe, creates per-arm
+/// key futures via [`init_race`](Self::init_race), and polls them
+/// flat via [`poll_race_one`](Self::poll_race_one). On a hit,
+/// [`dispatch_value`](Self::dispatch_value) converts the key claim to a value probe and polls
+/// the winning arm's value callback via [`poll_dispatch`](Self::poll_dispatch).
 ///
 /// All poll methods are sync - recursion through `(Rest, Slot)` tuples is
 /// ordinary call-stack recursion, not nested async state machines. This
@@ -1191,7 +1213,7 @@ impl<M: MapAccessOwned> FlattenContOwned<M> for crate::FlattenTerminalBoxed {
 /// impl. It intercepts `deserialize_map` → `iterate(inner_arms)`,
 /// prepends the outer struct's arms via [`StackConcat`], and delegates to
 /// the [`FlattenContOwned`] continuation. For the terminal case
-/// ([`FlattenTerminal`]) this drives the real map's `iterate`; for
+/// ([`crate::FlattenTerminal`]) this drives the real map's `iterate`; for
 /// intermediate cases it chains to the next flatten field.
 pub struct FlattenDeserializerOwned<'a, M, OuterArms, Cont>
 where
@@ -1292,6 +1314,7 @@ where
     type Claim = M::MapClaim;
     type StrChunks = crate::Never<'static, M::MapClaim, M::Error>;
     type BytesChunks = crate::Never<'static, M::MapClaim, M::Error>;
+    type NumberChunks = crate::Never<'static, M::MapClaim, M::Error>;
     type Map = FlattenMapAccessOwned<'a, M, OuterArms, Cont>;
     type Seq = crate::Never<'static, M::MapClaim, M::Error>;
 
@@ -1352,6 +1375,9 @@ where
         Ok(Probe::Miss)
     }
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
         Ok(Probe::Miss)
     }
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
@@ -1484,6 +1510,20 @@ impl<'n, C, E: DeserializeError> BytesAccessOwned for crate::Never<'n, C, E> {
     async fn next_bytes<R>(
         self,
         _f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        match self.0 {}
+    }
+}
+
+impl<'n, C, E: DeserializeError> NumberAccessOwned for crate::Never<'n, C, E> {
+    type Claim = C;
+    type Error = E;
+    fn fork(&mut self) -> Self {
+        match self.0 {}
+    }
+    async fn next_number_chunk<R>(
+        self,
+        _f: impl FnOnce(&str) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.0 {}
     }

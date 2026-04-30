@@ -2489,6 +2489,7 @@ pub mod map_facade {
         type Claim = M::MapClaim;
         type StrChunks = crate::Never<'de, M::MapClaim, M::Error>;
         type BytesChunks = crate::Never<'de, M::MapClaim, M::Error>;
+        type NumberChunks = crate::Never<'de, M::MapClaim, M::Error>;
         type Map = M;
         type Seq = crate::Never<'de, M::MapClaim, M::Error>;
 
@@ -2544,6 +2545,12 @@ pub mod map_facade {
             Ok(Probe::Miss)
         }
         async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_number(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
             Ok(Probe::Miss)
         }
         async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
@@ -2687,6 +2694,7 @@ pub mod tag_facade {
         type Claim = M::MapClaim;
         type StrChunks = Never<'de, M::MapClaim, M::Error>;
         type BytesChunks = Never<'de, M::MapClaim, M::Error>;
+        type NumberChunks = Never<'de, M::MapClaim, M::Error>;
         type Map = TagAwareMap<'de, 'v, M, N>;
         type Seq = Never<'de, M::MapClaim, M::Error>;
 
@@ -2742,6 +2750,12 @@ pub mod tag_facade {
             Ok(Probe::Miss)
         }
         async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_number(self) -> Result<Probe<(Self::Claim, &'de str)>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
             Ok(Probe::Miss)
         }
         async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
@@ -2952,6 +2966,7 @@ pub mod tag_facade {
         type Claim = M::MapClaim;
         type StrChunks = Never<'static, M::MapClaim, M::Error>;
         type BytesChunks = Never<'static, M::MapClaim, M::Error>;
+        type NumberChunks = Never<'static, M::MapClaim, M::Error>;
         type Map = TagAwareMapOwned<'v, M, N>;
         type Seq = Never<'static, M::MapClaim, M::Error>;
 
@@ -3001,6 +3016,9 @@ pub mod tag_facade {
             Ok(Probe::Miss)
         }
         async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
+            Ok(Probe::Miss)
+        }
+        async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
             Ok(Probe::Miss)
         }
         async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {

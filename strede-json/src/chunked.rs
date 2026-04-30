@@ -32,22 +32,20 @@ use strede::utils::repeat;
 use strede::{
     Buffer, BytesAccessOwned, Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, Handle,
     MapAccessOwned, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned,
-    MapValueProbeOwned, NextKey, Probe, SeqAccessOwned, SeqEntryOwned, SharedBuf, StrAccessOwned,
-    hit,
+    MapValueProbeOwned, NextKey, NumberAccessOwned, Probe, SeqAccessOwned, SeqEntryOwned,
+    SharedBuf, StrAccessOwned, hit,
 };
 
 // ---------------------------------------------------------------------------
 // Claim
 // ---------------------------------------------------------------------------
 
-/// Proof-of-consumption returned by every probe and threaded back to
-/// [`DeserializerOwned::entry`] / [`MapAccessOwned::next_kv`] / [`SeqAccessOwned::next`].
+/// The concrete [`DeserializerOwned::Claim`] type for the chunked JSON deserializer, threaded back
+/// through [`DeserializerOwned::entry`], accessor `next` methods, and `skip` calls.
 ///
-/// For chunked input, this carries the post-token tokenizer, the chunk
-/// offset, and (transferred via the [`Handle`] inside) ownership of buffer
-/// access. The handle inside is `None` when the probe was synchronous and
-/// dropped its handle naturally; in that case the parent re-forks from its
-/// `SharedBuf`.
+/// Carries the post-token tokenizer state, the chunk offset within the current
+/// buffer slice, and the [`Handle`] that holds ownership of buffer access until
+/// the parent is ready to advance the stream.
 pub struct ChunkedJsonClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     tokenizer: Tokenizer,
     offset: usize,
@@ -523,6 +521,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type StrChunks = ChunkedJsonStrAccess<'s, B, F>;
     type BytesChunks = ChunkedJsonBytesAccess<'s, B, F>;
+    type NumberChunks = ChunkedJsonNumberAccess<'s, B, F>;
     type Map = ChunkedJsonMapAccessOwned<'s, B, F>;
     type Seq = ChunkedJsonSeqAccess<'s, B, F>;
 
@@ -668,6 +667,18 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
                 access,
                 offset: self.offset,
                 char_buf: [0; 4],
+            })),
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    #[inline(always)]
+    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+        match self.token {
+            Token::Number(access) => Ok(Probe::Hit(ChunkedJsonNumberAccess {
+                handle: self.handle,
+                access,
+                offset: self.offset,
             })),
             _ => Ok(Probe::Miss),
         }
@@ -925,6 +936,65 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedJsonBytes
                     }
                     self.handle = refill(self.handle, &mut self.offset).await?;
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NumberAccessOwned
+// ---------------------------------------------------------------------------
+
+pub struct ChunkedJsonNumberAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    access: token::NumberAccess,
+    offset: usize,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> NumberAccessOwned
+    for ChunkedJsonNumberAccess<'s, B, F>
+{
+    type Claim = ChunkedJsonClaim<'s, B, F>;
+    type Error = JsonError;
+
+    #[inline(always)]
+    fn fork(&mut self) -> Self {
+        Self {
+            handle: self.handle.fork(),
+            access: self.access,
+            offset: self.offset,
+        }
+    }
+
+    async fn next_number_chunk<R>(
+        mut self,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        loop {
+            let pre_offset = self.offset;
+            let result = {
+                let buf = self.handle.buf();
+                let mut src: &[u8] = &buf[pre_offset..];
+                let r = self.access.next_chunk(&mut src);
+                self.offset = new_offset(buf, src);
+                r
+            };
+            match result {
+                Ok(Some(chunk)) => {
+                    let v = f(chunk);
+                    return Ok(Chunk::Data((self, v)));
+                }
+                Ok(None) => {
+                    return Ok(Chunk::Done(ChunkedJsonClaim {
+                        tokenizer: Tokenizer::new(),
+                        offset: self.offset,
+                        handle: self.handle,
+                    }));
+                }
+                Err(JsonError::UnexpectedEnd) => {
+                    self.handle = refill(self.handle, &mut self.offset).await?;
+                }
+                Err(e) => return Err(e),
             }
         }
     }

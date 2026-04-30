@@ -793,7 +793,6 @@ where
 
 /// Yielded by streaming accessors ([`StrAccess::next_str`](crate::StrAccess::next_str),
 /// [`BytesAccess::next_bytes`](crate::BytesAccess::next_bytes),
-/// [`MapAccess::next_kv`](crate::MapAccess::next_kv),
 /// [`SeqAccess::next`](crate::SeqAccess::next)).
 ///
 /// - `Data(item)` - another item of data.
