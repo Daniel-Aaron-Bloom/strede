@@ -353,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn parse_n_float_basic() {
         match parse_n("3.14").unwrap() {
             N::Float(f) => assert!((f - 3.14).abs() < 1e-12),
@@ -410,6 +411,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn deserialize_borrowed_float() {
         let n = deser_borrowed("3.14").unwrap();
         assert_eq!(n.as_u64(), None);
@@ -418,6 +420,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
     fn parse_n_lemire_hard() {
         // A few values that exercise the Eisel-Lemire path beyond the fast path.
         let cases = [
@@ -459,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn streaming_owned_float() {
         use crate::chunked::ChunkedJsonDeserializer;
         use strede::shared_buf::SharedBuf;
@@ -575,8 +579,8 @@ mod tests {
     /// Generate a random JSON number string with a mix of shapes:
     /// plain integers, negatives, floats, and floats with large exponents.
     fn random_number(rng: &mut Lcg) -> std::string::String {
-        let neg = rng.next() % 4 == 0;
-        let big = rng.next() % 3 == 0;
+        let neg = rng.next().is_multiple_of(4);
+        let big = rng.next().is_multiple_of(3);
 
         let int_digits = rng.next_range(1, if big { 25 } else { 10 });
         let mut int_part = std::string::String::new();
@@ -589,7 +593,7 @@ mod tests {
             int_part.push((b'0' + d as u8) as char);
         }
 
-        let frac = if rng.next() % 2 == 0 {
+        let frac = if rng.next().is_multiple_of(2) {
             let frac_digits = rng.next_range(1, if big { 35 } else { 10 });
             let mut s = std::string::String::from(".");
             for _ in 0..frac_digits {
@@ -600,7 +604,7 @@ mod tests {
             std::string::String::new()
         };
 
-        let exp = if rng.next() % 2 == 0 {
+        let exp = if rng.next().is_multiple_of(2) {
             let limit = if big { 400 } else { 30 };
             let e = rng.next_range(0, limit * 2) as i32 - limit as i32;
             std::format!("e{e}")
