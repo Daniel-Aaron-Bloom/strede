@@ -541,11 +541,11 @@ pub(super) fn expand(
             && !type_param_idents.is_empty()
             && mentions_type_param(flat_ty, &type_param_idents)
         {
-            let msg = format!(
+            let msg =
                 "`#[strede(flatten)]` on a field whose type mentions a struct type parameter \
                  is not supported on stable Rust. Add `#[strede(bound = \"...\")]` to the \
                  field, or enable the `nightly-flatten` feature."
-            );
+                    .to_string();
             return Ok(quote! {
                 ::core::compile_error!(#msg);
             });

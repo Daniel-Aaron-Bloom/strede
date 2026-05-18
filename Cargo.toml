@@ -20,7 +20,7 @@ homepage = "https://github.com/Daniel-Aaron-Bloom/strede"
 authors = ["Daniel Bloom"]
 categories = ["encoding", "asynchronous", "no-std"]
 keywords = ["serde", "async", "deserialize", "streaming", "zero-alloc"]
-rust-version = "1.88"
+rust-version = "1.89"
 
 [profile.test]
 opt-level = 1
