@@ -22,7 +22,7 @@ pub struct LogEntry {
 #[inline(never)]
 fn deser_point(input: &[u8]) -> Point {
     let de = JsonDeserializer::new(input);
-    let result = block_on(<Point as strede::Deserialize<'_>>::deserialize(de, ())).unwrap();
+    let result = block_on(<Point as strede::Deserialize<'_, _>>::deserialize(de, ())).unwrap();
     let Probe::Hit((_, v)) = result else {
         panic!("Miss")
     };
@@ -32,7 +32,11 @@ fn deser_point(input: &[u8]) -> Point {
 #[inline(never)]
 fn deser_log_entry(input: &[u8]) -> LogEntry {
     let de = JsonDeserializer::new(input);
-    let result = block_on(<LogEntry as strede::Deserialize<'_>>::deserialize(de, ())).unwrap();
+    let result = block_on(<LogEntry as strede::Deserialize<'_, _>>::deserialize(
+        de,
+        (),
+    ))
+    .unwrap();
     let Probe::Hit((_, v)) = result else {
         panic!("Miss")
     };

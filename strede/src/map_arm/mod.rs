@@ -6,6 +6,11 @@ use pin_project::pin_project;
 
 use crate::Probe;
 
+pub mod borrow;
+pub mod owned;
+pub use borrow::MapArmStack;
+pub use owned::MapArmStackOwned;
+
 // ===========================================================================
 // Shared map arm infrastructure - used by both the borrow and owned families.
 //
@@ -20,8 +25,8 @@ use crate::Probe;
 // NextKey - shared by both families' value-claim traits
 // ---------------------------------------------------------------------------
 
-/// Returned by the value-claim's `next_key` method to either continue or end
-/// map iteration.  Used by both [`crate::ValueClaim`] and [`crate::MapValueClaim`].
+/// Returned by [`crate::MapValueClaim::next_key`] / [`crate::MapValueClaimOwned::next_key`]
+/// to either yield the next key probe or signal map exhaustion.
 pub enum NextKey<KeyProbe, MapClaim> {
     /// Another KV pair is available; here is the key probe.
     Entry(KeyProbe),
@@ -74,7 +79,7 @@ impl<K, V, KeyFn, ValFn> MapArmSlot<K, V, KeyFn, ValFn> {
 /// Base of the arm tuple stack. Analogous to `SelectProbeBase`.
 pub struct MapArmBase;
 
-/// Wrapper that marks a [`MapArmSlot`] as one arm in a [`map_arms!`] call.
+/// Wrapper that marks a [`MapArmSlot`] as one arm in a [`crate::map_arms!`] call.
 ///
 /// Used with `+` on [`MapArmBase`] to build the arm stack without recursive macros:
 /// `MapArmBase + MapArm(slot0) + MapArm(slot1) + ...`
@@ -336,4 +341,156 @@ macro_rules! map_outputs {
     ($first:pat $(, $rest:pat)* $(,)?) => {
         $crate::__left_nest_pat!((), $first $(, $rest)*)
     };
+}
+
+// ---------------------------------------------------------------------------
+// Helper macros - borrow family
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`MapArmStack`] so that unknown map keys are silently consumed (borrow family).
+#[macro_export]
+macro_rules! SkipUnknown {
+    ($inner:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |vp: $vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbe as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+    ($inner:expr) => {{
+        use $crate::MapKeyProbe as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbe as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStack`] to return a duplicate-field error (borrow family).
+#[macro_export]
+macro_rules! DetectDuplicates {
+    ($inner:expr, $wire_names:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        let __wn = $wire_names;
+        $crate::DetectDuplicatesOwned::new(
+            $inner,
+            __wn,
+            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            |vp: $vp| vp.skip(),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStack`] to intercept a tag field (borrow family).
+#[macro_export]
+macro_rules! TagInjectingStack {
+    ($inner:expr, $tag_field:expr, $tag_candidates:expr, $tag_value:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        use $crate::MapValueProbe as _;
+        let __tf = $tag_field;
+        let __tc = $tag_candidates;
+        $crate::TagInjectingStackOwned::new(
+            $inner,
+            __tf,
+            __tc,
+            $tag_value,
+            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
+        )
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Helper macros - owned family
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`MapArmStackOwned`] so that unknown map keys are silently consumed.
+///
+/// Expands to `(arms, VirtualArmSlot::new(...))` with a skip key/value arm.
+#[macro_export]
+macro_rules! SkipUnknownOwned {
+    // 3-arg form: explicit KP/VP types for closure annotations (used by derive).
+    ($inner:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbeOwned as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |vp: $vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbeOwned as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+    // 1-arg form: types inferred from context (for hand-written code).
+    ($inner:expr) => {{
+        use $crate::MapKeyProbeOwned as _;
+        (
+            $inner,
+            $crate::VirtualArmSlot::new(
+                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |vp, _k: $crate::Skip| async move {
+                    use $crate::MapValueProbeOwned as _;
+                    let vc = vp.skip().await?;
+                    ::core::result::Result::Ok($crate::Probe::Hit((vc, ())))
+                },
+            ),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStackOwned`] to return a duplicate-field error (owned family).
+///
+/// `DetectDuplicatesOwned!(inner, wire_names, KP, VP)` expands to
+/// `DetectDuplicatesOwned::new(inner, wire_names, key_fn, skip_fn)` with typed closures.
+#[macro_export]
+macro_rules! DetectDuplicatesOwned {
+    ($inner:expr, $wire_names:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbeOwned as _;
+        use $crate::MapValueProbeOwned as _;
+        let __wn = $wire_names;
+        $crate::DetectDuplicatesOwned::new(
+            $inner,
+            __wn,
+            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            |vp: $vp| vp.skip(),
+        )
+    }};
+}
+
+/// Wraps a [`MapArmStackOwned`] to intercept a tag field (owned family).
+///
+/// `TagInjectingStackOwned!(inner, tag_field, tag_candidates, tag_value, KP, VP)`
+#[macro_export]
+macro_rules! TagInjectingStackOwned {
+    ($inner:expr, $tag_field:expr, $tag_candidates:expr, $tag_value:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbeOwned as _;
+        use $crate::MapValueProbeOwned as _;
+        let __tf = $tag_field;
+        let __tc = $tag_candidates;
+        $crate::TagInjectingStackOwned::new(
+            $inner,
+            __tf,
+            __tc,
+            $tag_value,
+            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
+        )
+    }};
 }

@@ -25,6 +25,7 @@
 //! condition signals that a load is needed; once all waiters drop, `remaining`
 //! is already 0 and the current buffer is still valid.
 
+use arrayvec::{ArrayString, ArrayVec};
 use core::cell::RefCell;
 use core::{
     cell::{Cell, UnsafeCell},
@@ -33,7 +34,6 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use arrayvec::{ArrayString, ArrayVec};
 use pin_list::{InitializedNode, NodeData, PinList, id::Unchecked};
 use pin_project::{pin_project, pinned_drop};
 
@@ -67,6 +67,14 @@ impl Buffer for alloc::vec::Vec<u8> {
     #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Buffer for alloc::string::String {
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -221,7 +229,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SharedBuf<'s, B, F> {
         f(SharedBuf(&shared))
     }
 
-    /// Async counterpart of [`SharedBufRef::with`].
+    /// Async counterpart of [`Self::with`].
     ///
     /// `shared` and the loader live inside the pinned async state machine,
     /// so all buffer pointers and waiter node addresses are stable for the

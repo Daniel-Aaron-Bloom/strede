@@ -21,12 +21,13 @@
 //! let v = d.entry(|[e1, e2, e3]| async {
 //!     select_probe! {
 //!         async move {
-//!             let (claim, f) = hit!(e1.deserialize_f32().await);
-//!             Ok(Probe::Hit((claim, Value::Float(f))))
+//!             let (claim, s) = hit!(e1.deserialize_str().await);
+//!             Ok(Probe::Hit((claim, Value::Str(s))))
 //!         },
 //!         async move {
-//!             let (claim, s) = hit!(e2.deserialize_str().await);
-//!             Ok(Probe::Hit((claim, Value::Str(s))))
+//!             let chunks = hit!(e2.deserialize_number_chunks().await);
+//!             let (claim, n) = collect_number(chunks).await?;
+//!             Ok(Probe::Hit((claim, Value::Number(n))))
 //!         },
 //!         async move {
 //!             let (claim, m) = hit!(e3.deserialize_map().await);
@@ -55,33 +56,19 @@ pub mod borrow;
 mod error;
 mod impls;
 pub mod map_arm;
+mod never;
 pub mod owned;
 pub mod probe;
 pub mod shared_buf;
-
-use core::{convert::Infallible, marker::PhantomData};
 
 // -- proc-macros --
 pub use strede_derive::{Deserialize, DeserializeOwned};
 
 // -- shared types --
 pub use error::DeserializeError;
+pub use never::Never;
 pub use probe::{Chunk, Probe};
 pub use shared_buf::{Buffer, Handle, SharedBuf};
-
-/// The uninhabited bottom type - equivalent to `!` but stable on all editions.
-///
-/// Used as the associated `StrChunks`, `BytesChunks`, and `Seq` types on
-/// [`Entry`] / [`EntryOwned`] implementations that never produce those
-/// accessor kinds.  Because `Never` has no values, all trait method bodies
-/// on `Never` are written as `match self {}` and the compiler accepts them
-/// without any reachable code.
-#[doc(hidden)]
-#[allow(clippy::type_complexity)]
-pub struct Never<'a, Claim, Error>(
-    Infallible,
-    PhantomData<(fn(*const Claim), fn(*const Error), fn(&'a ()))>,
-);
 
 /// Terminal flatten continuation: calls `map.iterate(SkipUnknownOwned(arms))` directly.
 /// Used for the last (or only) flatten field in a struct.
@@ -98,9 +85,9 @@ pub struct FlattenTerminalBoxed;
 
 // -- borrow family --
 pub use borrow::{
-    BytesAccess, Deserialize, Deserializer, Entry, FlattenCont, FlattenDeserializer, FlattenEntry,
-    FlattenMapAccess, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
-    MapValueProbe, SeqAccess, SeqEntry, StrAccess,
+    BytesAccess, Deserialize, DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry,
+    FlattenCont, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
+    NumberAccess, SeqAccess, SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -154,16 +141,18 @@ macro_rules! __left_nest_pat {
 }
 
 // -- utility types --
-pub use impls::{Match, MatchVals, Skip, UnwrapOrElse, map_facade, tag_facade};
+pub use impls::{
+    FlattenMapAccess, FlattenMapAccessOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
+    UnwrapOrElse,
+};
 
 // -- owned family --
 pub use owned::{
-    ArmState, BytesAccessOwned, DeserializeOwned, DeserializerOwned, DetectDuplicatesOwned,
-    EntryOwned, FlattenContOwned, FlattenDeserializerOwned, FlattenEntryOwned,
-    FlattenMapAccessOwned, MapAccessOwned, MapArm, MapArmBase, MapArmSlot, MapArmStackOwned,
-    MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned, NextKey,
-    SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned,
-    VirtualArmSlot,
+    ArmState, BytesAccessOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned, DeserializeOwned,
+    DeserializerOwned, DetectDuplicatesOwned, EntryOwned, FlattenContOwned, MapAccessOwned, MapArm,
+    MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
+    MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
+    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]

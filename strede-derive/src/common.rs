@@ -1,6 +1,223 @@
 use convert_case::{Case, Casing};
 use syn::{Fields, Token};
 
+// ---------------------------------------------------------------------------
+// Generics-lift helpers
+// ---------------------------------------------------------------------------
+
+/// Insert `'de` (if absent) and `__D: Deserializer<'de>` into `impl_gen`.
+/// Call between cloning `input.generics` and `split_for_impl`.
+pub fn insert_de_and_d_borrow(impl_gen: &mut syn::Generics, krate: &syn::Path) {
+    let has_de = impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+    if !has_de {
+        impl_gen.params.insert(0, syn::parse_quote!('de));
+    }
+    impl_gen
+        .params
+        .push(syn::parse_quote!(__D: #krate::Deserializer<'de>));
+}
+
+/// Insert `__D: DeserializerOwned` into `impl_gen` (owned mirror).
+pub fn insert_d_owned(impl_gen: &mut syn::Generics, krate: &syn::Path) {
+    impl_gen
+        .params
+        .push(syn::parse_quote!(__D: #krate::DeserializerOwned));
+}
+
+/// Insert `'de` (if absent) and `__M: MapAccess<'de>` into `impl_gen`.
+/// Used for `DeserializeFromMap` impl emission.
+pub fn insert_de_and_m_borrow(impl_gen: &mut syn::Generics, krate: &syn::Path) {
+    let has_de = impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+    if !has_de {
+        impl_gen.params.insert(0, syn::parse_quote!('de));
+    }
+    impl_gen
+        .params
+        .push(syn::parse_quote!(__M: #krate::MapAccess<'de>));
+}
+
+/// Insert `__M: MapAccessOwned` into `impl_gen` (owned mirror).
+pub fn insert_m_owned(impl_gen: &mut syn::Generics, krate: &syn::Path) {
+    impl_gen
+        .params
+        .push(syn::parse_quote!(__M: #krate::MapAccessOwned));
+}
+
+// ---------------------------------------------------------------------------
+// Bound shapes (D3/D4)
+// ---------------------------------------------------------------------------
+
+/// Where a field is consumed; determines which probe-trait projection to use
+/// when emitting the auto field bound.
+#[derive(Copy, Clone)]
+pub enum FieldContext {
+    /// `<T as Deserialize<'de, __D>>::deserialize(d, ())` — top-level / transparent / `from`.
+    Direct,
+    /// `__vp.deserialize_value::<T>(())` on `VP2<'de, __D>`.
+    MapValue,
+    /// `__se.get::<T>(())` on `SE<'de, __D>`.
+    SeqElem,
+}
+
+/// Auto-generated bound for one field in the borrow family.
+///
+/// Borrow family always assumes `'de` and `__D` are in scope.
+pub fn field_bound_borrow(
+    krate: &syn::Path,
+    ty: &syn::Type,
+    ctx: FieldContext,
+) -> syn::WherePredicate {
+    match ctx {
+        FieldContext::Direct => syn::parse_quote!(
+            #ty: #krate::Deserialize<'de, __D, Extra = ()>
+        ),
+        FieldContext::MapValue => syn::parse_quote!(
+            #ty: #krate::Deserialize<
+                'de,
+                <#krate::borrow::VP2<'de, __D> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                Extra = ()
+            >
+        ),
+        FieldContext::SeqElem => syn::parse_quote!(
+            #ty: #krate::Deserialize<
+                'de,
+                <#krate::borrow::SE<'de, __D> as #krate::SeqEntry<'de>>::SubDeserializer,
+                Extra = ()
+            >
+        ),
+    }
+}
+
+/// Auto-generated bound for one field in the owned family.
+pub fn field_bound_owned(
+    krate: &syn::Path,
+    ty: &syn::Type,
+    ctx: FieldContext,
+) -> syn::WherePredicate {
+    match ctx {
+        FieldContext::Direct => syn::parse_quote!(
+            #ty: #krate::DeserializeOwned<__D, Extra = ()>
+        ),
+        FieldContext::MapValue => syn::parse_quote!(
+            #ty: #krate::DeserializeOwned<
+                <#krate::owned::VP2<__D> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                Extra = ()
+            >
+        ),
+        FieldContext::SeqElem => syn::parse_quote!(
+            #ty: #krate::DeserializeOwned<
+                <#krate::owned::SE<__D> as #krate::SeqEntryOwned>::SubDeserializer,
+                Extra = ()
+            >
+        ),
+    }
+}
+
+/// Auto-generated bound for a type parameter on the user's struct/enum.
+pub fn type_param_bound_borrow(krate: &syn::Path, ident: &syn::Ident) -> syn::WherePredicate {
+    syn::parse_quote!(#ident: #krate::Deserialize<'de, __D, Extra = ()>)
+}
+
+/// Auto-generated bound for a type parameter on the user's struct/enum (owned).
+pub fn type_param_bound_owned(krate: &syn::Path, ident: &syn::Ident) -> syn::WherePredicate {
+    syn::parse_quote!(#ident: #krate::DeserializeOwned<__D, Extra = ()>)
+}
+
+// ---------------------------------------------------------------------------
+// Type-tree generic-param detection (D6)
+// ---------------------------------------------------------------------------
+
+/// Returns true if `ty` has a universal `Deserialize<'de, D> for ty` blanket
+/// impl shipped in `strede` core. Derive must skip the field bound for these
+/// types — an explicit where-clause `ty: Deserialize<'de, X>` would conflict
+/// with the blanket impl and cause "multiple impls or where clauses satisfying"
+/// errors.
+///
+/// Covers the top-level types only — `&str`, `&[u8]`, `Cow<'_, str>`,
+/// `PhantomData<…>`. Composite types like `Option<&str>` still need the
+/// where-clause bound because the universal Option impl has inner-T bounds
+/// that the trait solver checks separately.
+pub fn has_universal_blanket(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(r) => match &*r.elem {
+            syn::Type::Path(p) => p.path.is_ident("str"),
+            syn::Type::Slice(s) => matches!(&*s.elem, syn::Type::Path(p) if p.path.is_ident("u8")),
+            _ => false,
+        },
+        syn::Type::Path(p) => p.path.segments.last().is_some_and(|seg| {
+            let n = seg.ident.to_string();
+            matches!(n.as_str(), "Cow" | "PhantomData")
+        }),
+        _ => false,
+    }
+}
+
+/// Returns true if any path segment ident inside `ty` matches an ident in `params`.
+pub fn mentions_type_param(ty: &syn::Type, params: &[syn::Ident]) -> bool {
+    let mut found = false;
+    mentions_type_param_inner(ty, params, &mut found);
+    found
+}
+
+fn mentions_type_param_inner(ty: &syn::Type, params: &[syn::Ident], found: &mut bool) {
+    if *found {
+        return;
+    }
+    match ty {
+        syn::Type::Path(p) => {
+            if let Some(qself) = &p.qself {
+                mentions_type_param_inner(&qself.ty, params, found);
+            }
+            // A bare ident path like `T` matches only when the path has a single
+            // segment matching one of the params.
+            if p.qself.is_none()
+                && p.path.segments.len() == 1
+                && let Some(seg) = p.path.segments.first()
+                && matches!(seg.arguments, syn::PathArguments::None)
+                && params.iter().any(|tp| tp == &seg.ident)
+            {
+                *found = true;
+                return;
+            }
+            for seg in &p.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let syn::GenericArgument::Type(t) = arg {
+                            mentions_type_param_inner(t, params, found);
+                        }
+                    }
+                }
+            }
+        }
+        syn::Type::Reference(r) => mentions_type_param_inner(&r.elem, params, found),
+        syn::Type::Tuple(t) => {
+            for e in &t.elems {
+                mentions_type_param_inner(e, params, found);
+            }
+        }
+        syn::Type::Array(a) => mentions_type_param_inner(&a.elem, params, found),
+        syn::Type::Slice(s) => mentions_type_param_inner(&s.elem, params, found),
+        syn::Type::Paren(p) => mentions_type_param_inner(&p.elem, params, found),
+        syn::Type::Group(g) => mentions_type_param_inner(&g.elem, params, found),
+        syn::Type::TraitObject(t) => {
+            for b in &t.bounds {
+                if let syn::TypeParamBound::Trait(tb) = b {
+                    for seg in &tb.path.segments {
+                        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                            for arg in &args.args {
+                                if let syn::GenericArgument::Type(t) = arg {
+                                    mentions_type_param_inner(t, params, found);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a field is flattened and, if so, whether it opts into heap allocation
 /// to break deeply-nested async state-machine chains that would overflow the stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -333,12 +550,12 @@ pub fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerA
             } else if meta.path.is_ident("rename_all") {
                 let value = meta.value()?;
                 let s: syn::LitStr = value.parse()?;
-                rename_all = Some(RenameAll::from_str(&s.value()).ok_or_else(|| {
+                let s = s.value();
+                rename_all = Some(RenameAll::from_str(&s).ok_or_else(|| {
                     meta.error(format!(
-                        "unknown rename_all value {:?}; expected one of: \
+                        "unknown rename_all value {s:?}; expected one of: \
                          lowercase, UPPERCASE, PascalCase, camelCase, snake_case, \
                          SCREAMING_SNAKE_CASE, kebab-case, SCREAMING-KEBAB-CASE",
-                        s.value()
                     ))
                 })?);
                 Ok(())
@@ -583,7 +800,7 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
         if deserialize_with.is_some() || deserialize_owned_with.is_some() || has_from {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "#[strede(flatten)] cannot be combined with #[strede(deserialize_with)] / #[strede(with)] / #[strede(from)] / #[strede(try_from)]",
+                "#[strede(flatten)] cannot be combined with #[strede(deserialize_with)] / #[strede(deserialize_owned_with)] / #[strede(with)] / #[strede(from)] / #[strede(try_from)]",
             ));
         }
     }
@@ -643,6 +860,10 @@ pub fn apply_field_bound(
     match field_bound {
         Some(preds) => wc.predicates.extend(preds.iter().cloned()),
         None if has_custom_deserializer => {}
+        // Skip auto-bound for universal-blanket types ((`&str`, `&[u8]`, `Cow`,
+        // `PhantomData`) — an explicit Deserialize predicate would conflict with
+        // the blanket impl (E0283).
+        None if has_universal_blanket(ty) => {}
         None => wc.predicates.push(auto_pred(ty)),
     }
 }

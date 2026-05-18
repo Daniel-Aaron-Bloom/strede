@@ -14,6 +14,10 @@ readme = "../README.md"
 [dependencies]
 strede = { path = "../strede", version = "=0.1.1" }
 
+[features]
+arbitrary_precision = []
+alloc = []
+
 [dev-dependencies]
 strede-derive = { path = "../strede-derive", version = "=0.1.1", features = ["alloc"] }
 strede-test-util = { path = "../strede-test-util" }
