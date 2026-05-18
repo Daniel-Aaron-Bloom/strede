@@ -6,7 +6,7 @@
 //! - [`DeserializeOwned`] — owned family (`'s`); for chunked / streaming sources with no zero-copy borrows.
 //!
 //! Both derives are driven by `#[strede(...)]` attributes. All attributes described below are
-//! recognised by both derives unless noted otherwise.
+//! recognized by both derives unless noted otherwise.
 //!
 //! # Container attributes
 //!

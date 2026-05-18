@@ -41,10 +41,11 @@ enum Event {
 Then deserialize from JSON:
 
 ```rust
+use strede::Deserialize;
 use strede_json::JsonDeserializer;
 
-let json = r#"{"host": "localhost", "port": 8080}"#;
-let config = Config::deserialize(JsonDeserializer::new(json), ()).await??;
+let json = br#"{"host": "localhost", "port": 8080}"#;
+let (_, config) = Config::deserialize(JsonDeserializer::new(json), ()).await?.unwrap();
 ```
 
 For streaming/owned use (reading from an async byte source), derive
@@ -69,7 +70,7 @@ A `Claim` token is returned back to the deserializer as proof-of-consumption:
 let value = d.entry(|[e1, e2]| async {
     select_probe! {
         async move {
-            let (claim, f) = hit!(e1.deserialize_f32().await);
+            let (claim, f) = hit!(e1.deserialize_value::<f32, ()>(()).await);
             Ok(Probe::Hit((claim, Value::Float(f))))
         },
         async move {
@@ -91,6 +92,10 @@ Probe results:
 `select_probe!` polls all arms; `Miss` marks an arm done, first `Hit` wins,
 `Err` short-circuits. This replaces the visitor pattern with no heap allocation.
 
+`select_probe!` also supports two advanced forms:
+- `select_probe!(biased; ...)` — when multiple arms are ready simultaneously, the earliest arm in declaration order wins instead of an unspecified one.
+- `kill!(i)` — a macro available inside any arm that schedules arm `i` for cancellation on the next poll. Useful when one arm has gathered enough information to know a sibling can never win (e.g. the zero-copy string borrow succeeded, so the chunked fallback arm can be dropped before the next `.await`).
+
 ## Trait overview
 
 ### Borrow family (`'de` - zero-copy)
@@ -101,44 +106,49 @@ Deserialize<'de>      T::deserialize(d, ()) → Result<Probe<(Claim, T)>, Error>
 Deserializer<'de>     d.entry(|[e1, ..eN]| async { Ok(Probe::Hit((claim, r))) })
                         → Result<Probe<(Claim, R)>, Error>
 
-Entry<'de>            e.deserialize_bool()         → Result<Probe<(Claim, bool)>, Error>
-                      e.deserialize_u8/u16/u32/u64/u128()
-                      e.deserialize_i8/i16/i32/i64/i128()
-                      e.deserialize_f32/f64()
-                      e.deserialize_char()
-                      e.deserialize_str()          → Result<Probe<(Claim, &'de str)>, Error>
-                      e.deserialize_str_chunks()   → Result<Probe<StrAccess>, Error>
-                      e.deserialize_bytes()        → Result<Probe<(Claim, &'de [u8])>, Error>
-                      e.deserialize_bytes_chunks() → Result<Probe<BytesAccess>, Error>
-                      e.deserialize_map()          → Result<Probe<MapAccess>, Error>
-                      e.deserialize_seq()          → Result<Probe<SeqAccess>, Error>
-                      e.deserialize_option::<T, ()>(())  → Result<Probe<(Claim, Option<T>)>, Error>
-                      e.skip()                    → Result<Claim, Error>
-                      e.deserialize_value::<T, E>(e) → Result<Probe<(Claim, T)>, Error>
+Entry<'de>            e.deserialize_str()            → Result<Probe<(Claim, &'de str)>, Error>
+                      e.deserialize_str_chunks()     → Result<Probe<StrAccess>, Error>
+                      e.deserialize_bytes()          → Result<Probe<(Claim, &'de [u8])>, Error>
+                      e.deserialize_bytes_chunks()   → Result<Probe<BytesAccess>, Error>
+                      e.deserialize_number_chunks()  → Result<Probe<NumberAccess>, Error>
+                      e.deserialize_map()            → Result<Probe<MapAccess>, Error>
+                      e.deserialize_seq()            → Result<Probe<SeqAccess>, Error>
+                      e.deserialize_map_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.deserialize_seq_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.deserialize_option::<T, ()>(())   → Result<Probe<(Claim, Option<T>)>, Error>
+                      e.deserialize_value::<T, E>(e)      → Result<Probe<(Claim, T)>, Error>
+                      e.skip()                       → Result<Claim, Error>
 
 Chunk<Data, Done>     Data(item) | Done(claim)
+NextKey<KP, MC>       Entry(KP) | Done(MC)
 
 StrAccess             chunks.next_str(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                       chunks.fork() → Self
 BytesAccess           chunks.next_bytes(|&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                       chunks.fork() → Self
+NumberAccess          chunks.next_number_chunk(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
+                      chunks.fork() → Self
 
 MapAccess             map.iterate(arms: impl MapArmStack) → Result<Probe<(Claim, Outputs)>, Error>
                       map.fork() → Self
 
-MapKeyProbe           kp.deserialize_key::<K, Extra>(extra) → Result<Probe<(Claim, K)>, Error>
+MapKeyProbe           kp.deserialize_key::<K>(extra) → Result<Probe<(KeyClaim, K)>, Error>
                       kp.fork() → Self
   MapKeyClaim         kc.into_value_probe() → MapValueProbe
-    MapValueProbe     vp.deserialize_value::<V, Extra>(extra) → Result<Probe<(Claim, V)>, Error>
-                      vp.skip() → Result<Claim, Error>
+    MapValueProbe     vp.deserialize_value::<V>(extra) → Result<Probe<(ValueClaim, V)>, Error>
+                      vp.deserialize_map_into::<V>(extra) → Result<Probe<(ValueClaim, V)>, Error>
+                      vp.deserialize_seq_into::<V>(extra) → Result<Probe<(ValueClaim, V)>, Error>
+                      vp.skip() → Result<ValueClaim, Error>
                       vp.fork() → Self
-      MapValueClaim   vc.next_key() → Result<Probe<Chunk<(MapKeyProbe, R), Claim>>, Error>
+      MapValueClaim   vc.next_key(..) → Result<NextKey<MapKeyProbe, MapClaim>, Error>
 
 SeqAccess             seq.next(|[e]| async { Ok(Probe::Hit((claim, r))) })
                         → Result<Probe<Chunk<(Self, R), Claim>>, Error>
                       seq.fork() → Self
 
 SeqEntry              e.get::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.get_map_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.get_seq_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
                       e.skip()     → Result<Claim, Error>
 ```
 
@@ -152,14 +162,19 @@ to map the short-lived borrow to an owned value.
 ```
 DeserializeOwned       T::deserialize_owned(d, ()) → Result<Probe<(Claim, T)>, Error>
 DeserializerOwned      d.entry(self, closure) → Result<Probe<(Claim, R)>, Error>
-EntryOwned             (same probes minus deserialize_str/bytes, plus skip)
+EntryOwned             (same probes minus deserialize_str/bytes; includes
+                        deserialize_number_chunks, deserialize_map_into, deserialize_seq_into)
 StrAccessOwned         chunks.next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                            chunks.fork() → Self
 BytesAccessOwned       chunks.next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
                            chunks.fork() → Self
+NumberAccessOwned      chunks.next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
+                           chunks.fork() → Self
 SeqAccessOwned         seq.next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
                            seq.fork() → Self
 SeqEntryOwned          e.get(self, ()) → Result<Probe<(Claim, T)>, Error>
+                           e.get_map_into(self, ()) → Result<Probe<(Claim, T)>, Error>
+                           e.get_seq_into(self, ()) → Result<Probe<(Claim, T)>, Error>
                            e.skip(self) → Result<Claim, Error>
 ```
 
@@ -513,15 +528,13 @@ struct Explicit<'a, 'b, 'c> {
 **`Skip`** - `Deserialize<'de>` + `DeserializeOwned` (Extra = ()). Discards any
 token unconditionally. Always `Hit`.
 
-**`Match`** - Checks a token for an exact content match. `Extra` is the expected
-value:
+**`Match`** - Checks a string token for an exact content match. `Extra` is the
+expected string:
 
-| impl                         | family | token  |
-| ---------------------------- | ------ | ------ |
-| `Deserialize<'de, &'a str>`  | borrow | string |
-| `Deserialize<'de, &'a [u8]>` | borrow | bytes  |
-| `DeserializeOwned<&'a str>`  | owned  | string |
-| `DeserializeOwned<&'a [u8]>` | owned  | bytes  |
+| impl                        | family | token  |
+| --------------------------- | ------ | ------ |
+| `Deserialize<'de, &'static str>`  | borrow | string |
+| `DeserializeOwned<&'static str>`  | owned  | string |
 
 Returns `Hit(Match)` when content equals `extra`, `Miss` otherwise (stream not
 advanced). Use with `deserialize_value` inside `select_probe!` for string-tag
@@ -535,26 +548,23 @@ d.entry(|[e1, e2]| select_probe! {
 })
 ```
 
-The borrow-family str/bytes impls race the zero-copy probe against the chunked
-fallback (N=2 entry handles) so escaped strings are handled without a separate
-`d.entry` call.
+The borrow-family impl races the zero-copy `deserialize_str` probe against the
+chunked fallback (N=2 entry handles) so escaped strings are handled without a
+separate `d.entry` call. `Match` and `MatchVals` have independent implementations.
 
-**`MatchVals<T>`** - generalises `Match` to return a caller-supplied `T` on a
-content match. The same four family × token impls as `Match`. `Extra` is an
-array of `(&str, T)` / `(&[u8], T)` pairs, or plain `[&str; N]` / `[&[u8]; N]`
-for `MatchVals<usize>` index-only dispatch. `T` must be `Copy`:
+**`MatchVals<T, const N>`** - generalises `Match` to return a caller-supplied `T` on a
+content match. The same two family impls as `Match`. `Extra` is an array of
+`N` `(&'static str, T)` pairs. `T` must be `Copy`:
 
 ```rust
 // Return the matched enum variant
 e.deserialize_value::<MatchVals<MyEnum>, _>([("a", MyEnum::A), ("b", MyEnum::B)]).await
 
 // Return the matched index
-e.deserialize_value::<MatchVals<usize>, _>(["foo", "bar"]).await
+e.deserialize_value::<MatchVals<usize>, _>([("foo", 0usize), ("bar", 1usize)]).await
 ```
 
-`Match` is a thin wrapper that delegates to `MatchVals`.
-
-**`UnwrapOrElse<T>`** - wraps `T: Deserialize<'de, Extra>` with an async
+**`UnwrapOrElse<T, F>`** - wraps `T: Deserialize<'de, Extra>` with an async
 fallback. `Extra` is `(F, InnerExtra)` where `F: AsyncFnOnce() -> T`. Arm 1
 tries `T::deserialize`; if it misses, arm 2 calls `skip()` to consume the entry
 and then calls the fallback. The stream is always advanced exactly once:
@@ -613,4 +623,4 @@ and chunked/streaming owned-family deserializer (`strede-json::chunked`).
 | --------------- | -------------------------------------------------------------- |
 | `strede`        | core traits (borrow + owned families), `shared_buf` module     |
 | `strede-json`   | JSON deserializer backend (in-memory + chunked/streaming)      |
-| `strede-derive` | proc-macro: `Deserialize`, `DeserializeOwned`, `select_probe!` |
+| `strede-derive` | proc-macro: `Deserialize`, `DeserializeOwned`                  |

@@ -128,7 +128,7 @@ static DEEP_JSON: &[u8] = br#"{
 macro_rules! strede_borrow {
     ($T:ty, $input:expr) => {{
         let de = JsonDeserializer::new(black_box($input));
-        let result = block_on(<$T as strede::Deserialize<'_>>::deserialize(de, ())).unwrap();
+        let result = block_on(<$T as strede::Deserialize<'_, _>>::deserialize(de, ())).unwrap();
         let Probe::Hit((_, v)) = result else {
             panic!("Miss")
         };
@@ -147,7 +147,7 @@ macro_rules! strede_owned {
             },
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                <$T as DeserializeOwned>::deserialize_owned(de, ())
+                <$T as DeserializeOwned<_>>::deserialize_owned(de, ())
                     .await
                     .unwrap()
                     .unwrap()
