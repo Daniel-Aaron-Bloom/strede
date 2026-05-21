@@ -1127,36 +1127,51 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
 // ---------------------------------------------------------------------------
 // Per-format primitive Deserialize impls
 //
-// Each ships an `impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for T`.
-// The orphan rule allows this because `JsonSubDeserializer` is a local type.
+// Both `JsonDeserializer` and `JsonSubDeserializer` are local types, so both
+// are covered here. The orphan rule is satisfied for either.
 // ---------------------------------------------------------------------------
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for bool {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            match e.token {
-                Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
-                    JsonClaim {
-                        tokenizer: tok,
-                        src: e.src,
-                    },
-                    b,
-                ))),
-                _ => Ok(Probe::Miss),
+macro_rules! impl_deserialize_bool {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for bool {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    match e.token {
+                        Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
+                            JsonClaim {
+                                tokenizer: tok,
+                                src: e.src,
+                            },
+                            b,
+                        ))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
             }
-        })
-        .await
-    }
+        })*
+    };
 }
+impl_deserialize_bool!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
 
 macro_rules! impl_deserialize_num {
     ($($t:ty),*) => {
-        $(impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for $t {
+        $(impl<'de> Deserialize<'de, JsonDeserializer<'de>> for $t {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: JsonDeserializer<'de>,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move { e.parse_num::<$t>().await }).await
+            }
+        }
+        impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for $t {
             type Extra = ();
             #[inline(always)]
             async fn deserialize(
@@ -1208,44 +1223,54 @@ macro_rules! impl_deserialize_number_borrowed {
 #[cfg(feature = "arbitrary_precision")]
 impl_deserialize_number_borrowed!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for char {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            let (claim, s) = hit!(e.deserialize_str().await);
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => Ok(Probe::Hit((claim, c))),
-                _ => Ok(Probe::Miss),
+macro_rules! impl_deserialize_char {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for char {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    let (claim, s) = hit!(e.deserialize_str().await);
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Ok(Probe::Hit((claim, c))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
             }
-        })
-        .await
-    }
+        })*
+    };
 }
+impl_deserialize_char!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for () {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            match e.token {
-                Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
-                    JsonClaim {
-                        tokenizer: tok,
-                        src: e.src,
-                    },
-                    (),
-                ))),
-                _ => Ok(Probe::Miss),
+macro_rules! impl_deserialize_unit {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for () {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    match e.token {
+                        Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
+                            JsonClaim {
+                                tokenizer: tok,
+                                src: e.src,
+                            },
+                            (),
+                        ))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
             }
-        })
-        .await
-    }
+        })*
+    };
 }
+impl_deserialize_unit!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);

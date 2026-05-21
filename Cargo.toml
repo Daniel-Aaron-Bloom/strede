@@ -3,6 +3,7 @@ members = [
     "strede",
     "strede-derive",
     "strede-json",
+    "strede-msgpack",
     "strede-test-util",
     "strede-bench",
 ]

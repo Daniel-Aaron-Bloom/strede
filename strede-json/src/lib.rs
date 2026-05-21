@@ -3,7 +3,7 @@
 //! - [`full`] - in-memory borrow-family deserializer ([`full::JsonDeserializer`])
 //! - [`chunked`] - streaming owned-family deserializer
 
-// #![no_std]
+#![no_std]
 #![allow(async_fn_in_trait)]
 
 pub mod chunked;

@@ -10,8 +10,8 @@ Async, zero-alloc, pull-based deserialization for Rust.
 ## The name
 
 _Strede_ is a **STREaming DEserializer** - a name deliberately close to
-[serde](https://serde.rs), the library it complements. It's also an Old English
-word meaning "stream" or "channel."
+[serde](https://serde.rs), the library it complements. It's also an Old English / Norwegian
+word meaning "stream" or "channel". It's pronounced STREH-duh.
 
 Streaming is the important use case externally - but internally, the architecture
 is built around coroutines. _COroutine DEserializer_ just doesn't abbreviate as well.
@@ -93,6 +93,7 @@ Probe results:
 `Err` short-circuits. This replaces the visitor pattern with no heap allocation.
 
 `select_probe!` also supports two advanced forms:
+
 - `select_probe!(biased; ...)` — when multiple arms are ready simultaneously, the earliest arm in declaration order wins instead of an unspecified one.
 - `kill!(i)` — a macro available inside any arm that schedules arm `i` for cancellation on the next poll. Useful when one arm has gathered enough information to know a sibling can never win (e.g. the zero-copy string borrow succeeded, so the chunked fallback arm can be dropped before the next `.await`).
 
@@ -531,10 +532,10 @@ token unconditionally. Always `Hit`.
 **`Match`** - Checks a string token for an exact content match. `Extra` is the
 expected string:
 
-| impl                        | family | token  |
-| --------------------------- | ------ | ------ |
-| `Deserialize<'de, &'static str>`  | borrow | string |
-| `DeserializeOwned<&'static str>`  | owned  | string |
+| impl                             | family | token  |
+| -------------------------------- | ------ | ------ |
+| `Deserialize<'de, &'static str>` | borrow | string |
+| `DeserializeOwned<&'static str>` | owned  | string |
 
 Returns `Hit(Match)` when content equals `extra`, `Miss` otherwise (stream not
 advanced). Use with `deserialize_value` inside `select_probe!` for string-tag
@@ -575,6 +576,98 @@ e.deserialize_value::<UnwrapOrElse<MyType>, _>((async || MyType::default(), ()))
 
 The derive macro uses `UnwrapOrElse<MatchVals<usize>>` with a sentinel fallback
 so unknown map keys produce a sentinel index while still consuming the key entry.
+
+## Implementing a format backend
+
+This section is for authors writing a new format crate (CBOR, MessagePack, etc.),
+not for users of an existing backend.
+
+### Which traits to implement
+
+You only need to implement the family (or families) your format can support.
+A simple in-memory format usually implements the **borrow family**
+(`Deserializer`, `Entry`, `MapAccess`, `SeqAccess`, `StrAccess`, `BytesAccess`,
+`NumberAccess`). A chunked/streaming format implements the **owned family**
+(`DeserializerOwned`, `EntryOwned`, and the `*Owned` accessor traits). The two
+families are independent; you can implement one, both, or neither for a given
+entry type.
+
+### The `Entry` contract
+
+The single most important invariant: **type mismatches must return
+`Ok(Probe::Miss)`, never `Err`**. `Err` is reserved for fatal format errors
+(malformed data, I/O failure). `Pending` means only "waiting for I/O" — never
+a type mismatch. All probe methods consume `self`.
+
+### Contrast with serde's visitor pattern
+
+In serde, your deserializer _drives_ the process by calling methods on a
+`Visitor` (`visit_u64`, `visit_str`, …). In strede the roles are reversed: the
+caller _probes_ the entry with `deserialize_number_chunks`, `deserialize_str`,
+etc. and gets `Hit`/`Miss` back. Your implementation does not call any visitor
+methods — it inspects the current token and returns the appropriate `Probe`.
+
+### Primitive type impls are format-specific
+
+Unlike serde — where `u32: Deserialize` is provided by the serde crate itself
+— in strede `Deserialize<'de, D>` for numeric types (`u8`, `u32`, `f64`, …) and
+`bool` **must be provided by each format backend**. For most formats the right
+approach is to decode the wire value directly — inspect the current token,
+cast or convert in place, and return `Hit` or `Miss`. `deserialize_number_chunks`
+exists as a common denominator for text-based formats and arbitrary-precision
+integers; for ordinary numeric types, routing through it just to parse a string
+back into a number adds unnecessary overhead. That said, providing it as a
+fallback (e.g. for callers that want arbitrary-precision access) is fine.
+
+String-like types (`String`, `Cow<str>`, `Box<str>`, `&'de str`) are already
+provided by core strede generically via `deserialize_str` / `deserialize_str_chunks`
+— your backend gets them for free once `Entry` is implemented. The dividing line
+is: types whose wire encoding is format-independent ship in core; types whose
+encoding is format-dependent (numbers, booleans, raw bytes) are your
+responsibility.
+
+### Claim threading
+
+`Claim` is an opaque proof-of-consumption token that carries your parser's
+position forward. Each successful probe returns a new claim; that claim must be
+returned through `entry()`, `iterate()`, or `next()` to advance the stream.
+Store whatever per-step state you need (tokenizer position, buffer offset, …)
+inside your `Claim` type.
+
+### `fork()` and the deadlock rule (owned family)
+
+`fork()` creates an independent reader that shares the same underlying buffer.
+In the owned family **all forked readers must be polled concurrently** — race
+them with `select_probe!`. Sequentially awaiting one reader to completion before
+polling another will deadlock (see the "Owned family - parallel scanning"
+section above for the full explanation). `strede::shared_buf` provides a
+reference implementation of the multi-reader buffer coordination contract.
+
+### `Never<Claim, Error>` — stub accessor types
+
+If your format does not produce a particular accessor kind (e.g. no raw byte
+sequences), set the corresponding associated type to `Never`:
+
+```rust
+type BytesChunks = strede::Never<'de, Self::Claim, Self::Error>;
+```
+
+`Never` implements every trait in both families via an uninhabited match, so
+the trait obligation is satisfied without dead code.
+
+### `DeserializeError`
+
+Your error type must implement `strede::DeserializeError`, which requires one
+method: `duplicate_field(field: &'static str) -> Self`. This is called by
+derive-generated code when a map key appears twice.
+
+### Reference implementation
+
+`strede-json` is the canonical example. The borrow family lives in
+`strede_json` (the `JsonDeserializer` type); the owned family lives in
+`strede_json::chunked`. Reading those two modules alongside the trait
+definitions in `strede::borrow` and `strede::owned` is the fastest way to
+understand what a complete implementation looks like.
 
 ## Performance
 
@@ -619,8 +712,9 @@ and chunked/streaming owned-family deserializer (`strede-json::chunked`).
 
 ## Workspace
 
-| crate           | description                                                    |
-| --------------- | -------------------------------------------------------------- |
-| `strede`        | core traits (borrow + owned families), `shared_buf` module     |
-| `strede-json`   | JSON deserializer backend (in-memory + chunked/streaming)      |
-| `strede-derive` | proc-macro: `Deserialize`, `DeserializeOwned`                  |
+| crate              | description                                                |
+| ------------------ | ---------------------------------------------------------- |
+| `strede`           | core traits (borrow + owned families), `shared_buf` module |
+| `strede-json`      | JSON deserializer backend (in-memory + chunked/streaming)  |
+| `strede-msgpack`   | MessagePack deserializer backend (in-memory + chunked/streaming) |
+| `strede-derive`    | proc-macro: `Deserialize`, `DeserializeOwned`              |

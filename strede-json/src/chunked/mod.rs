@@ -714,6 +714,43 @@ pub(crate) async fn capture_raw_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut 
     Ok(handle)
 }
 
+/// Bit-per-depth open-bracket tracker for `skip_value_chunked`. Bit `i` is 1
+/// when depth `i+1` was opened by `{`, 0 when opened by `[`. Depths beyond
+/// 4096 are not validated.
+struct FixedBitSet([u64; 64]);
+
+impl FixedBitSet {
+    const fn new() -> Self {
+        Self([0u64; 64])
+    }
+
+    /// Returns `false` when `depth` exceeds the tracked range (> 4096).
+    fn set(&mut self, depth: usize, is_object: bool) -> bool {
+        let i = depth - 1;
+        if i >= 4096 {
+            return false;
+        }
+        let word = i / 64;
+        let bit = i % 64;
+        if is_object {
+            self.0[word] |= 1u64 << bit;
+        } else {
+            self.0[word] &= !(1u64 << bit);
+        }
+        true
+    }
+
+    fn is_object(&self, depth: usize) -> Option<bool> {
+        let i = depth - 1;
+        if i >= 4096 {
+            return None;
+        }
+        let word = i / 64;
+        let bit = i % 64;
+        Some((self.0[word] >> bit) & 1 == 1)
+    }
+}
+
 /// Skip one complete JSON value (scalar, string, object, or array) in chunked
 /// mode. Uses iterative depth tracking instead of recursion to stay no_std.
 pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
@@ -737,19 +774,48 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             *tokenizer = Tokenizer::new();
             Ok(handle)
         }
-        Token::Simple(SimpleToken::ObjectStart | SimpleToken::ArrayStart, t) => {
+        Token::Simple(open @ (SimpleToken::ObjectStart | SimpleToken::ArrayStart), t) => {
             *tokenizer = t;
             let mut depth = 1usize;
+            let mut stack = FixedBitSet::new();
+            stack.set(depth, open == SimpleToken::ObjectStart);
             while depth > 0 {
                 let mut pending = None;
                 let (h, tok) = next_dispatch(handle, tokenizer, offset, &mut pending).await?;
                 handle = h;
                 match tok {
-                    Token::Simple(SimpleToken::ObjectStart | SimpleToken::ArrayStart, t) => {
-                        *tokenizer = t;
+                    Token::Simple(
+                        inner @ (SimpleToken::ObjectStart | SimpleToken::ArrayStart),
+                        t,
+                    ) => {
                         depth += 1;
+                        if stack.set(depth, inner == SimpleToken::ObjectStart) {
+                            *tokenizer = t;
+                        } else {
+                            #[cfg(feature = "alloc")]
+                            {
+                                handle = alloc::boxed::Box::pin(skip_value_chunked(
+                                    handle,
+                                    tokenizer,
+                                    offset,
+                                    Token::Simple(inner, t),
+                                ))
+                                .await?;
+                                depth -= 1;
+                            }
+                            #[cfg(not(feature = "alloc"))]
+                            {
+                                *tokenizer = t;
+                            }
+                        }
                     }
-                    Token::Simple(SimpleToken::ObjectEnd | SimpleToken::ArrayEnd, t) => {
+                    Token::Simple(close @ (SimpleToken::ObjectEnd | SimpleToken::ArrayEnd), t) => {
+                        if let Some(was_object) = stack.is_object(depth) {
+                            let is_object_end = close == SimpleToken::ObjectEnd;
+                            if was_object != is_object_end {
+                                return Err(JsonError::UnexpectedByte { byte: 0 });
+                            }
+                        }
                         *tokenizer = t;
                         depth -= 1;
                     }
@@ -961,3 +1027,98 @@ use access::{
     ChunkedJsonBytesAccess, ChunkedJsonMapAccessOwned, ChunkedJsonNumberAccess,
     ChunkedJsonSeqAccess, ChunkedJsonStrAccess,
 };
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::ChunkedJsonDeserializer;
+    use std::{boxed::Box, vec::Vec};
+    use strede::shared_buf::SharedBuf;
+    use strede::{DeserializeOwned, Skip};
+    use strede_test_util::block_on;
+
+    fn skip_input(input: &'static [u8]) -> Result<(), crate::JsonError> {
+        block_on(SharedBuf::with_async(
+            input,
+            async move |buf: &mut &[u8]| {
+                *buf = &[];
+            },
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                match Skip::deserialize_owned(de, ()).await? {
+                    strede::Probe::Hit(_) => Ok(()),
+                    strede::Probe::Miss => Err(crate::JsonError::UnexpectedByte { byte: 0 }),
+                }
+            },
+        ))
+    }
+
+    #[test]
+    fn skip_mismatched_object_close_with_array_end() {
+        // {] is not valid JSON — object opened but array-end used to close it.
+        assert!(skip_input(b"{]").is_err());
+    }
+
+    #[test]
+    fn skip_mismatched_array_close_with_object_end() {
+        // [} is not valid JSON — array opened but object-end used to close it.
+        assert!(skip_input(b"[}").is_err());
+    }
+
+    #[test]
+    fn skip_mismatched_nested() {
+        // {"a": [} — mismatch inside a nested structure.
+        assert!(skip_input(b"{\"a\":[}").is_err());
+    }
+
+    #[test]
+    fn skip_matched_object() {
+        assert!(skip_input(b"{}").is_ok());
+    }
+
+    #[test]
+    fn skip_matched_array() {
+        assert!(skip_input(b"[]").is_ok());
+    }
+
+    /// Build a `&'static [u8]` from a `Vec` via `Box::leak` for use in tests.
+    fn skip_input_owned(input: Vec<u8>) -> Result<(), crate::JsonError> {
+        skip_input(Box::leak(input.into_boxed_slice()))
+    }
+
+    /// 4096 `[`s + `{}` + 4096 `]`s — valid at any depth, must succeed in both alloc and no-alloc.
+    #[test]
+    fn skip_deep_nesting_valid() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'[', 4096));
+        input.extend_from_slice(b"{}");
+        input.extend(std::iter::repeat_n(b']', 4096));
+        assert!(skip_input_owned(input).is_ok());
+    }
+
+    /// 4096 `[`s + `{` + `]` (mismatched close at depth 4097) + 4096 `]`s.
+    /// With `alloc`, the recursive call catches the mismatch and returns an error.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn skip_deep_nesting_mismatch_alloc() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat(b'[').take(4096));
+        input.push(b'{');
+        input.push(b']'); // closes `{` with `]` — mismatch
+        input.extend(std::iter::repeat(b']').take(4096));
+        assert!(skip_input_owned(input).is_err());
+    }
+
+    /// Same mismatch, but without `alloc`. Validation is skipped beyond depth 4096
+    /// so the mismatched close is silently accepted and skip returns `Ok`.
+    #[cfg(not(feature = "alloc"))]
+    #[test]
+    fn skip_deep_nesting_mismatch_no_alloc() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'[', 4096));
+        input.push(b'{');
+        input.push(b']'); // closes `{` with `]` — mismatch silently ignored
+        input.extend(std::iter::repeat_n(b']', 4096));
+        assert!(skip_input_owned(input).is_ok());
+    }
+}

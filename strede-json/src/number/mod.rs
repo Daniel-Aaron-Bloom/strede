@@ -315,6 +315,7 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
 mod tests {
     use super::*;
     extern crate std;
+    use std::{borrow::ToOwned, eprintln, vec::Vec};
     use strede_test_util::block_on;
 
     use crate::full::JsonDeserializer;
