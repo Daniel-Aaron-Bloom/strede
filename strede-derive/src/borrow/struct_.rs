@@ -601,6 +601,37 @@ pub(super) fn expand(
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
 
+    // For non-flatten structs, the Deserialize<'de, __D> impl delegates through
+    // DeserializeFromMap so its where-clause only needs Self: DeserializeFromMap
+    // rather than propagating every field type's ValueSubDeserializer chain. This
+    // prevents unbounded projection chains when this struct appears as a nested type.
+    let (de_impl_generics, de_where_clause) = if flatten_fields.is_empty() {
+        let mut impl_gen_d2 = input.generics.clone();
+        insert_de_and_d_borrow(&mut impl_gen_d2, krate);
+        {
+            let wc = impl_gen_d2.make_where_clause();
+            if let Some(preds) = &container_attrs.bound {
+                wc.predicates.extend(preds.iter().cloned());
+            } else {
+                for tp in input.generics.type_params() {
+                    let ident = &tp.ident;
+                    wc.predicates.push(type_param_bound_borrow(krate, ident));
+                }
+                wc.predicates.push(syn::parse_quote!(
+                    #name #ty_generics: #krate::DeserializeFromMap<
+                        'de,
+                        <__D::Entry as #krate::Entry<'de>>::Map,
+                        Extra = ()
+                    >
+                ));
+            }
+        }
+        let (ig, _, wc) = impl_gen_d2.split_for_impl();
+        (quote! { #ig }, quote! { #wc })
+    } else {
+        (quote! { #impl_generics }, quote! { #where_clause })
+    };
+
     // Build one MapArmSlot per non-skipped, non-flatten field.
     // `kp_ty` / `vp_ty` are the KeyProbe and ValueProbe type tokens used
     // inside the slot closures — they differ between the Deserialize (__D)
@@ -618,13 +649,13 @@ pub(super) fn expand(
                 let key_fn = if wire_names.len() == 1 {
                     let wname = wire_names[0];
                     quote! {
-                        |mut __kp: #kp_ty| {
+                        |mut __kp: #kp_ty, _i: usize| {
                             __kp.deserialize_key::<#krate::Match>(#wname)
                         }
                     }
                 } else {
                     quote! {
-                        |mut __kp: #kp_ty| {
+                        |mut __kp: #kp_ty, _i: usize| {
                             __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*])
                         }
                     }
@@ -725,7 +756,7 @@ pub(super) fn expand(
                         #krate::DetectDuplicatesOwned::new(
                             #expr,
                             __wn,
-                            move |__kp: #krate::borrow::KP<'de, __D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                            move |__kp: #krate::borrow::KP<'de, __D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
                             |__vp: #krate::borrow::VP2<'de, __D>| __vp.skip(),
                         )
                     }
@@ -983,42 +1014,9 @@ pub(super) fn expand(
         }
     } else {
         // Regular path: no flatten fields.
-        let arms_expr = {
-            let mut expr = quote! { #krate::MapArmBase };
-            for slot in &arm_slots {
-                expr = quote! { (#expr, #slot) };
-            }
-            expr = quote! {
-                {
-                    let __wn = [#( #dup_wire_names, )*];
-                    #krate::DetectDuplicatesOwned::new(
-                        #expr,
-                        __wn,
-                        move |__kp: #krate::borrow::KP<'de, __D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
-                        |__vp: #krate::borrow::VP2<'de, __D>| __vp.skip(),
-                    )
-                }
-            };
-            if allow_unknown_fields {
-                expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: #krate::borrow::KP<'de, __D>| __kp.deserialize_key::<#krate::Skip>(()),
-                    |__vp: #krate::borrow::VP2<'de, __D>, _k: #krate::Skip| async move {
-                        use #krate::MapValueProbe as _;
-                        let __vc = __vp.skip().await?;
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                    },
-                )) };
-            }
-            expr
-        };
-
         quote! {
             d.entry(|[__e]| async {
-                let __map = #krate::hit!(__e.deserialize_map().await);
-                let __arms = #arms_expr;
-                let (__claim, #output_pat) = #krate::hit!(__map.iterate(__arms).await);
-                #( #regular_field_finalizers )*
-                ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name { #( #field_names, )* })))
+                __e.deserialize_map_into::<Self>(()).await
             }).await
         }
     };
@@ -1039,14 +1037,14 @@ pub(super) fn expand(
                     #krate::DetectDuplicatesOwned::new(
                         #expr,
                         __wn,
-                        move |__kp: <__M as #krate::MapAccess<'de>>::KeyProbe| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                        move |__kp: <__M as #krate::MapAccess<'de>>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
                         |__vp: #krate::borrow::VP<'de, <__M as #krate::MapAccess<'de>>::KeyProbe>| __vp.skip(),
                     )
                 }
             };
             if allow_unknown_fields {
                 expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: <__M as #krate::MapAccess<'de>>::KeyProbe| __kp.deserialize_key::<#krate::Skip>(()),
+                    |__kp: <__M as #krate::MapAccess<'de>>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
                     |__vp: #krate::borrow::VP<'de, <__M as #krate::MapAccess<'de>>::KeyProbe>, _k: #krate::Skip| async move {
                         use #krate::MapValueProbe as _;
                         let __vc = __vp.skip().await?;
@@ -1131,7 +1129,7 @@ pub(super) fn expand(
             #de_with_wrappers
             #flatten_cont_structs
 
-            impl #impl_generics #krate::Deserialize<'de, __D> for #name #ty_generics #where_clause {
+            impl #de_impl_generics #krate::Deserialize<'de, __D> for #name #ty_generics #de_where_clause {
                 type Extra = ();
                 async fn deserialize(
                     d: __D,

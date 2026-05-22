@@ -19,8 +19,9 @@ use crate::token::MsgpackToken;
 use core::future::Future;
 use strede::utils::repeat;
 use strede::{
-    Buffer, DeserializeFromMapOwned, DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned,
-    EntryOwned, Handle, Never, Probe, SharedBuf, hit,
+    Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
+    EnumVariantProbeOwned, Handle, Never, Probe, SharedBuf, hit,
 };
 
 // ---------------------------------------------------------------------------
@@ -815,7 +816,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
     type NumberChunks = Never<'s, ChunkedMsgpackClaim<'s, B, F>, MsgpackError>;
     type Map = access::ChunkedMsgpackMapAccess<'s, B, F>;
     type Seq = access::ChunkedMsgpackSeqAccess<'s, B, F>;
-
+    type Enum = ChunkedMsgpackEnumAccess<'s, B, F>;
     #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
@@ -935,6 +936,20 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
         T::deserialize_from_seq_owned(seq, extra).await
     }
 
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_enum_into<T>(
+        self,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnumOwned<Self::Enum>,
+    {
+        Ok(Probe::Miss)
+    }
+
     #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut offset = self.offset;
@@ -944,6 +959,56 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
             handle,
             remaining_after: 0,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChunkedMsgpackEnumAccess — stub (not yet implemented)
+// ---------------------------------------------------------------------------
+
+/// Stub [`EnumAccessOwned`] for the chunked MessagePack deserializer.
+///
+/// Owned-family enum deserialization is not yet implemented.
+/// `iterate` always returns `Probe::Miss`.
+pub struct ChunkedMsgpackEnumAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    _handle: Handle<'s, B, F>,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedMsgpackEnumAccess<'s, B, F> {
+    type Error = MsgpackError;
+    type Claim = ChunkedMsgpackClaim<'s, B, F>;
+    type VariantProbe = ChunkedMsgpackEnumVariantProbe<'s, B, F>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            _handle: self._handle.fork(),
+        }
+    }
+
+    async fn iterate<S>(self, _arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStackOwned<Self::VariantProbe>,
+    {
+        Ok(Probe::Miss)
+    }
+}
+
+/// Stub [`EnumVariantProbeOwned`] for the chunked MessagePack deserializer.
+pub struct ChunkedMsgpackEnumVariantProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    _handle: Handle<'s, B, F>,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
+    for ChunkedMsgpackEnumVariantProbe<'s, B, F>
+{
+    type Error = MsgpackError;
+    type Claim = ChunkedMsgpackClaim<'s, B, F>;
+    type PayloadDeserializer = ChunkedMsgpackSubDeserializer<'s, B, F>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            _handle: self._handle.fork(),
+        }
     }
 }
 

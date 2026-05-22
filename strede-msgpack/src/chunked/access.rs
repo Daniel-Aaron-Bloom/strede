@@ -7,10 +7,9 @@ use crate::MsgpackError;
 use crate::token::MsgpackToken;
 use core::future::Future;
 use strede::{
-    Buffer, BytesAccessOwned, Chunk, DeserializeFromMapOwned, DeserializeFromSeqOwned,
-    DeserializeOwned, Handle, MapAccessOwned, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
-    MapValueClaimOwned, MapValueProbeOwned, NextKey, Probe, SeqAccessOwned, SeqEntryOwned,
-    StrAccessOwned, hit, utils::repeat,
+    Buffer, BytesAccessOwned, Chunk, DeserializeOwned, Handle, MapAccessOwned, MapArmStackOwned,
+    MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned, NextKey, Probe,
+    SeqAccessOwned, SeqEntryOwned, StrAccessOwned, hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -248,9 +247,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned
     type MapClaim = ChunkedMsgpackClaim<'s, B, F>;
     type ValueClaim = ChunkedMsgpackClaim<'s, B, F>;
     type ValueSubDeserializer = ChunkedMsgpackSubDeserializer<'s, B, F>;
-    type ValueMap = ChunkedMsgpackMapAccess<'s, B, F>;
-    type ValueSeq = ChunkedMsgpackSeqAccess<'s, B, F>;
-
     #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
@@ -280,69 +276,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned
                 v,
             ))),
             Probe::Miss => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn deserialize_map_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromMapOwned<Self::ValueMap>,
-    {
-        match self.value_tok {
-            MsgpackToken::Map(count) => {
-                let map = ChunkedMsgpackMapAccess {
-                    handle: self.handle,
-                    offset: self.offset,
-                    remaining: count,
-                };
-                match V::deserialize_from_map_owned(map, extra).await? {
-                    Probe::Hit((claim, v)) => Ok(Probe::Hit((
-                        ChunkedMsgpackClaim {
-                            handle: claim.handle,
-                            offset: claim.offset,
-                            remaining_after: self.remaining_after,
-                        },
-                        v,
-                    ))),
-                    Probe::Miss => Ok(Probe::Miss),
-                }
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn deserialize_seq_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromSeqOwned<Self::ValueSeq>,
-    {
-        match self.value_tok {
-            MsgpackToken::Array(count) => {
-                let seq = ChunkedMsgpackSeqAccess {
-                    handle: self.handle,
-                    offset: self.offset,
-                    remaining: count,
-                    first: true,
-                };
-                match V::deserialize_from_seq_owned(seq, extra).await? {
-                    Probe::Hit((claim, v)) => Ok(Probe::Hit((
-                        ChunkedMsgpackClaim {
-                            handle: claim.handle,
-                            offset: claim.offset,
-                            remaining_after: self.remaining_after,
-                        },
-                        v,
-                    ))),
-                    Probe::Miss => Ok(Probe::Miss),
-                }
-            }
-            _ => Ok(Probe::Miss),
         }
     }
 
@@ -518,8 +451,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedMsgpackSeqEn
     type Error = MsgpackError;
     type Claim = ChunkedMsgpackClaim<'s, B, F>;
     type SubDeserializer = ChunkedMsgpackSubDeserializer<'s, B, F>;
-    type Map = ChunkedMsgpackMapAccess<'s, B, F>;
-    type Seq = ChunkedMsgpackSeqAccess<'s, B, F>;
 
     #[inline(always)]
     fn fork(&mut self) -> Self {
@@ -537,43 +468,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedMsgpackSeqEn
     {
         let sub = ChunkedMsgpackSubDeserializer::new(self.handle, self.offset, self.elem_tok);
         T::deserialize_owned(sub, extra).await
-    }
-
-    #[inline(always)]
-    async fn get_map_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromMapOwned<Self::Map>,
-    {
-        match self.elem_tok {
-            MsgpackToken::Map(count) => {
-                let map = ChunkedMsgpackMapAccess {
-                    handle: self.handle,
-                    offset: self.offset,
-                    remaining: count,
-                };
-                T::deserialize_from_map_owned(map, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn get_seq_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromSeqOwned<Self::Seq>,
-    {
-        match self.elem_tok {
-            MsgpackToken::Array(count) => {
-                let seq = ChunkedMsgpackSeqAccess {
-                    handle: self.handle,
-                    offset: self.offset,
-                    remaining: count,
-                    first: true,
-                };
-                T::deserialize_from_seq_owned(seq, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
     }
 
     #[inline(always)]

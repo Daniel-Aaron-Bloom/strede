@@ -58,8 +58,11 @@ impl<K, V> ArmState<K, V> {
 /// One slot in the arm stack. Holds the key callback, value callback, and
 /// accumulated state for a single struct field.
 ///
-/// - `KeyFn: FnMut(KP) -> KeyFut` where `KeyFut: Future<Output = Result<Probe<(KeyClaim, K)>, Error>>`
-/// - `ValFn: FnMut(ValueProbe, K) -> ValFut` where `ValFut: Future<Output = Result<Probe<(ValueClaim, V)>, Error>>`
+/// - `KeyFn: FnMut(KP, usize) -> KeyFut` — races against an incoming key probe from the
+///   format. The `usize` is this arm's global positional index (0-based), computed at
+///   `init_race` time. Named-only arms ignore it; arms that also support positional access
+///   can call `kp.deserialize_key_by_index(i)` and race it via `select_probe!`.
+/// - `ValFn: FnMut(ValueProbe, K) -> ValFut` — dispatches the value once a key is resolved.
 pub struct MapArmSlot<K, V, KeyFn, ValFn> {
     pub key_fn: KeyFn,
     pub val_fn: ValFn,
@@ -107,7 +110,7 @@ impl<Rest, S, T> core::ops::Add<MapArm<T>> for (Rest, S) {
 /// - Stores `K` from the key race in `pending_key` so `init_dispatch` can
 ///   pass it to `val_fn`.
 ///
-/// `KeyFn: FnMut(KP) -> KeyFut` - creates the key-matching future.
+/// `KeyFn: FnMut(KP, usize) -> KeyFut` - creates the key-matching future.
 /// `ValFn: FnMut(VP, K) -> ValFut` - creates the value-dispatch future.
 pub struct VirtualArmSlot<K, KeyFn, ValFn> {
     pub key_fn: KeyFn,
@@ -308,13 +311,14 @@ where
 
 /// Build a left-nested arm tuple from a flat list of arm definitions.
 ///
-/// Each arm is `key_closure => value_closure`, which expands to a
-/// [`MapArmSlot`] wrapping the two closures.
+/// Each arm is `key_closure => value_closure`. Key closures receive `(KP, usize)` where
+/// the `usize` is the arm's global positional index — ignore it (`_i`) for named-only
+/// matching, or pass it to `kp.deserialize_key_by_index(i)` for positional support.
 ///
 /// ```rust,ignore
 /// let arms = map_arms! {
-///     |kp| kp.deserialize_key::<Match, _>("secs") => |vp, k| { ... },
-///     |kp| kp.deserialize_key::<Match, _>("nanos") => |vp, k| { ... },
+///     |kp, _i| kp.deserialize_key::<Match, _>("secs") => |vp, k| { ... },
+///     |kp, _i| kp.deserialize_key::<Match, _>("nanos") => |vp, k| { ... },
 /// };
 /// ```
 ///
@@ -355,7 +359,7 @@ macro_rules! SkipUnknown {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp: $vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbe as _;
                     let vc = vp.skip().await?;
@@ -369,7 +373,7 @@ macro_rules! SkipUnknown {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbe as _;
                     let vc = vp.skip().await?;
@@ -389,7 +393,7 @@ macro_rules! DetectDuplicates {
         $crate::DetectDuplicatesOwned::new(
             $inner,
             __wn,
-            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
             |vp: $vp| vp.skip(),
         )
     }};
@@ -408,7 +412,7 @@ macro_rules! TagInjectingStack {
             __tf,
             __tc,
             $tag_value,
-            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
             move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
         )
     }};
@@ -429,7 +433,7 @@ macro_rules! SkipUnknownOwned {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp: $vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbeOwned as _;
                     let vc = vp.skip().await?;
@@ -444,7 +448,7 @@ macro_rules! SkipUnknownOwned {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbeOwned as _;
                     let vc = vp.skip().await?;
@@ -468,7 +472,7 @@ macro_rules! DetectDuplicatesOwned {
         $crate::DetectDuplicatesOwned::new(
             $inner,
             __wn,
-            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
             |vp: $vp| vp.skip(),
         )
     }};
@@ -489,7 +493,7 @@ macro_rules! TagInjectingStackOwned {
             __tf,
             __tc,
             $tag_value,
-            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
             move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
         )
     }};

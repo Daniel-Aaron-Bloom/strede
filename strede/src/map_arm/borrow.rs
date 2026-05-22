@@ -36,7 +36,7 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
 
     type RaceState;
 
-    fn init_race(&mut self, kp: KP) -> Self::RaceState;
+    fn init_race(&mut self, kp: KP, arm_base: usize) -> Self::RaceState;
     #[allow(clippy::type_complexity)]
     fn poll_race_one(
         &mut self,
@@ -60,7 +60,7 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
-        let mut race_state = core::pin::pin!(self.init_race(kp));
+        let mut race_state = core::pin::pin!(self.init_race(kp, 0));
         core::future::poll_fn(|cx| {
             let mut all_miss = true;
             for i in 0..Self::SIZE {
@@ -117,7 +117,7 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
     type RaceState = ();
 
     #[inline(always)]
-    fn init_race(&mut self, _kp: KP) {}
+    fn init_race(&mut self, _kp: KP, _arm_base: usize) {}
     #[inline(always)]
     fn poll_race_one(
         &mut self,
@@ -154,7 +154,7 @@ impl<'de, KP, Rest, K, V, KeyFn, KeyFut, ValFn, ValFut> MapArmStack<'de, KP>
 where
     KP: MapKeyProbe<'de>,
     Rest: MapArmStack<'de, KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
     ValFn: FnMut(BVP<'de, KP>, K) -> ValFut,
     ValFut: Future<Output = Result<Probe<(BVC<'de, KP>, (K, V))>, KP::Error>>,
@@ -174,15 +174,15 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = if self.1.state.is_done() {
             None
         } else {
-            Some((self.1.key_fn)(kp))
+            Some((self.1.key_fn)(kp, arm_base + Self::SIZE - 1))
         };
         SlotRaceState {
-            rest: self.0.init_race(rest_kp),
+            rest: self.0.init_race(rest_kp, arm_base),
             this: this_fut,
         }
     }
@@ -262,7 +262,7 @@ impl<'de, KP, Rest, K, KeyFn, KeyFut, ValFn, ValFut> MapArmStack<'de, KP>
 where
     KP: MapKeyProbe<'de>,
     Rest: MapArmStack<'de, KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
     ValFn: FnMut(BVP<'de, KP>, K) -> ValFut,
     ValFut: Future<Output = Result<Probe<(BVC<'de, KP>, ())>, KP::Error>>,
@@ -282,11 +282,11 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
-        let this_fut = (self.1.key_fn)(kp);
+        let this_fut = (self.1.key_fn)(kp, arm_base + Self::SIZE - 1);
         SlotRaceState {
-            rest: self.0.init_race(rest_kp),
+            rest: self.0.init_race(rest_kp, arm_base),
             this: Some(this_fut),
         }
     }
@@ -408,7 +408,7 @@ impl<'de, KP, S, const M: usize, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStack<'de
 where
     KP: MapKeyProbe<'de>,
     S: MapArmStack<'de, KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<
         Output = Result<Probe<(KP::KeyClaim, crate::impls::MatchVals<usize, { M }>)>, KP::Error>,
     >,
@@ -430,11 +430,11 @@ where
     type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
         let dup_kp = kp.fork();
-        let dup_fut = (self.key_fn)(dup_kp);
+        let dup_fut = (self.key_fn)(dup_kp, arm_base + Self::SIZE - 1);
         WrapperRaceState {
-            inner: self.inner.init_race(kp),
+            inner: self.inner.init_race(kp, arm_base),
             virtual_arm: Some(dup_fut),
         }
     }
@@ -503,7 +503,7 @@ impl<'de, 'v, KP, S, const N: usize, TagKeyFn, TagKeyFut, TagValFn, TagValFut> M
 where
     KP: MapKeyProbe<'de>,
     S: MapArmStack<'de, KP>,
-    TagKeyFn: FnMut(KP) -> TagKeyFut,
+    TagKeyFn: FnMut(KP, usize) -> TagKeyFut,
     TagKeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::impls::Match)>, KP::Error>>,
     TagValFn: FnMut(BVP<'de, KP>) -> TagValFut,
     TagValFut: Future<
@@ -525,12 +525,14 @@ where
     type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
         let inner_kp = kp.fork();
-        let tag_fut = (self.tag_key_fn)(kp);
+        // Tag arm is always at global index 0; arm_base is irrelevant for it
+        // but we pass arm_base to the closure for consistency.
+        let tag_fut = (self.tag_key_fn)(kp, arm_base);
         TagRaceState {
             tag_fut: Some(tag_fut),
-            inner: self.inner.init_race(inner_kp),
+            inner: self.inner.init_race(inner_kp, arm_base + 1),
         }
     }
 
@@ -619,11 +621,11 @@ where
     type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
         let b_kp = kp.fork();
         ConcatRaceState {
-            a: self.0.init_race(kp),
-            b: self.1.init_race(b_kp),
+            a: self.0.init_race(kp, arm_base),
+            b: self.1.init_race(b_kp, arm_base + A::SIZE),
         }
     }
 

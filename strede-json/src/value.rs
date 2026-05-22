@@ -148,7 +148,7 @@ where
     }
 
     type RaceState = ();
-    fn init_race(&mut self, _: KP) {
+    fn init_race(&mut self, _: KP, _: usize) {
         unreachable!()
     }
     fn poll_race_one(
@@ -328,7 +328,7 @@ where
     }
 
     type RaceState = ();
-    fn init_race(&mut self, _: KP) {
+    fn init_race(&mut self, _: KP, _: usize) {
         unreachable!()
     }
     fn poll_race_one(

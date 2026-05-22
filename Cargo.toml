@@ -4,6 +4,7 @@ members = [
     "strede-derive",
     "strede-json",
     "strede-msgpack",
+    "strede-cbor",
     "strede-test-util",
     "strede-bench",
 ]

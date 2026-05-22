@@ -86,7 +86,7 @@ where
             tf,
             tc,
             tv,
-            move |kp: M::KeyProbe| kp.deserialize_key::<Match>(tf),
+            move |kp: M::KeyProbe, _i: usize| kp.deserialize_key::<Match>(tf),
             move |vp: crate::borrow::VP<'de, M::KeyProbe>| {
                 vp.deserialize_value::<MatchVals<usize, N>>(tc)
             },
@@ -268,7 +268,7 @@ where
             tf,
             tc,
             tv,
-            move |kp: M::KeyProbe| kp.deserialize_key::<Match>(tf),
+            move |kp: M::KeyProbe, _i: usize| kp.deserialize_key::<Match>(tf),
             move |vp: crate::owned::VP<M::KeyProbe>| {
                 vp.deserialize_value::<MatchVals<usize, N>>(tc)
             },

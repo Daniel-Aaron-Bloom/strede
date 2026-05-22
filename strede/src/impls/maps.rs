@@ -28,12 +28,12 @@ where
         d.entry(|[e]| async move {
             let map = hit!(e.deserialize_map().await);
             let arms = crate::map_arms! {
-                |kp: crate::borrow::KP<'de, D>| kp.deserialize_key::<crate::Match>("secs")
+                |kp: crate::borrow::KP<'de, D>, _i: usize| kp.deserialize_key::<crate::Match>("secs")
                 => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
                     let (vc, v) = hit!(vp.deserialize_value::<u64>(()).await);
                     Ok(Probe::Hit((vc, (k, v))))
                 },
-                |kp: crate::borrow::KP<'de, D>| kp.deserialize_key::<crate::Match>("nanos")
+                |kp: crate::borrow::KP<'de, D>, _i: usize| kp.deserialize_key::<crate::Match>("nanos")
                 => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
                     let (vc, v) = hit!(vp.deserialize_value::<u32>(()).await);
                     Ok(Probe::Hit((vc, (k, v))))
@@ -65,12 +65,12 @@ where
         d.entry(|[e]| async move {
             let map = hit!(e.deserialize_map().await);
             let arms = crate::map_arms! {
-                |kp: crate::owned::KP<D>| kp.deserialize_key::<crate::Match>("secs")
+                |kp: crate::owned::KP<D>, _i: usize| kp.deserialize_key::<crate::Match>("secs")
                 => |vp: crate::owned::VP2<D>, k: crate::Match| async move {
                     let (vc, v) = hit!(vp.deserialize_value::<u64>(()).await);
                     Ok(Probe::Hit((vc, (k, v))))
                 },
-                |kp: crate::owned::KP<D>| kp.deserialize_key::<crate::Match>("nanos")
+                |kp: crate::owned::KP<D>, _i: usize| kp.deserialize_key::<crate::Match>("nanos")
                 => |vp: crate::owned::VP2<D>, k: crate::Match| async move {
                     let (vc, v) = hit!(vp.deserialize_value::<u32>(()).await);
                     Ok(Probe::Hit((vc, (k, v))))
@@ -111,12 +111,12 @@ mod systemtime_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let arms = crate::map_arms! {
-                    |kp: crate::borrow::KP<'de, D>| kp.deserialize_key::<crate::Match>("secs_since_epoch")
+                    |kp: crate::borrow::KP<'de, D>, _i: usize| kp.deserialize_key::<crate::Match>("secs_since_epoch")
                     => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
                         let (vc, v) = hit!(vp.deserialize_value::<u64>(()).await);
                         Ok(Probe::Hit((vc, (k, v))))
                     },
-                    |kp: crate::borrow::KP<'de, D>| kp.deserialize_key::<crate::Match>("nanos_since_epoch")
+                    |kp: crate::borrow::KP<'de, D>, _i: usize| kp.deserialize_key::<crate::Match>("nanos_since_epoch")
                     => |vp: crate::borrow::VP2<'de, D>, k: crate::Match| async move {
                         let (vc, v) = hit!(vp.deserialize_value::<u32>(()).await);
                         Ok(Probe::Hit((vc, (k, v))))
@@ -147,12 +147,12 @@ mod systemtime_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let arms = crate::map_arms! {
-                    |kp: crate::owned::KP<D>| kp.deserialize_key::<crate::Match>("secs_since_epoch")
+                    |kp: crate::owned::KP<D>, _i: usize| kp.deserialize_key::<crate::Match>("secs_since_epoch")
                     => |vp: crate::owned::VP2<D>, k: crate::Match| async move {
                         let (vc, v) = hit!(vp.deserialize_value::<u64>(()).await);
                         Ok(Probe::Hit((vc, (k, v))))
                     },
-                    |kp: crate::owned::KP<D>| kp.deserialize_key::<crate::Match>("nanos_since_epoch")
+                    |kp: crate::owned::KP<D>, _i: usize| kp.deserialize_key::<crate::Match>("nanos_since_epoch")
                     => |vp: crate::owned::VP2<D>, k: crate::Match| async move {
                         let (vc, v) = hit!(vp.deserialize_value::<u32>(()).await);
                         Ok(Probe::Hit((vc, (k, v))))
@@ -218,7 +218,7 @@ mod btreemap_impls {
         }
 
         type RaceState = ();
-        fn init_race(&mut self, _: KP) -> () {
+        fn init_race(&mut self, _: KP, _: usize) -> () {
             unreachable!()
         }
         fn poll_race_one(
@@ -324,7 +324,7 @@ mod btreemap_impls {
         }
 
         type RaceState = ();
-        fn init_race(&mut self, _: KP) -> () {
+        fn init_race(&mut self, _: KP, _: usize) -> () {
             unreachable!()
         }
         fn poll_race_one(
@@ -441,7 +441,7 @@ mod hashmap_impls {
         }
 
         type RaceState = ();
-        fn init_race(&mut self, _: KP) -> () {
+        fn init_race(&mut self, _: KP, _: usize) -> () {
             unreachable!()
         }
         fn poll_race_one(
@@ -548,7 +548,7 @@ mod hashmap_impls {
         }
 
         type RaceState = ();
-        fn init_race(&mut self, _: KP) -> () {
+        fn init_race(&mut self, _: KP, _: usize) -> () {
             unreachable!()
         }
         fn poll_race_one(

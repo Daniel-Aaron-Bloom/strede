@@ -143,6 +143,7 @@ pub trait EntryOwned: Sized {
     type NumberChunks: NumberAccessOwned<Claim = Self::Claim, Error = Self::Error>;
     type Map: MapAccessOwned<MapClaim = Self::Claim, Error = Self::Error>;
     type Seq: SeqAccessOwned<SeqClaim = Self::Claim, Error = Self::Error>;
+    type Enum: EnumAccessOwned<Claim = Self::Claim, Error = Self::Error>;
 
     async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error>;
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
@@ -177,6 +178,15 @@ pub trait EntryOwned: Sized {
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeFromSeqOwned<Self::Seq>;
+
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error>;
+
+    async fn deserialize_enum_into<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnumOwned<Self::Enum>;
 
     fn fork(&mut self) -> Self;
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
@@ -294,22 +304,12 @@ pub trait SeqEntryOwned: Sized {
     type Claim;
 
     type SubDeserializer: DeserializerOwned<Claim = Self::Claim, Error = Self::Error>;
-    type Map: MapAccessOwned<MapClaim = Self::Claim, Error = Self::Error>;
-    type Seq: SeqAccessOwned<SeqClaim = Self::Claim, Error = Self::Error>;
 
     fn fork(&mut self) -> Self;
 
     async fn get<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeOwned<Self::SubDeserializer>;
-
-    async fn get_map_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromMapOwned<Self::Map>;
-
-    async fn get_seq_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromSeqOwned<Self::Seq>;
 
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
 }
@@ -337,6 +337,18 @@ pub trait MapKeyProbeOwned: Sized {
     ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error>
     where
         K: DeserializeOwned<Self::KeySubDeserializer>;
+
+    /// Match the key by positional index rather than by name.
+    ///
+    /// Returns `Ok(Probe::Hit((claim, ())))` if this key corresponds to the
+    /// field at position `expected` (0-based). Returns `Ok(Probe::Miss)` by
+    /// default — formats that support positional access override this.
+    async fn deserialize_key_by_index(
+        self,
+        _expected: usize,
+    ) -> Result<Probe<(Self::KeyClaim, ())>, Self::Error> {
+        Ok(Probe::Miss)
+    }
 }
 
 /// Proof that a key was consumed. Converts into a value probe.
@@ -360,9 +372,6 @@ pub trait MapValueProbeOwned: Sized {
     type ValueClaim: MapValueClaimOwned<MapClaim = Self::MapClaim, Error = Self::Error>;
 
     type ValueSubDeserializer: DeserializerOwned<Claim = Self::ValueClaim, Error = Self::Error>;
-    type ValueMap: MapAccessOwned<MapClaim = Self::ValueClaim, Error = Self::Error>;
-    type ValueSeq: SeqAccessOwned<SeqClaim = Self::ValueClaim, Error = Self::Error>;
-
     fn fork(&mut self) -> Self;
 
     async fn deserialize_value<V>(
@@ -371,20 +380,6 @@ pub trait MapValueProbeOwned: Sized {
     ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
     where
         V: DeserializeOwned<Self::ValueSubDeserializer>;
-
-    async fn deserialize_map_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromMapOwned<Self::ValueMap>;
-
-    async fn deserialize_seq_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromSeqOwned<Self::ValueSeq>;
 
     async fn skip(self) -> Result<Self::ValueClaim, Self::Error>;
 }
@@ -427,8 +422,92 @@ pub type VP2<D> = <<KP<D> as MapKeyProbeOwned>::KeyClaim as MapKeyClaimOwned>::V
 /// Shorthand for the sequence element entry type reachable from a DeserializerOwned.
 pub type SE<D> = <<<D as DeserializerOwned>::Entry as EntryOwned>::Seq as SeqAccessOwned>::Elem;
 
+pub use crate::enum_arm::EnumArmStackOwned;
 pub use crate::map_arm::MapArmStackOwned;
 pub use crate::map_arm::owned::FlattenContOwned;
+
+// ===========================================================================
+// Owned-family enum access
+// ===========================================================================
+
+/// Owned counterpart to [`crate::EnumVariantProbe`].
+pub trait EnumVariantProbeOwned: Sized {
+    type Error: DeserializeError;
+    type Claim;
+    type PayloadDeserializer: DeserializerOwned<Claim = Self::Claim, Error = Self::Error>;
+
+    fn fork(&mut self) -> Self;
+
+    async fn deserialize_unit_by_name<const N: usize>(
+        self,
+        _candidates: [(&'static str, usize); N],
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_payload_by_name<T, const N: usize>(
+        self,
+        _candidates: [(&'static str, usize); N],
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_unit_by_index(
+        self,
+        _expected_idx: usize,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_payload_by_index<T>(
+        self,
+        _expected_idx: usize,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        Ok(Probe::Miss)
+    }
+
+    /// Try to deserialize `T` directly from the current token with no discriminant.
+    /// Used for untagged variants. Default impl: `Ok(Probe::Miss)`.
+    async fn deserialize_value_by_shape<T>(
+        self,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        Ok(Probe::Miss)
+    }
+}
+
+/// Owned counterpart to [`crate::EnumAccess`].
+pub trait EnumAccessOwned: Sized {
+    type Error: DeserializeError;
+    type Claim;
+    type VariantProbe: EnumVariantProbeOwned<Claim = Self::Claim, Error = Self::Error>;
+
+    fn fork(&mut self) -> Self;
+
+    async fn iterate<S>(self, arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStackOwned<Self::VariantProbe>;
+}
+
+/// Owned counterpart to [`crate::DeserializeFromEnum`].
+pub trait DeserializeFromEnumOwned<E: EnumAccessOwned>: Sized {
+    type Extra;
+    async fn deserialize_from_enum_owned(
+        e: E,
+        extra: Self::Extra,
+    ) -> Result<Probe<(E::Claim, Self)>, E::Error>;
+}
 
 /// An in-progress map for the owned family.
 ///

@@ -484,13 +484,13 @@ pub(super) fn expand_owned(
                 let key_fn = if wire_names.len() == 1 {
                     let name = wire_names[0];
                     quote! {
-                        |mut __kp: #kp_ty| {
+                        |mut __kp: #kp_ty, _i: usize| {
                             __kp.deserialize_key::<#krate::Match>(#name)
                         }
                     }
                 } else {
                     quote! {
-                        |mut __kp: #kp_ty| {
+                        |mut __kp: #kp_ty, _i: usize| {
                             __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*])
                         }
                     }
@@ -586,7 +586,7 @@ pub(super) fn expand_owned(
                         #krate::DetectDuplicatesOwned::new(
                             #expr,
                             __wn,
-                            move |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                            move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
                             |__vp: #krate::owned::VP2<__D>| __vp.skip(),
                         )
                     }
@@ -828,14 +828,14 @@ pub(super) fn expand_owned(
                     #krate::DetectDuplicatesOwned::new(
                         #expr,
                         __wn,
-                        move |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                        move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
                         |__vp: #krate::owned::VP2<__D>| __vp.skip(),
                     )
                 }
             };
             if allow_unknown_fields {
                 expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::Skip>(()),
+                    |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
                     |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
                         let __vc = __vp.skip().await?;
                         ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
@@ -876,14 +876,14 @@ pub(super) fn expand_owned(
                     #krate::DetectDuplicatesOwned::new(
                         #expr,
                         __wn,
-                        move |__kp: <__M as #krate::MapAccessOwned>::KeyProbe| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                        move |__kp: <__M as #krate::MapAccessOwned>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
                         |__vp: #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>| __vp.skip(),
                     )
                 }
             };
             if allow_unknown_fields {
                 expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: <__M as #krate::MapAccessOwned>::KeyProbe| __kp.deserialize_key::<#krate::Skip>(()),
+                    |__kp: <__M as #krate::MapAccessOwned>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
                     |__vp: #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>, _k: #krate::Skip| async move {
                         use #krate::MapValueProbeOwned as _;
                         let __vc = __vp.skip().await?;

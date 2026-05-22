@@ -53,6 +53,7 @@
 extern crate alloc;
 
 pub mod borrow;
+pub mod enum_arm;
 mod error;
 mod impls;
 pub mod map_arm;
@@ -85,9 +86,10 @@ pub struct FlattenTerminalBoxed;
 
 // -- borrow family --
 pub use borrow::{
-    BytesAccess, Deserialize, DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry,
-    FlattenCont, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
-    NumberAccess, SeqAccess, SeqEntry, StrAccess,
+    BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
+    Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, FlattenCont, MapAccess,
+    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, SeqAccess,
+    SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -141,15 +143,20 @@ macro_rules! __left_nest_pat {
 }
 
 // -- utility types --
+pub use impls::string_enum::{match_entry_str_against, match_str_chunks_against};
 pub use impls::{
     FlattenMapAccess, FlattenMapAccessOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
     UnwrapOrElse,
 };
 
+// -- enum arm building blocks --
+pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
+
 // -- owned family --
 pub use owned::{
-    ArmState, BytesAccessOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned, DeserializeOwned,
-    DeserializerOwned, DetectDuplicatesOwned, EntryOwned, FlattenContOwned, MapAccessOwned, MapArm,
+    ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
+    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicatesOwned,
+    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, FlattenContOwned, MapAccessOwned, MapArm,
     MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
     MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
     SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned, VirtualArmSlot,

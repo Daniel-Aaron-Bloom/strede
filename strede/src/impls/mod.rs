@@ -27,6 +27,7 @@ use core::marker::PhantomData;
 
 mod maps;
 mod sequences;
+pub mod string_enum;
 mod strings;
 mod tag_flatten;
 mod utility;

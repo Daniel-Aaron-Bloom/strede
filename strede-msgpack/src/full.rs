@@ -26,9 +26,9 @@ use crate::{
     token::{MsgpackToken, next_token, skip_value},
 };
 use strede::{
-    BytesAccess, Chunk, Deserialize, DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry,
-    MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, Never, NextKey,
-    Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
+    BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
+    Deserializer, Entry, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
+    MapValueProbe, Never, NextKey, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
     type NumberChunks = Never<'de, MsgpackClaim<'de>, MsgpackError>;
     type Map = MsgpackMapAccess<'de>;
     type Seq = MsgpackSeqAccess<'de>;
-
+    type Enum = Never<'de, MsgpackClaim<'de>, MsgpackError>;
     fn fork(&mut self) -> Self {
         self.clone()
     }
@@ -340,6 +340,20 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
     {
         let seq = hit!(Entry::deserialize_seq(self).await);
         T::deserialize_from_seq(seq, extra).await
+    }
+
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_enum_into<T>(
+        self,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnum<'de, Self::Enum>,
+    {
+        Ok(Probe::Miss)
     }
 
     #[inline(always)]
@@ -613,9 +627,6 @@ impl<'de> MapValueProbe<'de> for MsgpackMapValueProbe<'de> {
     type MapClaim = MsgpackClaim<'de>;
     type ValueClaim = MsgpackClaim<'de>;
     type ValueSubDeserializer = MsgpackSubDeserializer<'de>;
-    type ValueMap = MsgpackMapAccess<'de>;
-    type ValueSeq = MsgpackSeqAccess<'de>;
-
     #[inline(always)]
     fn fork(&mut self) -> Self {
         self.clone()
@@ -640,66 +651,6 @@ impl<'de> MapValueProbe<'de> for MsgpackMapValueProbe<'de> {
                 v,
             ))),
             Probe::Miss => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn deserialize_map_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromMap<'de, Self::ValueMap>,
-    {
-        let remaining_after = self.remaining_after;
-        match self.value_tok {
-            MsgpackToken::Map(count) => {
-                let map = MsgpackMapAccess {
-                    src: self.src,
-                    remaining: count,
-                };
-                match V::deserialize_from_map(map, extra).await? {
-                    Probe::Hit((claim, v)) => Ok(Probe::Hit((
-                        MsgpackClaim {
-                            src: claim.src,
-                            remaining_after,
-                        },
-                        v,
-                    ))),
-                    Probe::Miss => Ok(Probe::Miss),
-                }
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn deserialize_seq_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromSeq<'de, Self::ValueSeq>,
-    {
-        let remaining_after = self.remaining_after;
-        match self.value_tok {
-            MsgpackToken::Array(count) => {
-                let seq = MsgpackSeqAccess {
-                    src: self.src,
-                    remaining: count,
-                };
-                match V::deserialize_from_seq(seq, extra).await? {
-                    Probe::Hit((claim, v)) => Ok(Probe::Hit((
-                        MsgpackClaim {
-                            src: claim.src,
-                            remaining_after,
-                        },
-                        v,
-                    ))),
-                    Probe::Miss => Ok(Probe::Miss),
-                }
-            }
-            _ => Ok(Probe::Miss),
         }
     }
 
@@ -870,8 +821,6 @@ impl<'de> SeqEntry<'de> for MsgpackSeqEntry<'de> {
     type Error = MsgpackError;
     type Claim = MsgpackClaim<'de>;
     type SubDeserializer = MsgpackSubDeserializer<'de>;
-    type Map = MsgpackMapAccess<'de>;
-    type Seq = MsgpackSeqAccess<'de>;
 
     #[inline(always)]
     fn fork(&mut self) -> Self {
@@ -885,40 +834,6 @@ impl<'de> SeqEntry<'de> for MsgpackSeqEntry<'de> {
     {
         let sub = MsgpackSubDeserializer::new(self.src, self.elem_tok);
         T::deserialize(sub, extra).await
-    }
-
-    #[inline(always)]
-    async fn get_map_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromMap<'de, Self::Map>,
-    {
-        match self.elem_tok {
-            MsgpackToken::Map(count) => {
-                let map = MsgpackMapAccess {
-                    src: self.src,
-                    remaining: count,
-                };
-                T::deserialize_from_map(map, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn get_seq_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromSeq<'de, Self::Seq>,
-    {
-        match self.elem_tok {
-            MsgpackToken::Array(count) => {
-                let seq = MsgpackSeqAccess {
-                    src: self.src,
-                    remaining: count,
-                };
-                T::deserialize_from_seq(seq, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
     }
 
     #[inline(always)]
