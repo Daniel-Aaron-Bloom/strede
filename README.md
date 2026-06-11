@@ -124,14 +124,10 @@ Chunk<Data, Done>     Data(item) | Done(claim)
 NextKey<KP, MC>       Entry(KP) | Done(MC)
 
 StrAccess             chunks.next_str(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 BytesAccess           chunks.next_bytes(|&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 NumberAccess          chunks.next_number_chunk(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 
 MapAccess             map.iterate(arms: impl MapArmStack) → Result<Probe<(Claim, Outputs)>, Error>
-                      map.fork() → Self
 
 MapKeyProbe           kp.deserialize_key::<K>(extra) → Result<Probe<(KeyClaim, K)>, Error>
                       kp.fork() → Self
@@ -145,11 +141,11 @@ MapKeyProbe           kp.deserialize_key::<K>(extra) → Result<Probe<(KeyClaim,
 
 SeqAccess             seq.next(|[e]| async { Ok(Probe::Hit((claim, r))) })
                         → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                      seq.fork() → Self
 
 SeqEntry              e.get::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
                       e.get_map_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
                       e.get_seq_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.fork() → Self
                       e.skip()     → Result<Claim, Error>
 ```
 
@@ -166,16 +162,13 @@ DeserializerOwned      d.entry(self, closure) → Result<Probe<(Claim, R)>, Erro
 EntryOwned             (same probes minus deserialize_str/bytes; includes
                         deserialize_number_chunks, deserialize_map_into, deserialize_seq_into)
 StrAccessOwned         chunks.next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 BytesAccessOwned       chunks.next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 NumberAccessOwned      chunks.next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 SeqAccessOwned         seq.next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                           seq.fork() → Self
 SeqEntryOwned          e.get(self, ()) → Result<Probe<(Claim, T)>, Error>
                            e.get_map_into(self, ()) → Result<Probe<(Claim, T)>, Error>
                            e.get_seq_into(self, ()) → Result<Probe<(Claim, T)>, Error>
+                           e.fork() → Self
                            e.skip(self) → Result<Claim, Error>
 ```
 
@@ -191,8 +184,9 @@ them with `select_probe!` without borrow conflicts.
 ### Owned family - parallel scanning
 
 The owned family reads from a streaming source where data arrives
-incrementally. When `entry` passes multiple handles, or when you `fork` an
-accessor, the resulting readers share the same underlying buffer.
+incrementally. When `entry` passes multiple handles, or when you `fork` a
+probe item (`Entry`, `SeqEntry`, `MapKeyProbe`, `MapValueProbe`,
+`EnumVariantProbe`), the resulting readers share the same underlying buffer.
 
 **You must drive all forked readers concurrently** - typically via
 `select_probe!`. Sequentially awaiting one reader to completion before
@@ -201,6 +195,12 @@ data that cannot arrive until all sibling readers have consumed the current
 chunk. This is safe to do: forked readers never interfere with each other,
 and every reader is automatically suspended and resumed as new data becomes
 available, provided all readers are being polled.
+
+Structural accessors (`MapAccess`, `SeqAccess`, `EnumAccess`, `StrAccess`,
+`BytesAccess`, `NumberAccess`) do not have `fork` — once opened they may be
+wrapped by layout adapters (e.g. `TagAwareMap`) that are single-use state
+machines. Concurrency inside a structural access is handled by the internal
+`map_arm` / `enum_arm` infrastructure.
 
 ## Deriving
 
@@ -339,34 +339,6 @@ struct Outer {
     pos: Inner,
 }
 // Deserializes: {"name": "p", "x": 1.0, "y": 2.0}
-```
-
-For structs with 3 or more flatten fields, use `#[strede(flatten(boxed))]`
-instead. Deeply-nested `StackConcat` types produce large async state machines
-that can overflow the stack; `flatten(boxed)` opts each continuation future
-into `Box::pin` to break the chain. Any flatten field annotated `flatten(boxed)`
-enables boxed mode for the entire flatten chain. Requires the `alloc` feature.
-
-```rust
-#[derive(strede::Deserialize)]
-struct Color { r: u8, g: u8, b: u8 }
-
-#[derive(strede::Deserialize)]
-struct Size { w: f64, h: f64 }
-
-#[derive(strede::Deserialize)]
-struct Point { x: f64, y: f64 }
-
-#[derive(strede::Deserialize)]
-struct Shape {
-    #[strede(flatten(boxed))]
-    pos: Point,
-    #[strede(flatten(boxed))]
-    color: Color,
-    #[strede(flatten(boxed))]
-    size: Size,
-}
-// Deserializes: {"x": 0.0, "y": 0.0, "r": 0, "g": 0, "b": 0, "w": 1.0, "h": 1.0}
 ```
 
 `#[strede(untagged)]` on an enum or individual variant enables shape-based
@@ -636,12 +608,23 @@ inside your `Claim` type.
 
 ### `fork()` and the deadlock rule (owned family)
 
-`fork()` creates an independent reader that shares the same underlying buffer.
-In the owned family **all forked readers must be polled concurrently** — race
-them with `select_probe!`. Sequentially awaiting one reader to completion before
-polling another will deadlock (see the "Owned family - parallel scanning"
-section above for the full explanation). `strede::shared_buf` provides a
-reference implementation of the multi-reader buffer coordination contract.
+`fork()` is defined on probe items: `Entry`, `SeqEntry`, `MapKeyProbe`,
+`MapValueProbe`, `EnumVariantProbe` (and their Owned counterparts). It creates
+an independent reader that shares the same underlying buffer. In the owned
+family **all forked readers must be polled concurrently** — race them with
+`select_probe!`. Sequentially awaiting one reader to completion before polling
+another will deadlock (see the "Owned family - parallel scanning" section above
+for the full explanation).
+
+Structural accessors (`MapAccess`, `SeqAccess`, `EnumAccess`, `StrAccess`,
+`BytesAccess`, `NumberAccess` and their Owned counterparts) do not implement
+`fork`. These types may be wrapped by layout-modifier adapters generated by the
+derive macro (e.g. `TagAwareMap` for `#[strede(tag)]`) which are single-use
+state machines. Any concurrency inside them is handled by the `map_arm` /
+`enum_arm` infrastructure.
+
+`strede::shared_buf` provides a reference implementation of the multi-reader
+buffer coordination contract for probe items.
 
 ### `Never<Claim, Error>` — stub accessor types
 

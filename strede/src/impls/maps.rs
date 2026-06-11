@@ -180,34 +180,40 @@ mod btreemap_impls {
     use crate::borrow::{KP, MapKeyProbe, VC, VP};
     use crate::owned::{self as owned_, MapKeyProbeOwned, MapValueProbeOwned};
     use alloc::collections::BTreeMap;
+    use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll};
 
-    pub struct CollectBTreeMap<K, V> {
+    pub struct CollectBTreeMap<K, V, KeyFn, ValFn> {
+        key_fn: KeyFn,
+        val_fn: ValFn,
         pending_key: Option<K>,
         out: BTreeMap<K, V>,
     }
 
-    impl<K: Ord, V> CollectBTreeMap<K, V> {
-        fn new() -> Self {
+    impl<K: Ord, V, KeyFn, ValFn> CollectBTreeMap<K, V, KeyFn, ValFn> {
+        fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
             Self {
+                key_fn,
+                val_fn,
                 pending_key: None,
                 out: BTreeMap::new(),
             }
         }
     }
 
-    impl<'de, KP, K, V> crate::MapArmStack<'de, KP> for CollectBTreeMap<K, V>
+    impl<'de, KP, K, V, KeyFn, KeyFut, ValFn, ValFut> crate::MapArmStack<'de, KP>
+        for CollectBTreeMap<K, V, KeyFn, ValFn>
     where
         KP: MapKeyProbe<'de>,
-        K: Deserialize<'de, KP::KeySubDeserializer, Extra = ()> + Ord,
-        V: Deserialize<
-                'de,
-                <VP<'de, KP> as crate::MapValueProbe<'de>>::ValueSubDeserializer,
-                Extra = (),
-            >,
+        K: Ord,
+        KeyFn: FnMut(KP) -> KeyFut,
+        KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+        ValFn: FnMut(VP<'de, KP>, K) -> ValFut,
+        ValFut: Future<Output = Result<Probe<(VC<'de, KP>, (K, V))>, KP::Error>>,
     {
         const SIZE: usize = 1;
+        const FIELD_COUNT: usize = 1;
         type Outputs = BTreeMap<K, V>;
 
         fn unsatisfied_count(&self) -> usize {
@@ -217,49 +223,48 @@ mod btreemap_impls {
             1
         }
 
-        type RaceState = ();
-        fn init_race(&mut self, _: KP, _: usize) -> () {
-            unreachable!()
+        type RaceState = KeyFut;
+        fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+            (self.key_fn)(kp)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_race_one(
             &mut self,
-            _: Pin<&mut ()>,
+            state: Pin<&mut KeyFut>,
             _: usize,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.pending_key = Some(k);
+                    Poll::Ready(Ok(Probe::Hit((0, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        type DispatchState = ();
-        fn init_dispatch(&mut self, _: usize, _: VP<'de, KP>) -> () {
-            unreachable!()
+        type DispatchState = ValFut;
+        fn init_dispatch(&mut self, _: usize, vp: VP<'de, KP>) -> ValFut {
+            let k = self.pending_key.take().expect("dispatch without pending key");
+            (self.val_fn)(vp, k)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_dispatch(
             &mut self,
-            _: Pin<&mut ()>,
-            _: &mut Context<'_>,
+            state: Pin<&mut ValFut>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
-            unreachable!()
-        }
-
-        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-            let (kc, k) = hit!(kp.deserialize_key::<K>(()).await);
-            self.pending_key = Some(k);
-            Ok(Probe::Hit((0, kc)))
-        }
-
-        async fn dispatch_value(
-            &mut self,
-            _: usize,
-            vp: VP<'de, KP>,
-        ) -> Result<Probe<(VC<'de, KP>, ())>, KP::Error> {
-            let k = self
-                .pending_key
-                .take()
-                .expect("dispatch without pending key");
-            let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
-            self.out.insert(k, v);
-            Ok(Probe::Hit((vc, ())))
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                    self.out.insert(k, v);
+                    Poll::Ready(Ok(Probe::Hit((vc, ()))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
         fn take_outputs(&mut self) -> Self::Outputs {
@@ -281,7 +286,14 @@ mod btreemap_impls {
         async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map.iterate(CollectBTreeMap::<K, V>::new()).await);
+                let (claim, out) = hit!(map.iterate(CollectBTreeMap::new(
+                    |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
+                    |vp: VP<'de, KP<'de, D>>, k| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                ))
+                .await);
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -290,30 +302,36 @@ mod btreemap_impls {
 
     // Owned family ---
 
-    pub struct CollectBTreeMapOwned<K, V> {
+    pub struct CollectBTreeMapOwned<K, V, KeyFn, ValFn> {
+        key_fn: KeyFn,
+        val_fn: ValFn,
         pending_key: Option<K>,
         out: BTreeMap<K, V>,
     }
 
-    impl<K: Ord, V> CollectBTreeMapOwned<K, V> {
-        fn new() -> Self {
+    impl<K: Ord, V, KeyFn, ValFn> CollectBTreeMapOwned<K, V, KeyFn, ValFn> {
+        fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
             Self {
+                key_fn,
+                val_fn,
                 pending_key: None,
                 out: BTreeMap::new(),
             }
         }
     }
 
-    impl<KP, K, V> crate::MapArmStackOwned<KP> for CollectBTreeMapOwned<K, V>
+    impl<KP, K, V, KeyFn, KeyFut, ValFn, ValFut> crate::MapArmStackOwned<KP>
+        for CollectBTreeMapOwned<K, V, KeyFn, ValFn>
     where
         KP: MapKeyProbeOwned,
-        K: DeserializeOwned<KP::KeySubDeserializer, Extra = ()> + Ord,
-        V: DeserializeOwned<
-                <owned_::VP<KP> as MapValueProbeOwned>::ValueSubDeserializer,
-                Extra = (),
-            >,
+        K: Ord,
+        KeyFn: FnMut(KP) -> KeyFut,
+        KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+        ValFn: FnMut(owned_::VP<KP>, K) -> ValFut,
+        ValFut: Future<Output = Result<Probe<(owned_::VC<KP>, (K, V))>, KP::Error>>,
     {
         const SIZE: usize = 1;
+        const FIELD_COUNT: usize = 1;
         type Outputs = BTreeMap<K, V>;
 
         fn unsatisfied_count(&self) -> usize {
@@ -323,52 +341,51 @@ mod btreemap_impls {
             1
         }
 
-        type RaceState = ();
-        fn init_race(&mut self, _: KP, _: usize) -> () {
-            unreachable!()
+        type RaceState = KeyFut;
+        fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+            (self.key_fn)(kp)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_race_one(
             &mut self,
-            _: Pin<&mut ()>,
+            state: Pin<&mut KeyFut>,
             _: usize,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.pending_key = Some(k);
+                    Poll::Ready(Ok(Probe::Hit((0, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        type DispatchState = ();
-        fn init_dispatch(&mut self, _: usize, _: owned_::VP<KP>) -> () {
-            unreachable!()
+        type DispatchState = ValFut;
+        fn init_dispatch(&mut self, _: usize, vp: owned_::VP<KP>) -> ValFut {
+            let k = self.pending_key.take().expect("dispatch without pending key");
+            (self.val_fn)(vp, k)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_dispatch(
             &mut self,
-            _: Pin<&mut ()>,
-            _: &mut Context<'_>,
+            state: Pin<&mut ValFut>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(owned_::VC<KP>, ())>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                    self.out.insert(k, v);
+                    Poll::Ready(Ok(Probe::Hit((vc, ()))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-            let (kc, k) = hit!(kp.deserialize_key::<K>(()).await);
-            self.pending_key = Some(k);
-            Ok(Probe::Hit((0, kc)))
-        }
-
-        async fn dispatch_value(
-            &mut self,
-            _: usize,
-            vp: owned_::VP<KP>,
-        ) -> Result<Probe<(owned_::VC<KP>, ())>, KP::Error> {
-            let k = self
-                .pending_key
-                .take()
-                .expect("dispatch without pending key");
-            let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
-            self.out.insert(k, v);
-            Ok(Probe::Hit((vc, ())))
-        }
-
-        fn take_outputs(&mut self) -> Self::Outputs {
+        fn take_outputs(&mut self) -> BTreeMap<K, V> {
             core::mem::take(&mut self.out)
         }
     }
@@ -387,7 +404,14 @@ mod btreemap_impls {
         async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map.iterate(CollectBTreeMapOwned::<K, V>::new()).await);
+                let (claim, out) = hit!(map.iterate(CollectBTreeMapOwned::new(
+                    |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
+                    |vp: owned_::VP<owned_::KP<D>>, k| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                ))
+                .await);
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -401,37 +425,43 @@ mod hashmap_impls {
     use super::*;
     use crate::borrow::{KP, MapKeyProbe, VC, VP};
     use crate::owned::{self as owned_, MapKeyProbeOwned, MapValueProbeOwned};
+    use core::future::Future;
     use core::hash::{BuildHasher, Hash};
     use core::pin::Pin;
     use core::task::{Context, Poll};
     use std::collections::HashMap;
 
-    pub struct CollectHashMap<K, V, S> {
+    pub struct CollectHashMap<K, V, S, KeyFn, ValFn> {
+        key_fn: KeyFn,
+        val_fn: ValFn,
         pending_key: Option<K>,
         out: HashMap<K, V, S>,
     }
 
-    impl<K, V, S: BuildHasher + Default> CollectHashMap<K, V, S> {
-        fn new() -> Self {
+    impl<K, V, S: BuildHasher + Default, KeyFn, ValFn> CollectHashMap<K, V, S, KeyFn, ValFn> {
+        fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
             Self {
+                key_fn,
+                val_fn,
                 pending_key: None,
                 out: HashMap::with_hasher(S::default()),
             }
         }
     }
 
-    impl<'de, KP, K, V, S> crate::MapArmStack<'de, KP> for CollectHashMap<K, V, S>
+    impl<'de, KP, K, V, S, KeyFn, KeyFut, ValFn, ValFut> crate::MapArmStack<'de, KP>
+        for CollectHashMap<K, V, S, KeyFn, ValFn>
     where
         KP: MapKeyProbe<'de>,
-        K: Deserialize<'de, KP::KeySubDeserializer, Extra = ()> + Eq + Hash,
-        V: Deserialize<
-                'de,
-                <VP<'de, KP> as crate::MapValueProbe<'de>>::ValueSubDeserializer,
-                Extra = (),
-            >,
+        K: Eq + Hash,
         S: BuildHasher + Default,
+        KeyFn: FnMut(KP) -> KeyFut,
+        KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+        ValFn: FnMut(VP<'de, KP>, K) -> ValFut,
+        ValFut: Future<Output = Result<Probe<(VC<'de, KP>, (K, V))>, KP::Error>>,
     {
         const SIZE: usize = 1;
+        const FIELD_COUNT: usize = 1;
         type Outputs = HashMap<K, V, S>;
         fn unsatisfied_count(&self) -> usize {
             0
@@ -440,49 +470,50 @@ mod hashmap_impls {
             1
         }
 
-        type RaceState = ();
-        fn init_race(&mut self, _: KP, _: usize) -> () {
-            unreachable!()
+        type RaceState = KeyFut;
+        fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+            (self.key_fn)(kp)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_race_one(
             &mut self,
-            _: Pin<&mut ()>,
+            state: Pin<&mut KeyFut>,
             _: usize,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.pending_key = Some(k);
+                    Poll::Ready(Ok(Probe::Hit((0, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        type DispatchState = ();
-        fn init_dispatch(&mut self, _: usize, _: VP<'de, KP>) -> () {
-            unreachable!()
+        type DispatchState = ValFut;
+        fn init_dispatch(&mut self, _: usize, vp: VP<'de, KP>) -> ValFut {
+            let k = self.pending_key.take().expect("dispatch without pending key");
+            (self.val_fn)(vp, k)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_dispatch(
             &mut self,
-            _: Pin<&mut ()>,
-            _: &mut Context<'_>,
+            state: Pin<&mut ValFut>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(VC<'de, KP>, ())>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                    self.out.insert(k, v);
+                    Poll::Ready(Ok(Probe::Hit((vc, ()))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-            let (kc, k) = hit!(kp.deserialize_key::<K>(()).await);
-            self.pending_key = Some(k);
-            Ok(Probe::Hit((0, kc)))
-        }
-        async fn dispatch_value(
-            &mut self,
-            _: usize,
-            vp: VP<'de, KP>,
-        ) -> Result<Probe<(VC<'de, KP>, ())>, KP::Error> {
-            let k = self
-                .pending_key
-                .take()
-                .expect("dispatch without pending key");
-            let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
-            self.out.insert(k, v);
-            Ok(Probe::Hit((vc, ())))
-        }
         fn take_outputs(&mut self) -> Self::Outputs {
             core::mem::replace(&mut self.out, HashMap::with_hasher(S::default()))
         }
@@ -505,7 +536,14 @@ mod hashmap_impls {
         async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map.iterate(CollectHashMap::<K, V, S>::new()).await);
+                let (claim, out) = hit!(map.iterate(CollectHashMap::<K, V, S, _, _>::new(
+                    |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
+                    |vp: VP<'de, KP<'de, D>>, k| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                ))
+                .await);
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -514,31 +552,37 @@ mod hashmap_impls {
 
     // Owned ---
 
-    pub struct CollectHashMapOwned<K, V, S> {
+    pub struct CollectHashMapOwned<K, V, S, KeyFn, ValFn> {
+        key_fn: KeyFn,
+        val_fn: ValFn,
         pending_key: Option<K>,
         out: HashMap<K, V, S>,
     }
 
-    impl<K, V, S: BuildHasher + Default> CollectHashMapOwned<K, V, S> {
-        fn new() -> Self {
+    impl<K, V, S: BuildHasher + Default, KeyFn, ValFn> CollectHashMapOwned<K, V, S, KeyFn, ValFn> {
+        fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
             Self {
+                key_fn,
+                val_fn,
                 pending_key: None,
                 out: HashMap::with_hasher(S::default()),
             }
         }
     }
 
-    impl<KP, K, V, S> crate::MapArmStackOwned<KP> for CollectHashMapOwned<K, V, S>
+    impl<KP, K, V, S, KeyFn, KeyFut, ValFn, ValFut> crate::MapArmStackOwned<KP>
+        for CollectHashMapOwned<K, V, S, KeyFn, ValFn>
     where
         KP: MapKeyProbeOwned,
-        K: DeserializeOwned<KP::KeySubDeserializer, Extra = ()> + Eq + Hash,
-        V: DeserializeOwned<
-                <owned_::VP<KP> as MapValueProbeOwned>::ValueSubDeserializer,
-                Extra = (),
-            >,
+        K: Eq + Hash,
         S: BuildHasher + Default,
+        KeyFn: FnMut(KP) -> KeyFut,
+        KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
+        ValFn: FnMut(owned_::VP<KP>, K) -> ValFut,
+        ValFut: Future<Output = Result<Probe<(owned_::VC<KP>, (K, V))>, KP::Error>>,
     {
         const SIZE: usize = 1;
+        const FIELD_COUNT: usize = 1;
         type Outputs = HashMap<K, V, S>;
         fn unsatisfied_count(&self) -> usize {
             0
@@ -547,49 +591,50 @@ mod hashmap_impls {
             1
         }
 
-        type RaceState = ();
-        fn init_race(&mut self, _: KP, _: usize) -> () {
-            unreachable!()
+        type RaceState = KeyFut;
+        fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+            (self.key_fn)(kp)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_race_one(
             &mut self,
-            _: Pin<&mut ()>,
+            state: Pin<&mut KeyFut>,
             _: usize,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                    self.pending_key = Some(k);
+                    Poll::Ready(Ok(Probe::Hit((0, kc))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        type DispatchState = ();
-        fn init_dispatch(&mut self, _: usize, _: owned_::VP<KP>) -> () {
-            unreachable!()
+        type DispatchState = ValFut;
+        fn init_dispatch(&mut self, _: usize, vp: owned_::VP<KP>) -> ValFut {
+            let k = self.pending_key.take().expect("dispatch without pending key");
+            (self.val_fn)(vp, k)
         }
+        #[allow(clippy::type_complexity)]
         fn poll_dispatch(
             &mut self,
-            _: Pin<&mut ()>,
-            _: &mut Context<'_>,
+            state: Pin<&mut ValFut>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Probe<(owned_::VC<KP>, ())>, KP::Error>> {
-            unreachable!()
+            match state.poll(cx) {
+                Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                    self.out.insert(k, v);
+                    Poll::Ready(Ok(Probe::Hit((vc, ()))))
+                }
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
 
-        async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-            let (kc, k) = hit!(kp.deserialize_key::<K>(()).await);
-            self.pending_key = Some(k);
-            Ok(Probe::Hit((0, kc)))
-        }
-        async fn dispatch_value(
-            &mut self,
-            _: usize,
-            vp: owned_::VP<KP>,
-        ) -> Result<Probe<(owned_::VC<KP>, ())>, KP::Error> {
-            let k = self
-                .pending_key
-                .take()
-                .expect("dispatch without pending key");
-            let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
-            self.out.insert(k, v);
-            Ok(Probe::Hit((vc, ())))
-        }
         fn take_outputs(&mut self) -> Self::Outputs {
             core::mem::replace(&mut self.out, HashMap::with_hasher(S::default()))
         }
@@ -611,7 +656,14 @@ mod hashmap_impls {
         async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map.iterate(CollectHashMapOwned::<K, V, S>::new()).await);
+                let (claim, out) = hit!(map.iterate(CollectHashMapOwned::<K, V, S, _, _>::new(
+                    |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
+                    |vp: owned_::VP<owned_::KP<D>>, k| async move {
+                        let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
+                        Ok(Probe::Hit((vc, (k, v))))
+                    },
+                ))
+                .await);
                 Ok(Probe::Hit((claim, out)))
             })
             .await

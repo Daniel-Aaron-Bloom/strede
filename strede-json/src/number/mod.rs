@@ -18,7 +18,10 @@ use core::marker::PhantomData;
 use strede::Chunk;
 #[cfg(not(feature = "arbitrary_precision"))]
 use strede::borrow::{Deserialize, Deserializer, Entry};
-use strede::owned::{DeserializeOwned, DeserializerOwned, EntryOwned, NumberAccessOwned};
+use strede::owned::{DeserializeOwned, DeserializerOwned, EntryOwned};
+#[cfg(feature = "arbitrary_precision")]
+use strede::owned::NumberAccessOwned;
+use strede::Ascii;
 #[cfg(not(all(feature = "arbitrary_precision", feature = "alloc")))]
 use strede::select_probe;
 use strede::{Probe, hit};
@@ -228,7 +231,7 @@ impl<'de, D: Deserializer<'de>> Deserialize<'de, D> for NumberBorrowed<'de> {
         use strede::Chunk;
         use strede::borrow::NumberAccess;
         d.entry(|[e]| async {
-            let chunks = hit!(e.deserialize_number_chunks().await);
+            let chunks = hit!(e.deserialize_number_chunks::<strede::Ascii>().await);
             // For in-memory JSON the number is always a single chunk; parse it
             // directly. If a future borrow-family format streams numbers in
             // multiple chunks this will need the parser-state-machine treatment.
@@ -254,26 +257,23 @@ impl<'de, D: Deserializer<'de>> Deserialize<'de, D> for NumberBorrowed<'de> {
 impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
     type Extra = ();
     async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        d.entry(|[e]| async {
-            let chunks = hit!(e.deserialize_number_chunks().await);
-
-            #[cfg(not(all(feature = "arbitrary_precision", feature = "alloc")))]
-            {
-                let mut c1 = chunks;
-                let c2 = c1.fork();
-                let c3 = c1.fork();
-                let c4 = c1.fork();
+        #[cfg(not(all(feature = "arbitrary_precision", feature = "alloc")))]
+        {
+            d.entry(|[e1, e2, e3, e4]| async {
                 select_probe! {
                     async move {
-                        let (claim, u) = hit!(parser::parse_int_pos(c1).await);
+                        let c = hit!(e1.deserialize_number_chunks::<Ascii>().await);
+                        let (claim, u) = hit!(parser::parse_int_pos(c).await);
                         Ok(Probe::Hit((claim, NumberOwned { n: N::PosInt(u) })))
                     },
                     async move {
-                        let (claim, i) = hit!(parser::parse_int_neg(c2).await);
+                        let c = hit!(e2.deserialize_number_chunks::<Ascii>().await);
+                        let (claim, i) = hit!(parser::parse_int_neg(c).await);
                         Ok(Probe::Hit((claim, NumberOwned { n: N::NegInt(i) })))
                     },
                     async move {
-                        let (claim, fp, neg) = hit!(parser::parse_float_fast(c3).await);
+                        let c = hit!(e3.deserialize_number_chunks::<Ascii>().await);
+                        let (claim, fp, neg) = hit!(parser::parse_float_fast(c).await);
                         let f = parser::biased_fp_to_float(fp, neg);
                         if !f.is_finite() {
                             return Ok(Probe::Miss);
@@ -281,7 +281,8 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
                         Ok(Probe::Hit((claim, NumberOwned { n: N::Float(f) })))
                     },
                     async move {
-                        let (claim, fp, neg) = hit!(parser::parse_float_slow(c4).await);
+                        let c = hit!(e4.deserialize_number_chunks::<Ascii>().await);
+                        let (claim, fp, neg) = hit!(parser::parse_float_slow(c).await);
                         let f = parser::biased_fp_to_float(fp, neg);
                         if !f.is_finite() {
                             return Ok(Probe::Miss);
@@ -289,10 +290,13 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
                         Ok(Probe::Hit((claim, NumberOwned { n: N::Float(f) })))
                     },
                 }
-            }
-            #[cfg(all(feature = "arbitrary_precision", feature = "alloc"))]
-            {
-                let mut chunks = chunks;
+            })
+            .await
+        }
+        #[cfg(all(feature = "arbitrary_precision", feature = "alloc"))]
+        {
+            d.entry(|[e]| async {
+                let mut chunks = hit!(e.deserialize_number_chunks::<Ascii>().await);
                 let mut raw = alloc::string::String::new();
                 let claim = loop {
                     match chunks.next_number_chunk(|s| raw.push_str(s)).await? {
@@ -301,9 +305,9 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
                     }
                 };
                 Ok(Probe::Hit((claim, NumberOwned { raw })))
-            }
-        })
-        .await
+            })
+            .await
+        }
     }
 }
 

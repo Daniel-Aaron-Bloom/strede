@@ -1,18 +1,21 @@
-use std::marker::PhantomData;
+use strede::DeserializeOwned;
 
-// This struct borrows the first two lifetimes but not the third.
-#[derive(strede::Deserialize)]
-pub struct Three<'a, 'b, 'c> {
-    pub a: &'a str,
-    pub b: &'b str,
-    pub c: PhantomData<&'c str>,
+#[derive(DeserializeOwned)]
+struct Inner {
+    a: u32,
+    b: u32,
 }
-
-#[derive(strede::Deserialize)]
-pub struct Example<'a, 'b, 'c> {
-    #[strede(borrow = "'a+'b")]
-    // Borrow 'a and 'b only, not 'c.
-    pub three: Three<'a, 'b, 'c>,
+// Field before AND after the flatten — exercises the before/after arm split.
+#[derive(DeserializeOwned)]
+struct OuterWithSuffix {
+    prefix: u32,
+    #[strede(flatten)]
+    inner1: Inner,
+    #[strede(flatten)]
+    inner2: Inner,
+    #[strede(flatten)]
+    inner3: Inner,
+    suffix: u32,
 }
 
 fn main() {}

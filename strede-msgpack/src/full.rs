@@ -16,10 +16,11 @@
 //!
 //! # Numbers
 //!
-//! Numbers are stored in binary form in msgpack; there is no text to parse.
-//! [`Entry::deserialize_number_chunks`] always returns `Probe::Miss` — format-
-//! specific `Deserialize` impls in [`crate::impls`] use the typed token value
-//! directly via `MsgpackEntry::parse_num`.
+//! Numbers are stored in binary form in msgpack.  [`Entry::deserialize_number_chunks`]
+//! supports [`strede::BigEndian`] encoding for integer tokens — it yields the raw
+//! big-endian wire bytes.  Float tokens (`Float32`/`Float64`) return `Probe::Miss`
+//! from `deserialize_number_chunks`; use `MsgpackEntry::parse_num` for those and
+//! for all typed `Deserialize` impls.
 
 use crate::{
     MsgpackError,
@@ -27,8 +28,9 @@ use crate::{
 };
 use strede::{
     BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
-    Deserializer, Entry, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
-    MapValueProbe, Never, NextKey, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
+    Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess, MapArmStack,
+    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
+    BigEndian, NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,10 +171,10 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
     type SubDeserializer = MsgpackSubDeserializer<'de>;
     type StrChunks = MsgpackStrAccess<'de>;
     type BytesChunks = MsgpackBytesAccess<'de>;
-    type NumberChunks = Never<'de, MsgpackClaim<'de>, MsgpackError>;
+    type NumberChunks<Enc: NumberEncoding> = MsgpackNumberAccess<'de>;
     type Map = MsgpackMapAccess<'de>;
     type Seq = MsgpackSeqAccess<'de>;
-    type Enum = Never<'de, MsgpackClaim<'de>, MsgpackError>;
+    type Enum = MsgpackEnumAccess<'de>;
     fn fork(&mut self) -> Self {
         self.clone()
     }
@@ -252,8 +254,27 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
 
     // ---- Numbers ------------------------------------------------------------
 
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
-        Ok(Probe::Miss)
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(self) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != BigEndian::NAME {
+            return Ok(Probe::Miss);
+        }
+        match self.token {
+            MsgpackToken::UFixInt(_)
+            | MsgpackToken::UInt8(_)
+            | MsgpackToken::UInt16(_)
+            | MsgpackToken::UInt32(_)
+            | MsgpackToken::UInt64(_)
+            | MsgpackToken::IFixInt(_)
+            | MsgpackToken::Int8(_)
+            | MsgpackToken::Int16(_)
+            | MsgpackToken::Int32(_)
+            | MsgpackToken::Int64(_) => Ok(Probe::Hit(MsgpackNumberAccess {
+                token: self.token,
+                src: self.src,
+                done: false,
+            })),
+            _ => Ok(Probe::Miss),
+        }
     }
 
     // ---- Map / Seq ----------------------------------------------------------
@@ -342,18 +363,30 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
         T::deserialize_from_seq(seq, extra).await
     }
 
+    #[inline(always)]
     async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
-        Ok(Probe::Miss)
+        match self.token {
+            MsgpackToken::Str(_) | MsgpackToken::Map(_) => Ok(Probe::Hit(MsgpackEnumAccess {
+                token: self.token,
+                src: self.src,
+            })),
+            _ => Ok(Probe::Miss),
+        }
     }
 
+    #[inline(always)]
     async fn deserialize_enum_into<T>(
         self,
-        _extra: T::Extra,
+        extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeFromEnum<'de, Self::Enum>,
     {
-        Ok(Probe::Miss)
+        let e = match Entry::deserialize_enum(self).await? {
+            Probe::Hit(e) => e,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        T::deserialize_from_enum(e, extra).await
     }
 
     #[inline(always)]
@@ -378,8 +411,16 @@ impl<'de> MsgpackEntry<'de> {
         self,
     ) -> Result<Probe<(MsgpackClaim<'de>, T)>, MsgpackError> {
         let v = match self.token {
-            MsgpackToken::UInt(n) => T::from_uint(n),
-            MsgpackToken::Int(n) => T::from_int(n),
+            MsgpackToken::UFixInt(b) => T::from_ufixint(b),
+            MsgpackToken::UInt8(b) => T::from_uint8(b),
+            MsgpackToken::UInt16(b) => T::from_uint16(b),
+            MsgpackToken::UInt32(b) => T::from_uint32(b),
+            MsgpackToken::UInt64(b) => T::from_uint64(b),
+            MsgpackToken::IFixInt(b) => T::from_ifixint(b),
+            MsgpackToken::Int8(b) => T::from_int8(b),
+            MsgpackToken::Int16(b) => T::from_int16(b),
+            MsgpackToken::Int32(b) => T::from_int32(b),
+            MsgpackToken::Int64(b) => T::from_int64(b),
             MsgpackToken::Float32(f) => T::from_f32(f),
             MsgpackToken::Float64(f) => T::from_f64(f),
             _ => return Ok(Probe::Miss),
@@ -398,8 +439,16 @@ impl<'de> MsgpackEntry<'de> {
 }
 
 pub(crate) trait ParseNum: Sized {
-    fn from_uint(v: u64) -> Option<Self>;
-    fn from_int(v: i64) -> Option<Self>;
+    fn from_ufixint(v: [u8; 1]) -> Option<Self>;
+    fn from_uint8(v: [u8; 1]) -> Option<Self>;
+    fn from_uint16(v: [u8; 2]) -> Option<Self>;
+    fn from_uint32(v: [u8; 4]) -> Option<Self>;
+    fn from_uint64(v: [u8; 8]) -> Option<Self>;
+    fn from_ifixint(v: [u8; 1]) -> Option<Self>;
+    fn from_int8(v: [u8; 1]) -> Option<Self>;
+    fn from_int16(v: [u8; 2]) -> Option<Self>;
+    fn from_int32(v: [u8; 4]) -> Option<Self>;
+    fn from_int64(v: [u8; 8]) -> Option<Self>;
     fn from_f32(v: f32) -> Option<Self>;
     fn from_f64(v: f64) -> Option<Self>;
 }
@@ -416,14 +465,6 @@ pub struct MsgpackStrAccess<'de> {
 impl<'de> StrAccess for MsgpackStrAccess<'de> {
     type Claim = MsgpackClaim<'de>;
     type Error = MsgpackError;
-
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
 
     async fn next_str<R>(
         self,
@@ -461,14 +502,6 @@ impl<'de> BytesAccess for MsgpackBytesAccess<'de> {
     type Claim = MsgpackClaim<'de>;
     type Error = MsgpackError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
-
     async fn next_bytes<R>(
         self,
         f: impl FnOnce(&[u8]) -> R,
@@ -491,6 +524,41 @@ impl<'de> BytesAccess for MsgpackBytesAccess<'de> {
             },
             r,
         )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MsgpackNumberAccess
+// ---------------------------------------------------------------------------
+
+pub struct MsgpackNumberAccess<'de> {
+    token: MsgpackToken,
+    src: &'de [u8],
+    done: bool,
+}
+
+impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for MsgpackNumberAccess<'de> {
+    type Claim = MsgpackClaim<'de>;
+    type Error = MsgpackError;
+
+    async fn next_number_chunk<R>(
+        mut self,
+        f: impl FnOnce(&Enc::Data) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        if self.done {
+            return Ok(Chunk::Done(MsgpackClaim { src: self.src, remaining_after: 0 }));
+        }
+        let bytes: &[u8] = match &self.token {
+            MsgpackToken::UFixInt(b) | MsgpackToken::UInt8(b)
+            | MsgpackToken::IFixInt(b) | MsgpackToken::Int8(b) => b.as_slice(),
+            MsgpackToken::UInt16(b) | MsgpackToken::Int16(b) => b.as_slice(),
+            MsgpackToken::UInt32(b) | MsgpackToken::Int32(b) => b.as_slice(),
+            MsgpackToken::UInt64(b) | MsgpackToken::Int64(b) => b.as_slice(),
+            _ => unreachable!(),
+        };
+        let r = f(Enc::from_bytes(bytes));
+        self.done = true;
+        Ok(Chunk::Data((self, r)))
     }
 }
 
@@ -673,14 +741,6 @@ impl<'de> MapAccess<'de> for MsgpackMapAccess<'de> {
     type MapClaim = MsgpackClaim<'de>;
     type KeyProbe = MsgpackMapKeyProbe<'de>;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
-
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
         mut arms: S,
@@ -797,14 +857,6 @@ impl<'de> SeqAccess<'de> for MsgpackSeqAccess<'de> {
     type Elem = MsgpackSeqEntry<'de>;
 
     #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
-
-    #[inline(always)]
     async fn next<const N: usize, F, Fut, R>(
         self,
         f: F,
@@ -844,5 +896,140 @@ impl<'de> SeqEntry<'de> for MsgpackSeqEntry<'de> {
             src,
             remaining_after: 0,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MsgpackEnumAccess / MsgpackEnumVariantProbe
+// ---------------------------------------------------------------------------
+//
+// Externally-tagged enums:
+//   - Unit variants:     bare string token  ("VariantName")
+//   - Non-unit variants: single-key map     ({"VariantName": <payload>})
+
+pub struct MsgpackEnumAccess<'de> {
+    token: MsgpackToken,
+    src: &'de [u8],
+}
+
+impl<'de> EnumAccess<'de> for MsgpackEnumAccess<'de> {
+    type Error = MsgpackError;
+    type Claim = MsgpackClaim<'de>;
+    type VariantProbe = MsgpackEnumVariantProbe<'de>;
+
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStack<'de, Self::VariantProbe>,
+    {
+        let vp = MsgpackEnumVariantProbe {
+            token: self.token,
+            src: self.src,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
+    }
+}
+
+pub struct MsgpackEnumVariantProbe<'de> {
+    token: MsgpackToken,
+    src: &'de [u8],
+}
+
+impl<'de> EnumVariantProbe<'de> for MsgpackEnumVariantProbe<'de> {
+    type Error = MsgpackError;
+    type Claim = MsgpackClaim<'de>;
+    type PayloadDeserializer = MsgpackSubDeserializer<'de>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            token: self.token,
+            src: self.src,
+        }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        // Msgpack strings are always valid UTF-8 with no escape sequences —
+        // zero-copy str works directly.
+        let entry = MsgpackEntry {
+            token: self.token,
+            src: self.src,
+        };
+        let (claim, s) = match Entry::deserialize_str(entry).await? {
+            Probe::Hit(v) => v,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        for &(name, idx) in candidates.as_ref() {
+            if s == name {
+                return Ok(Probe::Hit((claim, idx)));
+            }
+        }
+        Ok(Probe::Miss)
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        // Expect a single-key map {"VariantName": <payload>}.
+        let count = match self.token {
+            MsgpackToken::Map(n) if n >= 1 => n,
+            _ => return Ok(Probe::Miss),
+        };
+
+        let mut src = self.src;
+        let key_tok = next_token(&mut src)?;
+
+        let key_probe = MsgpackMapKeyProbe {
+            src,
+            key_tok,
+            remaining_after: count - 1,
+        };
+
+        let (key_claim, MatchVals(idx, _)) = match key_probe
+            .deserialize_key::<MatchVals<usize, W>>(candidates)
+            .await?
+        {
+            Probe::Hit(v) => v,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        let value_probe = key_claim.into_value_probe().await?;
+        let (value_claim, t) = match value_probe.deserialize_value::<T>(extra).await? {
+            Probe::Hit(v) => v,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        // Externally-tagged enum has exactly one key-value pair.
+        let map_claim = match value_claim.next_key(0, 0).await? {
+            NextKey::Done(c) => c,
+            NextKey::Entry(_) => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_claim, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+    {
+        let sub = MsgpackSubDeserializer::new(self.src, self.token);
+        T::deserialize(sub, extra).await
     }
 }

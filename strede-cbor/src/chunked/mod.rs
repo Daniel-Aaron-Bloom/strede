@@ -12,9 +12,10 @@ use crate::token::CborToken;
 use core::future::Future;
 use strede::utils::repeat;
 use strede::{
-    Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
-    DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
-    EnumVariantProbeOwned, Handle, Never, Probe, SharedBuf, hit,
+    BigEndian, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned,
+    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned,
+    EnumArmStackOwned, EnumVariantProbeOwned, Handle, NumberEncoding, Probe,
+    SharedBuf, hit, match_str_chunks_against_owned,
 };
 
 // ---------------------------------------------------------------------------
@@ -224,6 +225,31 @@ async fn strip_tags_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     }
 }
 
+async fn strip_tags_bignum_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
+    mut handle: Handle<'s, B, F>,
+    offset: &mut usize,
+    mut tok: CborToken,
+) -> Result<(Handle<'s, B, F>, Option<u64>, CborToken), CborError> {
+    let mut bignum_tag: Option<u64> = None;
+    loop {
+        match tok {
+            CborToken::Tag(n @ (2 | 3)) => {
+                bignum_tag = Some(n);
+                let (h, next) = next_dispatch(handle, offset).await?;
+                handle = h;
+                tok = next;
+            }
+            CborToken::Tag(_) => {
+                bignum_tag = None;
+                let (h, next) = next_dispatch(handle, offset).await?;
+                handle = h;
+                tok = next;
+            }
+            other => return Ok((handle, bignum_tag, other)),
+        }
+    }
+}
+
 /// Strip leading `Tag` tokens using a `TagHandler`.
 /// Returns `None` if the handler vetoes any tag.
 pub(crate) async fn strip_tags_with_dispatch<
@@ -426,70 +452,94 @@ impl<const N: usize> Stack<N> {
 const INDEF_SENTINEL: u64 = u64::MAX;
 
 /// Skip one complete CBOR value (including payload) in chunked mode.
+///
+/// Fully iterative — no recursive async calls — so the compiler can compute a
+/// finite layout for the future.  A `Stack` tracks pending array/map item counts
+/// and indefinite-length container sentinels; `skip_one_token` (a sync macro)
+/// handles the per-token dispatch inline.
 pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     mut handle: Handle<'s, B, F>,
     offset: &mut usize,
-    tok: CborToken,
+    mut tok: CborToken,
 ) -> Result<Handle<'s, B, F>, CborError> {
+    // Strip leading tag wrappers without any recursive call.
+    while let CborToken::Tag(_) = tok {
+        let (h, next) = next_dispatch(handle, offset).await?;
+        handle = h;
+        tok = next;
+    }
+
+    // Process `tok`, then drain `stack`.  Every async operation is a direct
+    // `.await` on a non-recursive helper (`skip_n_bytes`, `next_dispatch`).
     let mut stack = Stack::<32>::new();
 
-    match tok {
-        CborToken::UInt(_)
-        | CborToken::NegInt(_)
-        | CborToken::Bool(_)
-        | CborToken::Null
-        | CborToken::Undefined
-        | CborToken::Float16(_)
-        | CborToken::Float32(_)
-        | CborToken::Float64(_) => return Ok(handle),
-        CborToken::Break => return Err(CborError::InvalidBreak),
-        CborToken::Bstr(len) | CborToken::Tstr(len) => {
-            return skip_n_bytes(handle, offset, len).await;
-        }
-        CborToken::BstrIndef | CborToken::TstrIndef => {
-            // Skip chunks until break
-            loop {
-                let (h, chunk_tok) = next_dispatch(handle, offset).await?;
-                handle = h;
-                match chunk_tok {
-                    CborToken::Break => return Ok(handle),
-                    CborToken::Bstr(len) | CborToken::Tstr(len) => {
-                        handle = skip_n_bytes(handle, offset, len).await?;
+    // `process_tok` inlines the per-token logic for both the initial token and
+    // each token popped while draining the stack.
+    //
+    // Returns `true` if the caller should `break` out of the drain loop (i.e.
+    // the token was self-contained and pushed nothing onto `stack`).  For tokens
+    // that extend the stack this is a no-op that lets the loop continue.
+    //
+    // Because this is a macro (not an async fn), it has no separate future and
+    // therefore introduces no layout cycle.
+    macro_rules! process_tok {
+        ($tok:expr) => {{
+            match $tok {
+                CborToken::UInt(_)
+                | CborToken::NegInt(_)
+                | CborToken::Bool(_)
+                | CborToken::Null
+                | CborToken::Undefined
+                | CborToken::Float16(_)
+                | CborToken::Float32(_)
+                | CborToken::Float64(_) => { /* leaf, nothing to push */ }
+                CborToken::Break => return Err(CborError::InvalidBreak),
+                CborToken::Bstr(len) | CborToken::Tstr(len) => {
+                    handle = skip_n_bytes(handle, offset, len).await?;
+                }
+                CborToken::BstrIndef | CborToken::TstrIndef => {
+                    loop {
+                        let (h, chunk_tok) = next_dispatch(handle, offset).await?;
+                        handle = h;
+                        match chunk_tok {
+                            CborToken::Break => break,
+                            CborToken::Bstr(len) | CborToken::Tstr(len) => {
+                                handle = skip_n_bytes(handle, offset, len).await?;
+                            }
+                            _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                        }
                     }
-                    _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                }
+                CborToken::Tag(_) => {
+                    // A tag wraps one value: push 1 so the drain loop reads it.
+                    if !stack.push(1) {
+                        return Err(CborError::SkipDepthExceeded);
+                    }
+                }
+                CborToken::Array(Some(0)) | CborToken::Map(Some(0)) => { /* empty */ }
+                CborToken::Array(Some(n)) => {
+                    if !stack.push(n as u64) {
+                        return Err(CborError::SkipDepthExceeded);
+                    }
+                }
+                CborToken::Map(Some(n)) => {
+                    let total = (n as u64)
+                        .checked_mul(2)
+                        .ok_or(CborError::SkipDepthExceeded)?;
+                    if !stack.push(total) {
+                        return Err(CborError::SkipDepthExceeded);
+                    }
+                }
+                CborToken::Array(None) | CborToken::Map(None) => {
+                    if !stack.push(INDEF_SENTINEL) {
+                        return Err(CborError::SkipDepthExceeded);
+                    }
                 }
             }
-        }
-        CborToken::Tag(_) => {
-            // Skip the tagged value
-            let (h, inner) = next_dispatch(handle, offset).await?;
-            return skip_value_chunked(h, offset, inner).await;
-        }
-        CborToken::Array(Some(0)) | CborToken::Map(Some(0)) => return Ok(handle),
-        CborToken::Array(Some(n)) => {
-            if !stack.push(n as u64) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Map(Some(n)) => {
-            let total = (n as u64)
-                .checked_mul(2)
-                .ok_or(CborError::SkipDepthExceeded)?;
-            if !stack.push(total) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Array(None) => {
-            if !stack.push(INDEF_SENTINEL) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Map(None) => {
-            if !stack.push(INDEF_SENTINEL) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
+        }};
     }
+
+    process_tok!(tok);
 
     loop {
         let remaining = match stack.pop() {
@@ -503,111 +553,21 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             if matches!(next_tok, CborToken::Break) {
                 continue;
             }
-            // Push sentinel back, then handle this item
+            // Push sentinel back so we keep reading items until the break.
             if !stack.push(INDEF_SENTINEL) {
                 return Err(CborError::SkipDepthExceeded);
             }
-            handle = skip_item_chunked(handle, offset, next_tok, &mut stack).await?;
+            process_tok!(next_tok);
         } else {
             if remaining > 1 && !stack.push(remaining - 1) {
                 return Err(CborError::SkipDepthExceeded);
             }
             let (h, next_tok) = next_dispatch(handle, offset).await?;
             handle = h;
-            handle = skip_item_chunked(handle, offset, next_tok, &mut stack).await?;
+            process_tok!(next_tok);
         }
     }
 
-    Ok(handle)
-}
-
-async fn skip_item_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
-    mut handle: Handle<'s, B, F>,
-    offset: &mut usize,
-    tok: CborToken,
-    stack: &mut Stack<32>,
-) -> Result<Handle<'s, B, F>, CborError> {
-    match tok {
-        CborToken::UInt(_)
-        | CborToken::NegInt(_)
-        | CborToken::Bool(_)
-        | CborToken::Null
-        | CborToken::Undefined
-        | CborToken::Float16(_)
-        | CborToken::Float32(_)
-        | CborToken::Float64(_) => {}
-        CborToken::Break => return Err(CborError::InvalidBreak),
-        CborToken::Bstr(len) | CborToken::Tstr(len) => {
-            handle = skip_n_bytes(handle, offset, len).await?;
-        }
-        CborToken::BstrIndef | CborToken::TstrIndef => loop {
-            let (h, chunk_tok) = next_dispatch(handle, offset).await?;
-            handle = h;
-            match chunk_tok {
-                CborToken::Break => break,
-                CborToken::Bstr(len) | CborToken::Tstr(len) => {
-                    handle = skip_n_bytes(handle, offset, len).await?;
-                }
-                _ => return Err(CborError::UnexpectedByte { byte: 0 }),
-            }
-        },
-        CborToken::Tag(_) => {
-            // Push 1 more to process the tagged value
-            if !stack.push(1) {
-                #[cfg(feature = "alloc")]
-                {
-                    let (h, inner) = next_dispatch(handle, offset).await?;
-                    handle = alloc::boxed::Box::pin(skip_value_chunked(h, offset, inner)).await?;
-                }
-                #[cfg(not(feature = "alloc"))]
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Array(Some(0)) | CborToken::Map(Some(0)) => {}
-        CborToken::Array(Some(n)) => {
-            if !stack.push(n as u64) {
-                #[cfg(feature = "alloc")]
-                {
-                    handle = alloc::boxed::Box::pin(skip_value_chunked(
-                        handle,
-                        offset,
-                        CborToken::Array(Some(n)),
-                    ))
-                    .await?;
-                }
-                #[cfg(not(feature = "alloc"))]
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Map(Some(n)) => {
-            let total = (n as u64)
-                .checked_mul(2)
-                .ok_or(CborError::SkipDepthExceeded)?;
-            if !stack.push(total) {
-                #[cfg(feature = "alloc")]
-                {
-                    handle = alloc::boxed::Box::pin(skip_value_chunked(
-                        handle,
-                        offset,
-                        CborToken::Map(Some(n)),
-                    ))
-                    .await?;
-                }
-                #[cfg(not(feature = "alloc"))]
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Array(None) => {
-            if !stack.push(INDEF_SENTINEL) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-        CborToken::Map(None) => {
-            if !stack.push(INDEF_SENTINEL) {
-                return Err(CborError::SkipDepthExceeded);
-            }
-        }
-    }
     Ok(handle)
 }
 
@@ -635,6 +595,7 @@ pub struct ChunkedCborSubDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
     pub(crate) offset: usize,
     pub(crate) pending_tok: Option<CborToken>,
+    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborSubDeserializer<'s, B, F> {
@@ -644,6 +605,22 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborSubDeserializer<'s, B, F> 
             handle,
             offset,
             pending_tok: Some(tok),
+            bignum_tag: None,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_bignum(
+        handle: Handle<'s, B, F>,
+        offset: usize,
+        tok: CborToken,
+        bignum_tag: Option<u64>,
+    ) -> Self {
+        Self {
+            handle,
+            offset,
+            pending_tok: Some(tok),
+            bignum_tag,
         }
     }
 }
@@ -656,6 +633,7 @@ pub struct ChunkedCborEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
     pub(crate) token: CborToken,
     pub(crate) offset: usize,
+    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
@@ -665,6 +643,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
             handle: self.handle.fork(),
             token: self.token,
             offset: self.offset,
+            bignum_tag: self.bignum_tag,
         }
     }
 
@@ -717,14 +696,15 @@ where
         next_dispatch(main, &mut offset).await?
     };
 
-    // Strip tags
-    let (main, token) = strip_tags_dispatch(main, &mut offset, raw_token).await?;
+    let (main, bignum_tag, token) =
+        strip_tags_bignum_dispatch(main, &mut offset, raw_token).await?;
 
     let snap_offset = offset;
     let entry = ChunkedCborEntry {
         handle: main,
         token,
         offset: snap_offset,
+        bignum_tag,
     };
     let (claim, r) = hit!(f(repeat(entry, ChunkedCborEntry::clone)).await);
 
@@ -759,12 +739,12 @@ where
     let main = de.handle;
     let mut offset = de.offset;
 
-    // pending_tok is already tag-stripped by the parent
-    let (main, token) = if let Some(tok) = de.pending_tok {
-        (main, tok)
+    // pending_tok is already tag-stripped by the parent; bignum_tag carried through
+    let (main, bignum_tag, token) = if let Some(tok) = de.pending_tok {
+        (main, de.bignum_tag, tok)
     } else {
         let (h, raw) = next_dispatch(main, &mut offset).await?;
-        strip_tags_dispatch(h, &mut offset, raw).await?
+        strip_tags_bignum_dispatch(h, &mut offset, raw).await?
     };
 
     let snap_offset = offset;
@@ -772,6 +752,7 @@ where
         handle: main,
         token,
         offset: snap_offset,
+        bignum_tag,
     };
     f(repeat(entry, ChunkedCborEntry::clone)).await
 }
@@ -826,7 +807,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
     type SubDeserializer = ChunkedCborSubDeserializer<'s, B, F>;
     type StrChunks = access::ChunkedCborStrAccess<'s, B, F>;
     type BytesChunks = access::ChunkedCborBytesAccess<'s, B, F>;
-    type NumberChunks = Never<'s, ChunkedCborClaim<'s, B, F>, CborError>;
+    type NumberChunks<Enc: NumberEncoding> = access::ChunkedCborNumberAccess<'s, B, F>;
     type Map = access::ChunkedCborMapAccess<'s, B, F>;
     type Seq = access::ChunkedCborSeqAccess<'s, B, F>;
     type Enum = ChunkedCborEnumAccess<'s, B, F>;
@@ -836,6 +817,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
             handle: self.handle.fork(),
             token: self.token,
             offset: self.offset,
+            bignum_tag: self.bignum_tag,
         }
     }
 
@@ -874,8 +856,29 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
     }
 
     #[inline(always)]
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
-        Ok(Probe::Miss)
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != BigEndian::NAME {
+            return Ok(Probe::Miss);
+        }
+        match (self.bignum_tag, self.token) {
+            (Some(2 | 3), CborToken::Bstr(len)) => {
+                Ok(Probe::Hit(access::ChunkedCborNumberAccess {
+                    handle: self.handle,
+                    offset: self.offset,
+                    state: access::ChunkedBytesState::Definite { remaining: len },
+                }))
+            }
+            (Some(2 | 3), CborToken::BstrIndef) => {
+                Ok(Probe::Hit(access::ChunkedCborNumberAccess {
+                    handle: self.handle,
+                    offset: self.offset,
+                    state: access::ChunkedBytesState::Indefinite,
+                }))
+            }
+            _ => Ok(Probe::Miss),
+        }
     }
 
     #[inline(always)]
@@ -957,17 +960,31 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
     }
 
     async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
-        Ok(Probe::Miss)
+        match self.token {
+            CborToken::Tstr(_) | CborToken::TstrIndef | CborToken::Map(_) => {
+                Ok(Probe::Hit(ChunkedCborEnumAccess {
+                    handle: self.handle,
+                    token: self.token,
+                    offset: self.offset,
+                }))
+            }
+            _ => Ok(Probe::Miss),
+        }
     }
 
+    #[inline(always)]
     async fn deserialize_enum_into<T>(
         self,
-        _extra: T::Extra,
+        extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeFromEnumOwned<Self::Enum>,
     {
-        Ok(Probe::Miss)
+        let e = match EntryOwned::deserialize_enum(self).await? {
+            Probe::Hit(e) => e,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        T::deserialize_from_enum_owned(e, extra).await
     }
 
     #[inline(always)]
@@ -983,15 +1000,17 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
 }
 
 // ---------------------------------------------------------------------------
-// ChunkedCborEnumAccess — stub (not yet implemented)
+// ChunkedCborEnumAccess / ChunkedCborEnumVariantProbe
 // ---------------------------------------------------------------------------
 
-/// Stub [`EnumAccessOwned`] for the chunked CBOR deserializer.
+/// [`EnumAccessOwned`] for CBOR externally-tagged enums (chunked/streaming).
 ///
-/// Owned-family enum deserialization is not yet implemented.
-/// `iterate` always returns `Probe::Miss`.
+/// - Unit variants: bare text string (`"VariantName"`)
+/// - Non-unit variants: single-key map (`{"VariantName": <payload>}`)
 pub struct ChunkedCborEnumAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    _handle: Handle<'s, B, F>,
+    handle: Handle<'s, B, F>,
+    token: CborToken,
+    offset: usize,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedCborEnumAccess<'s, B, F> {
@@ -999,23 +1018,26 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedCborEnumAc
     type Claim = ChunkedCborClaim<'s, B, F>;
     type VariantProbe = ChunkedCborEnumVariantProbe<'s, B, F>;
 
-    fn fork(&mut self) -> Self {
-        Self {
-            _handle: self._handle.fork(),
-        }
-    }
-
-    async fn iterate<S>(self, _arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStackOwned<Self::VariantProbe>,
     {
-        Ok(Probe::Miss)
+        let vp = ChunkedCborEnumVariantProbe {
+            handle: self.handle,
+            token: self.token,
+            offset: self.offset,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
     }
 }
 
-/// Stub [`EnumVariantProbeOwned`] for the chunked CBOR deserializer.
+/// [`EnumVariantProbeOwned`] for CBOR externally-tagged enums (chunked/streaming).
 pub struct ChunkedCborEnumVariantProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    _handle: Handle<'s, B, F>,
+    handle: Handle<'s, B, F>,
+    token: CborToken,
+    offset: usize,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
@@ -1027,8 +1049,121 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
 
     fn fork(&mut self) -> Self {
         Self {
-            _handle: self._handle.fork(),
+            handle: self.handle.fork(),
+            token: self.token,
+            offset: self.offset,
         }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        let str_access = match self.token {
+            CborToken::Tstr(len) => access::ChunkedCborStrAccess {
+                handle: self.handle,
+                offset: self.offset,
+                state: access::ChunkedStrState::Definite { remaining: len },
+            },
+            CborToken::TstrIndef => access::ChunkedCborStrAccess {
+                handle: self.handle,
+                offset: self.offset,
+                state: access::ChunkedStrState::Indefinite,
+            },
+            _ => return Ok(Probe::Miss),
+        };
+        match_str_chunks_against_owned(str_access, candidates.as_ref()).await
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        // Expect a single-key map `{"VariantName": <payload>}`.
+        let (handle, mut offset, remaining) = match self.token {
+            CborToken::Map(Some(n)) if n >= 1 => (self.handle, self.offset, Some(n - 1)),
+            CborToken::Map(None) => (self.handle, self.offset, None),
+            _ => return Ok(Probe::Miss),
+        };
+
+        // Read key token.
+        let (handle, raw_key) = next_dispatch(handle, &mut offset).await?;
+        let (handle, key_tok) = strip_tags_dispatch(handle, &mut offset, raw_key).await?;
+
+        // Match key as a text string against candidates.
+        let key_str_access = match key_tok {
+            CborToken::Tstr(len) => access::ChunkedCborStrAccess {
+                handle,
+                offset,
+                state: access::ChunkedStrState::Definite { remaining: len },
+            },
+            CborToken::TstrIndef => access::ChunkedCborStrAccess {
+                handle,
+                offset,
+                state: access::ChunkedStrState::Indefinite,
+            },
+            _ => return Ok(Probe::Miss),
+        };
+
+        let (key_claim, idx) =
+            match match_str_chunks_against_owned(key_str_access, candidates.as_ref()).await? {
+                Probe::Hit(v) => v,
+                Probe::Miss => return Ok(Probe::Miss),
+            };
+
+        // Read value token (already stripped of tags by sub-deserializer entry).
+        let mut val_offset = key_claim.offset;
+        let (val_handle, raw_val) = next_dispatch(key_claim.handle, &mut val_offset).await?;
+        let (val_handle, val_tok) = strip_tags_dispatch(val_handle, &mut val_offset, raw_val).await?;
+
+        let sub = ChunkedCborSubDeserializer::new(val_handle, val_offset, val_tok);
+        let (val_claim, t) = hit!(T::deserialize_owned(sub, extra).await);
+
+        // Verify no additional keys (externally-tagged = exactly one KV pair).
+        let map_done = match remaining {
+            Some(0) => ChunkedCborClaim {
+                offset: val_claim.offset,
+                handle: val_claim.handle,
+                remaining_after: 0,
+            },
+            None => {
+                // Indefinite map: expect break.
+                let mut off = val_claim.offset;
+                let (h, tok) = next_dispatch(val_claim.handle, &mut off).await?;
+                match tok {
+                    CborToken::Break => ChunkedCborClaim {
+                        offset: off,
+                        handle: h,
+                        remaining_after: 0,
+                    },
+                    _ => return Ok(Probe::Miss),
+                }
+            }
+            _ => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_done, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        let sub = ChunkedCborSubDeserializer::new(self.handle, self.offset, self.token);
+        T::deserialize_owned(sub, extra).await
     }
 }
 

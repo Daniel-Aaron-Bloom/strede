@@ -33,9 +33,9 @@ use core::future::Future;
 use core::mem;
 use strede::utils::repeat;
 use strede::{
-    Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    Ascii, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
     DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
-    EnumVariantProbeOwned, Handle, Probe, SharedBuf, hit,
+    EnumVariantProbeOwned, Handle, NumberEncoding, Probe, SharedBuf, hit,
 };
 
 // ---------------------------------------------------------------------------
@@ -852,7 +852,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     type SubDeserializer = ChunkedJsonSubDeserializer<'s, B, F>;
     type StrChunks = ChunkedJsonStrAccess<'s, B, F>;
     type BytesChunks = ChunkedJsonBytesAccess<'s, B, F>;
-    type NumberChunks = ChunkedJsonNumberAccess<'s, B, F>;
+    type NumberChunks<Enc: NumberEncoding> = ChunkedJsonNumberAccess<'s, B, F>;
     type Map = ChunkedJsonMapAccessOwned<'s, B, F>;
     type Seq = ChunkedJsonSeqAccess<'s, B, F>;
     type Enum = ChunkedJsonEnumAccess<'s, B, F>;
@@ -894,7 +894,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     }
 
     #[inline(always)]
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != Ascii::NAME {
+            return Ok(Probe::Miss);
+        }
         match self.token {
             Token::Number(access) => Ok(Probe::Hit(ChunkedJsonNumberAccess {
                 handle: self.handle,
@@ -1079,16 +1084,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedJsonEnumAc
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type VariantProbe = ChunkedJsonEnumVariantProbe<'s, B, F>;
 
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            token: self.token.clone(),
-            tokenizer: self.tokenizer.clone(),
-            offset: self.offset,
-            start_offset: self.start_offset,
-        }
-    }
-
     async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStackOwned<Self::VariantProbe>,
@@ -1132,10 +1127,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         }
     }
 
-    async fn deserialize_unit_by_name<const N: usize>(
+    async fn deserialize_unit_by_name<W>(
         self,
-        candidates: [(&'static str, usize); N],
-    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
         use access::ChunkedJsonStrAccess;
         use strede::StrAccessOwned as _;
 
@@ -1150,35 +1149,37 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
             _ => return Ok(Probe::Miss),
         };
 
-        let mut viable = [true; N];
+        let mut viable = candidates.map(|_| true);
+        let cands = candidates.as_ref();
         let mut consumed: usize = 0;
         loop {
             let result = str_access
                 .next_str(|s: &str| {
                     let new_consumed = consumed + s.len();
-                    for i in 0..N {
-                        if !viable[i] {
+                    let v = viable.as_mut();
+                    for (i, &(k, _)) in cands.iter().enumerate() {
+                        if !v[i] {
                             continue;
                         }
-                        let k = candidates[i].0;
                         if new_consumed > k.len()
                             || &k.as_bytes()[consumed..new_consumed] != s.as_bytes()
                         {
-                            viable[i] = false;
+                            v[i] = false;
                         }
                     }
                     consumed = new_consumed;
                 })
                 .await?;
-            if !viable.iter().any(|v| *v) {
+            if !viable.as_ref().iter().any(|v| *v) {
                 return Ok(Probe::Miss);
             }
             match result {
                 strede::Chunk::Data((new, ())) => str_access = new,
                 strede::Chunk::Done(claim) => {
-                    for i in 0..N {
-                        if viable[i] && candidates[i].0.len() == consumed {
-                            return Ok(Probe::Hit((claim, candidates[i].1)));
+                    let v = viable.as_ref();
+                    for (i, &(k, idx)) in cands.iter().enumerate() {
+                        if v[i] && k.len() == consumed {
+                            return Ok(Probe::Hit((claim, idx)));
                         }
                     }
                     return Ok(Probe::Miss);
@@ -1187,13 +1188,15 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         }
     }
 
-    async fn deserialize_payload_by_name<T, const N: usize>(
+    async fn deserialize_payload_by_name<T, W>(
         self,
-        candidates: [(&'static str, usize); N],
+        candidates: W,
         extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: DeserializeOwned<Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         use access::ChunkedJsonKeyProbe;
 
@@ -1223,14 +1226,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
             start_offset: start_key_offset,
         };
 
-        // Deserialize the key as MatchVals<usize, N> to find the candidate index.
+        // Deserialize the key as MatchVals<usize, [(&'static str, usize); N]> to find the candidate index.
         use strede::{
             MapKeyClaimOwned as _, MapKeyProbeOwned as _, MapValueClaimOwned as _,
             MapValueProbeOwned as _, MatchVals,
         };
-        let (key_claim, MatchVals(idx, _)): (ChunkedJsonClaim<'s, B, F>, MatchVals<usize, N>) =
+        let (key_claim, MatchVals(idx, _)): (ChunkedJsonClaim<'s, B, F>, MatchVals<usize, W>) =
             match key_probe
-                .deserialize_key::<MatchVals<usize, N>>(candidates)
+                .deserialize_key::<MatchVals<usize, W>>(candidates)
                 .await?
             {
                 Probe::Hit(v) => v,

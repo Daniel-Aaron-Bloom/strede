@@ -131,14 +131,11 @@ Deserializer<'de>     — stream handle; entry(self, closure) → Result<Probe<(
                         fork(&mut self) → Self
                         skip(self) → Result<Claim, Error>
     StrAccess         — streaming string chunks; next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                                                 fork(&mut self) → Self
     BytesAccess       — streaming byte chunks;   next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                                                 fork(&mut self) → Self
     NumberAccess      — streaming number chunks; next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                                                 fork(&mut self) → Self
     MapAccess<'de>    — in-progress map; iterate(self, arms: impl MapArmStack) → Result<Probe<(Claim, Outputs)>, Error>
-                                         fork(&mut self) → Self
       MapKeyProbe<'de>   — key probe handle; deserialize_key::<K>(self, extra) → Result<Probe<(KeyClaim, K)>, Error>
+                                             deserialize_key_by_index(self, expected: usize) → Result<Probe<(KeyClaim, ())>, Error>
                                              fork(&mut self) → Self
         MapKeyClaim<'de> — after key matched; into_value_probe(self) → Result<MapValueProbe, Error>
           MapValueProbe<'de> — value probe handle; deserialize_value::<V>(self, extra) → Result<Probe<(ValueClaim, V)>, Error>
@@ -148,14 +145,12 @@ Deserializer<'de>     — stream handle; entry(self, closure) → Result<Probe<(
                                                    skip(self) → Result<ValueClaim, Error>
             MapValueClaim<'de> — after value consumed; next_key(self, ..) → Result<NextKey<KeyProbe, MapClaim>, Error>
     SeqAccess<'de>    — in-progress seq; next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                                         fork(&mut self) → Self
       SeqEntry        — one element slot; get::<T, Extra>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                           get_map_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                           get_seq_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                           fork(&mut self) → Self
                                           skip(self) → Result<Claim, Error>
     EnumAccess<'de>   — in-progress enum (externally-tagged); iterate(self, arms: impl EnumArmStack) → Result<Probe<(Claim, Outputs)>, Error>
-                                          fork(&mut self) → Self
       EnumVariantProbe<'de> — variant probe; all methods default to Ok(Probe::Miss)
                               deserialize_unit_by_name(self, candidates) → Result<Probe<(Claim, usize)>, Error>
                               deserialize_payload_by_name::<T>(self, candidates, extra) → Result<Probe<(Claim, usize, T)>, Error>
@@ -197,14 +192,11 @@ DeserializerOwned      — entry(self, closure) → Result<Probe<(Claim, R)>, Er
                              fork(&mut self) → Self
                              skip(self) → Result<Claim, Error>
     StrAccessOwned     — next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                             fork(&mut self) → Self
     BytesAccessOwned   — next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                             fork(&mut self) → Self
     NumberAccessOwned  — next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                             fork(&mut self) → Self
     MapAccessOwned     — in-progress map (owned); iterate(self, arms: impl MapArmStackOwned) → Result<Probe<(Claim, Outputs)>, Error>
-                             fork(&mut self) → Self
       MapKeyProbeOwned   — key probe; deserialize_key::<K>(self, extra) → Result<Probe<(KeyClaim, K)>, Error>
+                               deserialize_key_by_index(self, expected: usize) → Result<Probe<(KeyClaim, ())>, Error>
                                fork(&mut self) → Self
         MapKeyClaimOwned — after key matched; into_value_probe(self) → Result<MapValueProbeOwned, Error>
           MapValueProbeOwned — value probe; deserialize_value::<V>(self, extra) → Result<Probe<(ValueClaim, V)>, Error>
@@ -212,14 +204,12 @@ DeserializerOwned      — entry(self, closure) → Result<Probe<(Claim, R)>, Er
                                    skip(self) → Result<ValueClaim, Error>
             MapValueClaimOwned — after value consumed; next_key(self, ..) → Result<NextKey<KeyProbeOwned, MapClaim>, Error>
     SeqAccessOwned     — next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                             fork(&mut self) → Self
       SeqEntryOwned        — get::<T, Extra>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                get_map_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                get_seq_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                                fork(&mut self) → Self
                                skip(self) → Result<Claim, Error>
     EnumAccessOwned      — in-progress enum (owned); iterate(self, arms: impl EnumArmStackOwned) → Result<Probe<(Claim, Outputs)>, Error>
-                               fork(&mut self) → Self
       EnumVariantProbeOwned — variant probe; all methods default to Ok(Probe::Miss)
                               deserialize_unit_by_name(self, candidates) → Result<Probe<(Claim, usize)>, Error>
                               deserialize_payload_by_name::<T>(self, candidates, extra) → Result<Probe<(Claim, usize, T)>, Error>
@@ -234,8 +224,9 @@ A format implements whichever family (or both) it can support.
 ### Owned family — parallel scanning and deadlock hazard
 
 The owned family reads from a streaming source where data arrives
-incrementally. Every reader (entry handle, map/seq accessor, str/bytes
-chunk accessor) shares the same underlying buffer and advances through it
+incrementally. Entry handles and probe items (`Entry`, `SeqEntry`,
+`MapKeyProbe`, `MapValueProbe`, `EnumVariantProbe`, and their Owned
+counterparts) share the same underlying buffer and advance through it
 cooperatively via `fork`.
 
 **For callers:** you must not await one forked handle to completion and then
@@ -255,6 +246,31 @@ opportunity to process it. You must never require one reader to finish
 before another can make progress — doing so creates a circular dependency
 that deadlocks the single-threaded executor. The `shared_buf` module
 provides a reference implementation of this contract.
+
+### `fork` — probe items vs. structural accessors
+
+`fork` is present only on probe items, not on structural accessors. The two
+categories:
+
+**Probe items have `fork`:** `Entry`, `SeqEntry`, `MapKeyProbe`,
+`MapValueProbe`, `EnumVariantProbe` (and their Owned counterparts). These are
+individual slot handles at the _probe layer_ — the layer where racing multiple
+type interpretations of the same slot is the core mechanism. `fork` gives
+callers an independent view of the same position to hand to `select_probe!`.
+The derive macro exploits this via `d.entry(|[e1, ..., eN]|)`, which delivers
+N independent handles directly without an explicit `fork` call.
+
+**Structural accessors do not have `fork`:** `MapAccess`, `SeqAccess`,
+`EnumAccess`, `StrAccess`, `BytesAccess`, `NumberAccess` (and their Owned
+counterparts). Once a structural accessor is open, format crates may wrap it
+in adapter types driven by struct layout attributes (e.g. `TagAwareMap` for
+`#[strede(tag)]`). These adapters
+are single-use state machines that capture closures and cell references and
+cannot be meaningfully duplicated. Requiring `fork` on structural accessors
+would force every such adapter to implement it with no safe way to do so.
+Any concurrency inside a structural access — for example, racing arms over a
+map's key stream — is handled internally by the `map_arm` / `enum_arm`
+infrastructure, which does not need to fork the accessor itself.
 
 ### Shared utilities
 
@@ -289,13 +305,12 @@ used by derive-generated map iteration. The module is split into `mod.rs`
 
 - `MapArmBase` — empty base of an arm stack. Left-nested with `+` via `Add<MapArm<S>>`.
 - `MapArm<S>` — newtype that wraps one arm slot for the `+` operator.
-- `MapArmSlot<K, V, KeyFn, DefaultKeyFn, ValFn>` — one concrete field slot. Holds the
-  key-race closure, a default-key closure (`FnMut() -> Option<K>`), the value-dispatch
-  closure, and the current `ArmState<K, V>`. The `DefaultKeyFn` is what distinguishes a
-  **struct arm stack** from a plain **dynamic map**: struct arms know their positional slot
-  and can supply a key without an incoming key probe (returning `Some(k)`), while dynamic
-  map arms always return `None`. Use `no_default_key` (a named free function exported from
-  `strede`) as the default for arms with no positional key.
+- `MapArmSlot<K, V, KeyFn, ValFn>` — one concrete field slot. Holds the key-race closure
+  `KeyFn: FnMut(KP, usize) -> KeyFut`, the value-dispatch closure `ValFn`, and the current
+  `ArmState<K, V>`. The `usize` passed to `KeyFn` is the arm's global positional index
+  (computed from `arm_base` at `init_race` time) — named-only arms ignore it, while arms
+  that also support positional access call `kp.deserialize_key_by_index(i)` and race it via
+  `select_probe!`.
 - `ArmState<K, V>` — `Empty | Key(K) | Done(K, V)`. Tracks per-slot progress
   through a map iteration round.
 - `NextKey<KeyProbe, MapClaim>` — returned by the value-claim's `next_key` to
@@ -304,27 +319,45 @@ used by derive-generated map iteration. The module is split into `mod.rs`
   produces no output. Used by skip-unknown, dup-detect, and tag-inject wrappers.
 - `StackConcat<A, B>` — concatenates two arm stacks so that all arms from both
   are polled concurrently. Arm indices from `A` are `0..A::SIZE`; arm indices from
-  `B` are offset by `A::SIZE`. Outputs are `(A::Outputs, B::Outputs)`. Used
-  inside `FlattenMapAccess` at runtime to merge the outer struct's arms with
-  the flattened field's arms; not directly emitted by the derive macro.
+  `B` are offset by `A::SIZE`. Outputs are `(A::Outputs, B::Outputs)`. Emitted by
+  the derive macro to splice a flatten field's `make_arms()` substack into the
+  outer struct's arm stack.
 
-**`MapArmStack` / `MapArmStackOwned` — key method:**
+**`MapArmStack` / `MapArmStackOwned` — key methods:**
 
-`default_key(arm_index) -> bool` — positional key injection. Calls the arm's
-`DefaultKeyFn` at `arm_index`. If it returns `Some(k)`, transitions that arm from
-`ArmState::Empty` to `ArmState::Key(k)` and returns `true`; otherwise returns `false`.
-This is the hook a positional format backend (e.g. MessagePack arrays-as-structs) uses
-instead of running the normal key race: it calls `default_key(i)` for each arm index in
-order, then calls `dispatch_value` directly. Virtual arms (`VirtualArmSlot`) always
-return `false`; `StackConcat` and wrapper stacks route to the correct sub-stack with
-the appropriate index offset.
+`race_keys(kp)` — drives one round of key racing. Calls `init_race(kp, 0)` to create
+per-arm key futures (passing each arm its global positional index), then polls all
+futures via `poll_race_one` in a flat loop. Returns `Probe::Hit((arm_index, key_claim))`
+for the first winning arm, or `Probe::Miss` when all arms miss. Wrapper stacks override
+this to inject virtual arms before delegating to the inner `init_race`/`poll_race_one`
+path. `StackConcat` routes to the correct sub-stack with the appropriate index offset.
+
+`dispatch_value(arm_index, vp)` — converts the winning arm's key claim to a value probe
+and polls its value callback via `init_dispatch`/`poll_dispatch`.
+
+**`deserialize_key_by_index` in derive-generated key closures:**
+
+Every field arm's key closure generated by the derive (both borrow and owned families,
+both struct and enum helper derives) races `deserialize_key::<Match>(wire_name)` against
+`deserialize_key_by_index(arm_index)` via `select_probe!`. Whichever hits first wins.
+This means:
+
+- **Name-based formats** (JSON, CBOR, MessagePack maps): `deserialize_key` hits on the
+  wire string; `deserialize_key_by_index` returns `Miss` (default impl).
+- **Positional formats** (postcard): `deserialize_key_by_index` hits because the format
+  implements it to match when `current_position == expected`; `deserialize_key` returns
+  `Miss` (no wire names).
+
+Virtual arms (dup-detect, skip-unknown, tag-inject) use only `deserialize_key` and do
+not call `deserialize_key_by_index` — they are infrastructure, not user fields, and have
+no meaningful positional identity.
 
 **Wrapper stacks** (generated around the base arm stack):
 
-- `DetectDuplicatesOwned<S, const M, KeyFn, SkipFn>` — wraps any arm stack and
+- `DetectDuplicates<S, const M, KeyFn, SkipFn>` — wraps any arm stack and
   returns an error when a wire key that already matched an arm appears a second
   time. `wire_names` maps each known key to its arm index for O(1) lookup.
-- `TagInjectingStackOwned<'v, S, const N, TagKeyFn, TagValFn>` — prepends a
+- `TagInjectingStack<'v, S, const N, TagKeyFn, TagValFn>` — prepends a
   virtual tag arm (index 0) to the inner stack. When the tag key matches, it
   captures the matched variant index into a `Cell<Option<usize>>` and then
   checks that index against `expected_variant` at iteration end.
@@ -332,15 +365,15 @@ the appropriate index offset.
 **Macros** (re-exported from `strede`):
 
 - `map_arms! { key_fn => val_fn, … }` — builds a left-nested arm tuple from a
-  flat list of `key_closure => value_closure` pairs. Each slot uses `no_default_key`
-  as its `DefaultKeyFn`. Equivalent to writing
-  `MapArmBase + MapArm(MapArmSlot::new(k0, no_default_key, v0)) + …`.
+  flat list of `key_closure => value_closure` pairs. Key closures receive `(KP, usize)`
+  where the `usize` is the arm's global positional index. Equivalent to writing
+  `MapArmBase + MapArm(MapArmSlot::new(k0, v0)) + …`.
 - `map_outputs!(pat0, pat1, …)` — destructures the left-nested output tuple
   produced by `MapArmStack::take_outputs` / `MapArmStackOwned::take_outputs`
   into flat named bindings. Expands to the nested pattern `(((), pat0), pat1)`.
 - `SkipUnknown!(arms, KP, VP)` / `SkipUnknownOwned!(arms, KP, VP)` — prepend a
-  virtual arm that matches any key and skips its value. Used by `FlattenTerminal`
-  and `allow_unknown_fields` codegen. `SkipUnknownOwned!` also accepts a 1-arg
+  virtual arm that matches any key and skips its value. Used by the
+  `allow_unknown_fields` codegen. `SkipUnknownOwned!` also accepts a 1-arg
   form `SkipUnknownOwned!(arms)` where KP/VP types are inferred from context.
 - `DetectDuplicates!(arms, KP, VP, M, wire_names)` / `DetectDuplicatesOwned!(…)` —
   wrap an arm stack with duplicate-key detection.
@@ -463,11 +496,10 @@ where <__D::Entry as Entry<'de>>::Enum: EnumAccess<'de>, Self: DeserializeFromEn
 
 Formats that don't yet support `EnumAccess` set `type Enum = Never<...>` on their `Entry` impl; `deserialize_enum` returns `Probe::Miss`.
 
-### Tag and flatten adapters — `TagAwareMap` and `FlattenMapAccess`
+### Tag adapter — `TagAwareMap`
 
-These types live in `strede/src/impls/tag_flatten.rs` and are re-exported from
-`strede`. They are generated by enum and struct derives; callers do not
-construct them directly.
+`TagAwareMap` lives in `strede/src/impls/tag_flatten.rs` and is re-exported from
+`strede`. It is generated by enum derives; callers do not construct it directly.
 
 **`TagAwareMap<'de, 'v, M, const N>`** (and `TagAwareMapOwned<'v, M, const N>`)
 wraps an already-opened `MapAccess` / `MapAccessOwned` to inject a tag arm into
@@ -476,24 +508,18 @@ key and captures the matched variant index into a `Cell<Option<usize>>`, then
 post-validates that index against `expected_variant` once iteration is done. Used
 by internally-tagged and adjacently-tagged enum derives.
 
-**`FlattenMapAccess<'de, 'c, M, OuterArms, OuterOut, Cont>`** (and
-`FlattenMapAccessOwned<'c, M, OuterArms, OuterOut, Cont>`) adapts an in-progress
-`MapAccess` so that a flattened field's `deserialize_from_map` impl runs against
-the outer map while the outer struct's arm stack is still live. Each flatten
-layer adds one `FlattenMapAccess` wrapper; the final layer is handled by
-`FlattenTerminal` / `FlattenTerminalBoxed` (see below).
+### Flatten — `MapFieldProvider` / `MapFieldProviderOwned`
 
-### `FlattenTerminal` / `FlattenTerminalBoxed` — flatten chain terminators
-
-`FlattenTerminal` is the zero-sized type placed at the end of a flatten chain
-by the derive macro. It directly calls `map.iterate(SkipUnknownOwned!(arms, KP, VP))`
-without any intermediate allocation. `SkipUnknownOwned!` is a macro (not a type)
-that expands to `(arms, VirtualArmSlot::new(…))`, prepending a virtual arm that
-matches any key and skips its value. With deeply-nested `StackConcat` types
-(typically 3+ flatten fields) the resulting async state machine can overflow
-the stack; in that case `FlattenTerminalBoxed` (gated on the `alloc` feature)
-is generated instead — it wraps the `iterate` future in `Box::pin` to break
-the chain.
+Flatten fields are handled at codegen time, not via a runtime adapter chain.
+Every `#[derive(Deserialize)]` / `#[derive(DeserializeOwned)]` on a named
+struct emits a `MapFieldProvider<'de, __KP>` / `MapFieldProviderOwned<__KP>`
+impl that exposes the struct's arm stack via `make_arms()`, its wire-name
+table via `wire_names()`, and an `Outputs → Self` reconstruction via
+`from_outputs()`. The parent struct's MFP impl composes flatten children via
+`StackConcat(outer_arms, <Child as MFP>::make_arms())` and shifts the child's
+wire-name indices via `.map(|(s, i)| (s, i + offset))`. The result is one
+`iterate` call against a unified arm stack — no continuation chain, no
+intermediate cells, no boxed-future workaround.
 
 ### `deserialize_option` — null-or-T probe
 
@@ -670,26 +696,6 @@ supported. Unknown keys (not claimed by the outer struct or any flattened type)
 are silently skipped. Both families are supported. Cannot be combined with
 `rename`, `alias`, `default`, `skip_deserializing`, `deserialize_with`,
 `deserialize_owned_with`, `with`, `from`, or `try_from`.
-
-`#[strede(flatten(boxed))]` — same as `#[strede(flatten)]`, but
-heap-allocates each continuation future via `Box::pin` to prevent stack
-overflow from deeply-nested `StackConcat` async state machines. Recommended
-when a struct has 3+ flatten fields. Any flatten field annotated
-`flatten(boxed)` enables boxed mode for the entire flatten chain. Requires
-the `alloc` feature.
-
-**Multi-flatten on generic outer structs.** When the outer struct has its
-own generic type parameters _and_ multiple flatten fields, the
-auto-generated continuation-impl `where`-clauses don't always inherit the
-lifetime predicates that the outer `'de: 'a` bounds carry. The derive can't
-introspect the inner flatten chain to figure out which generics each
-continuation step actually depends on. If you hit this — usually surfaces
-as an unresolvable `'de` outlives obligation on the cont impl — drop in
-the container-level `#[strede(bound = "...")]` escape hatch and write the
-predicates explicitly. See the `#[strede(bound)]` section below for syntax;
-the predicate list replaces the entire auto-generated set, so include the
-field bounds you need.
-
 
 `#[strede(untagged)]` — on an enum or individual variant. Variants marked
 untagged are deserialized by shape (trying each in declaration order) rather

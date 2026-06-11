@@ -132,7 +132,7 @@ pub(super) fn expand_owned(input: DeriveInput, krate: &syn::Path) -> syn::Result
                                 #krate::TagAwareMapOwned<
                                     '__v,
                                     <__D::Entry as #krate::EntryOwned>::Map,
-                                    #n_cands,
+                                    [(&'static str, usize); #n_cands],
                                 >,
                                 Extra = (),
                             >
@@ -469,25 +469,33 @@ fn expand_owned_enum_external_tagged(
             for alias in &cv.aliases {
                 candidates.push((alias.as_str(), arm_local_idx));
             }
-            let n_candidates = candidates.len();
             let cands_tokens: Vec<TokenStream2> = candidates
                 .iter()
                 .map(|(wn, idx)| quote! { (#wn, #idx) })
                 .collect();
 
+        let cv_idx = cv.index;
             match &cv.kind {
                 VariantKind::Unit => {
                     quote! {
-                        #krate::EnumArmSlot::new(|__vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
-                            let (__claim, _) = #krate::hit!(__vp.deserialize_unit_by_name::<#n_candidates>([#( #cands_tokens, )*]).await);
+                        #krate::EnumArmSlot::new(|mut __vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
+                            let __vp2 = __vp.fork();
+                            let (__claim, _) = #krate::hit!(#krate::select_probe! {
+                                __vp.deserialize_unit_by_name([#( #cands_tokens, )*]),
+                                __vp2.deserialize_unit_by_index(#cv_idx),
+                            });
                             ::core::result::Result::Ok(#krate::Probe::Hit((__claim, ())))
                         })
                     }
                 }
                 VariantKind::Newtype(ty) => {
                     quote! {
-                        #krate::EnumArmSlot::new(|__vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
-                            let (__claim, _, __v) = #krate::hit!(__vp.deserialize_payload_by_name::<#ty, #n_candidates>([#( #cands_tokens, )*], ()).await);
+                        #krate::EnumArmSlot::new(|mut __vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
+                            let __vp2 = __vp.fork();
+                            let (__claim, _, __v) = #krate::hit!(#krate::select_probe! {
+                                __vp.deserialize_payload_by_name::<#ty, _>([#( #cands_tokens, )*], ()),
+                                __vp2.deserialize_payload_by_index::<#ty>(#cv_idx, ()),
+                            });
                             ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __v)))
                         })
                     }
@@ -495,8 +503,12 @@ fn expand_owned_enum_external_tagged(
                 VariantKind::Struct(_) => {
                     let helper_name = format_ident!("__VariantOwned{}", cv.index);
                     quote! {
-                        #krate::EnumArmSlot::new(|__vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
-                            let (__claim, _, __v) = #krate::hit!(__vp.deserialize_payload_by_name::<#helper_name, #n_candidates>([#( #cands_tokens, )*], ()).await);
+                        #krate::EnumArmSlot::new(|mut __vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
+                            let __vp2 = __vp.fork();
+                            let (__claim, _, __v) = #krate::hit!(#krate::select_probe! {
+                                __vp.deserialize_payload_by_name::<#helper_name, _>([#( #cands_tokens, )*], ()),
+                                __vp2.deserialize_payload_by_index::<#helper_name>(#cv_idx, ()),
+                            });
                             ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __v)))
                         })
                     }
@@ -504,8 +516,12 @@ fn expand_owned_enum_external_tagged(
                 VariantKind::Tuple(_) => {
                     let helper_name = format_ident!("__TupleVariantOwned{}", cv.index);
                     quote! {
-                        #krate::EnumArmSlot::new(|__vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
-                            let (__claim, _, __v) = #krate::hit!(__vp.deserialize_payload_by_name::<#helper_name, #n_candidates>([#( #cands_tokens, )*], ()).await);
+                        #krate::EnumArmSlot::new(|mut __vp: <__E as #krate::EnumAccessOwned>::VariantProbe| async move {
+                            let __vp2 = __vp.fork();
+                            let (__claim, _, __v) = #krate::hit!(#krate::select_probe! {
+                                __vp.deserialize_payload_by_name::<#helper_name, _>([#( #cands_tokens, )*], ()),
+                                __vp2.deserialize_payload_by_index::<#helper_name>(#cv_idx, ()),
+                            });
                             ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __v)))
                         })
                     }
@@ -630,8 +646,9 @@ fn expand_owned_enum_external_tagged(
             use #krate::{
                 DefaultValue as _, DeserializeOwned as _, DeserializeFromEnumOwned as _,
                 DeserializerOwned as _, EntryOwned as _, EnumAccessOwned as _,
-                EnumVariantProbeOwned as _, MapAccessOwned as _, SeqAccessOwned as _,
-                SeqEntryOwned as _, StrAccessOwned as _,
+                EnumVariantProbeOwned as _, MapAccessOwned as _, MapKeyProbeOwned as _,
+                MapValueProbeOwned as _, SeqAccessOwned as _, SeqEntryOwned as _,
+                StrAccessOwned as _,
             };
 
             #tuple_variant_helpers
@@ -762,7 +779,7 @@ fn gen_owned_enum_map_body(
         pat
     };
 
-    // dup wire names for DetectDuplicatesOwned.
+    // dup wire names for DetectDuplicates.
     let dup_wire_names: Vec<TokenStream2> = tagged_nonunit
         .iter()
         .enumerate()
@@ -785,7 +802,7 @@ fn gen_owned_enum_map_body(
         }
         expr = quote! {{
             let __wn = [#( #dup_wire_names, )*];
-            #krate::DetectDuplicatesOwned::new(
+            #krate::DetectDuplicates::new(
                 #expr,
                 __wn,
                 move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
@@ -861,14 +878,28 @@ fn gen_struct_variant_helpers_owned(
                     let key_fn = if wire_names.len() == 1 {
                         let name = wire_names[0];
                         quote! {
-                            |mut __kp: <__M2 as #krate::MapAccessOwned>::KeyProbe, _i: usize| {
-                                __kp.deserialize_key::<#krate::Match>(#name)
+                            |mut __kp: <__M2 as #krate::MapAccessOwned>::KeyProbe, __i: usize| async move {
+                                let __kp2 = __kp.fork();
+                                #krate::select_probe! {
+                                    __kp.deserialize_key::<#krate::Match>(#name),
+                                    async move {
+                                        let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                                        ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::Match)))
+                                    },
+                                }
                             }
                         }
                     } else {
                         quote! {
-                            |mut __kp: <__M2 as #krate::MapAccessOwned>::KeyProbe, _i: usize| {
-                                __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*])
+                            |mut __kp: <__M2 as #krate::MapAccessOwned>::KeyProbe, __i: usize| async move {
+                                let __kp2 = __kp.fork();
+                                #krate::select_probe! {
+                                    __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*]),
+                                    async move {
+                                        let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                                        ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::MatchVals((), ::core::marker::PhantomData))))
+                                    },
+                                }
                             }
                         }
                     };
@@ -895,7 +926,7 @@ fn gen_struct_variant_helpers_owned(
                 pat
             };
 
-            // DetectDuplicatesOwned wire names array.
+            // DetectDuplicates wire names array.
             let dup_wire_names: Vec<TokenStream2> = cf
                 .iter()
                 .enumerate()
@@ -918,7 +949,7 @@ fn gen_struct_variant_helpers_owned(
                 quote! {
                     {
                         let __wn = [#( #dup_wire_names, )*];
-                        #krate::DetectDuplicatesOwned::new(
+                        #krate::DetectDuplicates::new(
                             #expr,
                             __wn,
                             move |__kp: <__M2 as #krate::MapAccessOwned>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
@@ -1330,10 +1361,10 @@ fn expand_owned_internally_tagged_unit_only(
         )
     };
 
-    // dup wire names for DetectDuplicatesOwned (only tag_field is a real arm).
+    // dup wire names for DetectDuplicates (only tag_field is a real arm).
     let arms_expr = quote! {{
         let __wn = [(#tag_field, 0usize)];
-        let __inner = #krate::DetectDuplicatesOwned::new(
+        let __inner = #krate::DetectDuplicates::new(
             (#krate::MapArmBase, #arm_slot),
             __wn,
             move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
@@ -1444,15 +1475,13 @@ fn expand_owned_internally_tagged_with_nonunit(
         .map(|(wire_name, idx)| quote! { (#wire_name, #idx) })
         .collect();
 
-    // Build one select_probe arm per non-unit variant.
-    // Each arm gets a pre-forked map variable so all forks are created before
-    // any async blocks capture them (avoiding multiple &mut borrows on __map).
-    let mut fork_stmts: Vec<TokenStream2> = Vec::new();
+    let mut all_entry_idents: Vec<syn::Ident> = Vec::new();
     let mut select_arms: Vec<TokenStream2> = Vec::new();
 
     for (arm_i, &(local_idx, cv)) in nonunit_variants.iter().enumerate() {
         let vname = &cv.variant.ident;
-        let fork_ident = format_ident!("__map_{}", arm_i);
+        let entry_ident = format_ident!("__e_{}", arm_i);
+        all_entry_idents.push(entry_ident.clone());
 
         let (de_type, variant_construction) = match &cv.kind {
             VariantKind::Newtype(ty) => (quote! { #ty }, quote! { #name::#vname(__v) }),
@@ -1479,18 +1508,17 @@ fn expand_owned_internally_tagged_with_nonunit(
             VariantKind::Unit => unreachable!(),
         };
 
-        fork_stmts.push(quote! {
-            let #fork_ident = __map.fork();
-        });
-
         select_arms.push(quote! {
             async move {
+                let __map = #krate::hit!(#entry_ident.deserialize_map().await);
+                let __tag_cell: ::core::cell::Cell<::core::option::Option<usize>> =
+                    ::core::cell::Cell::new(::core::option::Option::None);
                 let __m = #krate::TagAwareMapOwned::new(
-                    #fork_ident,
+                    __map,
                     #tag_field,
                     [#( #tag_cands_entries, )*],
                     #local_idx,
-                    __tag_value,
+                    &__tag_cell,
                 );
                 match <#de_type as #krate::DeserializeFromMapOwned<_>>::deserialize_from_map_owned(__m, ()).await? {
                     #krate::Probe::Hit((__c, __v)) =>
@@ -1502,92 +1530,117 @@ fn expand_owned_internally_tagged_with_nonunit(
         });
     }
 
-    // Unit variant match arms: after all non-unit arms miss, check tag_value.
-    // These are returned if the tag matched a unit variant index.
-    let unit_match_arms: Vec<_> = unit_variants
-        .iter()
-        .map(|&(local_idx, cv)| {
-            let vname = &cv.variant.ident;
-            quote! {
-                ::core::option::Option::Some(#local_idx) => {
-                    // Unit variant: drain the remaining map entries (all unknown since
-                    // the tag was already consumed by the non-unit arms' TagInjectingStackOwned)
-                    // and use the map claim to finalize the entry.
-                    return match __map.fork().iterate(
-                        (#krate::MapArmBase, #krate::VirtualArmSlot::new(
-                        |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
-                        |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
-                            let __vc = __vp.skip().await?;
-                            ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                        },
-                    ))
-                    ).await? {
-                        #krate::Probe::Hit((__c, _)) =>
-                            ::core::result::Result::Ok(#krate::Probe::Hit((__c, #name::#vname))),
-                        #krate::Probe::Miss =>
-                            ::core::result::Result::Ok(#krate::Probe::Miss),
-                    };
+    // Unit arm: handles all unit variants and the `other` fallback.
+    let needs_unit_arm = !unit_variants.is_empty() || other_variant(classified).is_some();
+    if needs_unit_arm {
+        let unit_entry_ident = format_ident!("__e_unit");
+        all_entry_idents.push(unit_entry_ident.clone());
+
+        // Reuse the unit-only logic to build the arm body.
+        let unit_only_body = expand_owned_internally_tagged_unit_only(
+            name,
+            classified,
+            tag_field,
+            variant_candidates,
+            _variant_key_sentinel,
+            krate,
+        )?;
+
+        // The unit_only_body is a full `d.entry(|[__e]| async { ... }).await` expression.
+        // We need just the inner map iteration logic. Instead, inline the map-iteration
+        // directly so it can be used inside a select_probe! arm.
+        let val_extra_entries: Vec<TokenStream2> = variant_candidates
+            .iter()
+            .map(|(wire_name, idx)| quote! { (#wire_name, #idx) })
+            .collect();
+        let val_extra_count = val_extra_entries.len();
+
+        let arm_slot = quote! {
+            #krate::MapArmSlot::new(
+                |mut __kp: #krate::owned::KP<__D>, _i: usize| {
+                    __kp.deserialize_key::<#krate::Match>(#tag_field)
+                },
+                |__vp: #krate::owned::VP2<__D>, __k| async move {
+                    let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#krate::MatchVals<usize, _>>(
+                        [#( #val_extra_entries, )*]
+                    ).await);
+                    ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                },
+            )
+        };
+
+        let arms_expr = quote! {{
+            let __wn = [(#tag_field, 0usize)];
+            let __inner = #krate::DetectDuplicates::new(
+                (#krate::MapArmBase, #arm_slot),
+                __wn,
+                move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
+                |__vp: #krate::owned::VP2<__D>| __vp.skip(),
+            );
+            (__inner, #krate::VirtualArmSlot::new(
+                |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
+                |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
+                    let __vc = __vp.skip().await?;
+                    ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
+                },
+            ))
+        }};
+
+        // Build match arms for unit variants only.
+        let unit_match_inner: Vec<_> = unit_variants
+            .iter()
+            .filter_map(|&(local_idx, cv)| {
+                if matches!(cv.kind, VariantKind::Unit) {
+                    let vname = &cv.variant.ident;
+                    Some(quote! {
+                        #krate::MatchVals(#local_idx, _) => ::core::result::Result::Ok(
+                            #krate::Probe::Hit((__claim, #name::#vname))
+                        ),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let unit_wildcard = match other_variant(classified) {
+            Some(vname) => quote! {
+                _ => ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name::#vname))),
+            },
+            None => quote! {
+                _ => ::core::result::Result::Ok(#krate::Probe::Miss),
+            },
+        };
+
+        let _ = val_extra_count;
+        let _ = unit_only_body;
+
+        select_arms.push(quote! {
+            async move {
+                let __map = #krate::hit!(#unit_entry_ident.deserialize_map().await);
+                let __arms = #arms_expr;
+                let (__claim, ((), __out_0)) = #krate::hit!(__map.iterate(__arms).await);
+                match __out_0 {
+                    ::core::option::Option::Some((_k, __matched)) => match __matched {
+                        #( #unit_match_inner )*
+                        #unit_wildcard
+                    },
+                    ::core::option::Option::None => {
+                        ::core::result::Result::Ok(#krate::Probe::Miss)
+                    }
                 }
             }
-        })
-        .collect();
-
-    let other_arm = match other_variant(classified) {
-        Some(vname) => quote! {
-            _ => {
-                // `other` variant: drain the map and return the catch-all variant.
-                return match __map.fork().iterate(
-                    (#krate::MapArmBase, #krate::VirtualArmSlot::new(
-                        |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
-                        |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
-                            let __vc = __vp.skip().await?;
-                            ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                        },
-                    ))
-                ).await? {
-                    #krate::Probe::Hit((__c, _)) =>
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__c, #name::#vname))),
-                    #krate::Probe::Miss =>
-                        ::core::result::Result::Ok(#krate::Probe::Miss),
-                };
-            }
-        },
-        None => quote! {
-            _ => ::core::result::Result::Ok(#krate::Probe::Miss),
-        },
-    };
+        });
+    }
 
     let _ = nonunit_count;
     let _ = tag_candidates_count;
 
     let body = quote! {
-        d.entry(|[__e]| async {
-            let mut __map = #krate::hit!(__e.deserialize_map().await);
-            let __tag_value: ::core::cell::Cell<::core::option::Option<usize>> =
-                ::core::cell::Cell::new(::core::option::Option::None);
-            let __tag_value = &__tag_value;
-
-            // Fork the map once per non-unit variant before entering select_probe!
-            // so that each async arm captures an owned fork, not &mut __map.
-            #( #fork_stmts )*
-
-            // Race all non-unit variant arms. Each arm uses a TagAwareDeserializerOwned
-            // that injects the tag arm and checks expected_variant before returning Hit.
-            let __result = #krate::select_probe! {
+        d.entry(|[#( #all_entry_idents, )*]| async {
+            #krate::select_probe! {
                 #( #select_arms, )*
                 @miss => ::core::result::Result::Ok(#krate::Probe::Miss),
-            };
-            if let ::core::result::Result::Ok(#krate::Probe::Hit(__v)) = __result {
-                return ::core::result::Result::Ok(#krate::Probe::Hit(__v));
-            }
-            if let ::core::result::Result::Err(__e) = __result {
-                return ::core::result::Result::Err(__e);
-            }
-
-            // All non-unit arms missed. Check tag_value for unit variants.
-            match __tag_value.get() {
-                #( #unit_match_arms )*
-                #other_arm
             }
         }).await
     };
@@ -1723,12 +1776,13 @@ fn expand_owned_adjacent_tagged_with_nonunit(
         [(#tag_field, 0usize), (#content_field, 1usize)]
     };
 
-    let mut fork_stmts: Vec<TokenStream2> = Vec::new();
+    let mut all_entry_idents: Vec<syn::Ident> = Vec::new();
     let mut select_arms: Vec<TokenStream2> = Vec::new();
 
     for (arm_i, &(local_idx, cv)) in nonunit_variants.iter().enumerate() {
         let vname = &cv.variant.ident;
-        let fork_ident = format_ident!("__map_{}", arm_i);
+        let entry_ident = format_ident!("__e_{}", arm_i);
+        all_entry_idents.push(entry_ident.clone());
 
         let (de_type, variant_construction) = match &cv.kind {
             VariantKind::Newtype(ty) => (quote! { #ty }, quote! { #name::#vname(__v) }),
@@ -1755,12 +1809,9 @@ fn expand_owned_adjacent_tagged_with_nonunit(
             VariantKind::Unit => unreachable!(),
         };
 
-        fork_stmts.push(quote! {
-            let #fork_ident = __map.fork();
-        });
-
         select_arms.push(quote! {
             async move {
+                let mut __map = #krate::hit!(#entry_ident.deserialize_map().await);
                 // Two-slot arm stack: tag slot + content slot, with dup detection + skip unknown.
                 let __arms = {
                     let __inner_arms = (
@@ -1771,7 +1822,7 @@ fn expand_owned_adjacent_tagged_with_nonunit(
                              },
                              |__vp: #krate::owned::VP2<__D>, __k| async move {
                                  let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<
-                                     #krate::MatchVals<usize, #tag_cands_count>
+                                     #krate::MatchVals<usize, [(&'static str, usize); #tag_cands_count]>
                                  >([#( #tag_cands_entries, )*]).await);
                                  ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
                              },
@@ -1787,7 +1838,7 @@ fn expand_owned_adjacent_tagged_with_nonunit(
                         )
                     );
                     let __wn = #dup_wire_names;
-                    let __dd = #krate::DetectDuplicatesOwned::new(
+                    let __dd = #krate::DetectDuplicates::new(
                         __inner_arms,
                         __wn,
                         move |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
@@ -1802,7 +1853,7 @@ fn expand_owned_adjacent_tagged_with_nonunit(
                     ))
                 };
                 let (__claim, (((), __opt_tag), __opt_content)) =
-                    #krate::hit!(#fork_ident.iterate(__arms).await);
+                    #krate::hit!(__map.iterate(__arms).await);
                 match (__opt_tag, __opt_content) {
                     (
                         ::core::option::Option::Some((_, #krate::MatchVals(#local_idx, _))),
@@ -1816,8 +1867,7 @@ fn expand_owned_adjacent_tagged_with_nonunit(
         });
     }
 
-    // Unit variant match arms (fallback after all non-unit arms miss).
-    // Iterate the outer map with just the tag slot + SkipUnknownOwned.
+    // Unit variant arms (as a select arm that handles all unit/other fallback).
     let unit_match_arms: Vec<_> = unit_variants
         .iter()
         .map(|&(local_idx, cv)| {
@@ -1845,64 +1895,52 @@ fn expand_owned_adjacent_tagged_with_nonunit(
         },
     };
 
-    let unit_fallback = if !unit_match_arms.is_empty() || other_variant(classified).is_some() {
-        quote! {
-            // Unit variant fallback: iterate the outer map looking for the tag field.
-            let __unit_arms = (
-                (#krate::MapArmBase,
-                 #krate::MapArmSlot::new(
-                     |mut __kp: #krate::owned::KP<__D>, _i: usize| {
-                         __kp.deserialize_key::<#krate::Match>(#tag_field)
-                     },
-                     |__vp: #krate::owned::VP2<__D>, __k| async move {
-                         let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<
-                             #krate::MatchVals<usize, #tag_cands_count>
-                         >([#( #tag_cands_entries, )*]).await);
-                         ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
-                     },
-                 )),
-                #krate::VirtualArmSlot::new(
-                    |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
-                    |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
-                        let __vc = __vp.skip().await?;
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                    },
-                ),
-            );
-            let (__unit_claim, ((), __opt_unit_tag)) =
-                #krate::hit!(__map.fork().iterate(__unit_arms).await);
-            match __opt_unit_tag {
-                #( #unit_match_arms )*
-                #other_arm
+    let needs_unit_arm = !unit_match_arms.is_empty() || other_variant(classified).is_some();
+    if needs_unit_arm {
+        let unit_entry_ident = format_ident!("__e_unit");
+        all_entry_idents.push(unit_entry_ident.clone());
+
+        select_arms.push(quote! {
+            async move {
+                let mut __map = #krate::hit!(#unit_entry_ident.deserialize_map().await);
+                // Unit variant arm: iterate the outer map looking for the tag field.
+                let __unit_arms = (
+                    (#krate::MapArmBase,
+                     #krate::MapArmSlot::new(
+                         |mut __kp: #krate::owned::KP<__D>, _i: usize| {
+                             __kp.deserialize_key::<#krate::Match>(#tag_field)
+                         },
+                         |__vp: #krate::owned::VP2<__D>, __k| async move {
+                             let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<
+                                 #krate::MatchVals<usize, [(&'static str, usize); #tag_cands_count]>
+                             >([#( #tag_cands_entries, )*]).await);
+                             ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                         },
+                     )),
+                    #krate::VirtualArmSlot::new(
+                        |__kp: #krate::owned::KP<__D>, _i: usize| __kp.deserialize_key::<#krate::Skip>(()),
+                        |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
+                            let __vc = __vp.skip().await?;
+                            ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
+                        },
+                    ),
+                );
+                let (__unit_claim, ((), __opt_unit_tag)) =
+                    #krate::hit!(__map.iterate(__unit_arms).await);
+                match __opt_unit_tag {
+                    #( #unit_match_arms )*
+                    #other_arm
+                }
             }
-        }
-    } else {
-        quote! {
-            ::core::result::Result::Ok(#krate::Probe::Miss)
-        }
-    };
+        });
+    }
 
     let body = quote! {
-        d.entry(|[__e]| async {
-            let mut __map = #krate::hit!(__e.deserialize_map().await);
-
-            // Fork the map once per non-unit variant.
-            #( #fork_stmts )*
-
-            // Race all non-unit variant arms.
-            let __result = #krate::select_probe! {
+        d.entry(|[#( #all_entry_idents, )*]| async {
+            #krate::select_probe! {
                 #( #select_arms, )*
                 @miss => ::core::result::Result::Ok(#krate::Probe::Miss),
-            };
-            if let ::core::result::Result::Ok(#krate::Probe::Hit(__v)) = __result {
-                return ::core::result::Result::Ok(#krate::Probe::Hit(__v));
             }
-            if let ::core::result::Result::Err(__e) = __result {
-                return ::core::result::Result::Err(__e);
-            }
-
-            // All non-unit arms missed - check for unit variants.
-            #unit_fallback
         }).await
     };
 

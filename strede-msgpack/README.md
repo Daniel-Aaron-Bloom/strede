@@ -188,7 +188,7 @@ enum Event {
 All [strede derive attributes](https://crates.io/crates/strede) work
 unchanged with msgpack: `rename`, `rename_all`, `alias`, `default`,
 `default = "expr"`, `skip_deserializing`, `allow_unknown_fields`,
-`transparent`, `flatten`, `flatten(boxed)`, `tag`, `tag + content`,
+`transparent`, `flatten`, `tag`, `tag + content`,
 `untagged`, `other`, `from`, `try_from`, `deserialize_with`,
 `deserialize_owned_with`, `with`, `bound`, `borrow`, `crate`.
 
@@ -348,7 +348,7 @@ any key type (including non-string keys) is supported.
 
 | Feature | Description |
 |---|---|
-| `alloc` | Enables `MsgpackValue`, Timestamp 96 decoding in the owned family, and `#[strede(flatten(boxed))]` for deeply-nested flatten chains. |
+| `alloc` | Enables `MsgpackValue` and Timestamp 96 decoding in the owned family. |
 
 ## Error type
 
@@ -372,10 +372,6 @@ any key type (including non-string keys) is supported.
   values nested deeper than the stack capacity return
   `Err(MsgpackError::SkipDepthExceeded)`. The borrow-family skip is
   recursion-based and is limited by the call stack instead.
-- **`deserialize_number_chunks`** is not implemented; numeric types decode
-  directly from wire integers and floats rather than going through a text
-  chunk accessor. Code that calls `deserialize_number_chunks` on a msgpack
-  entry will get `Probe::Miss`.
 
 ## Workspace
 

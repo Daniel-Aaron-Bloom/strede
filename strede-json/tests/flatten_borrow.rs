@@ -1,4 +1,4 @@
-//! Borrow-family single-flatten fixtures exercising the v3 `FlattenMapAccess` path.
+//! Borrow-family single-flatten fixtures exercising the derive's `MapFieldProvider` codegen.
 
 use strede::Probe;
 use strede_derive::Deserialize;
@@ -16,6 +16,15 @@ struct Outer {
     id: u32,
     #[strede(flatten)]
     inner: Inner,
+}
+
+// Field before AND after the flatten — exercises the before/after arm split.
+#[derive(Debug, PartialEq, Deserialize)]
+struct OuterWithSuffix {
+    prefix: u32,
+    #[strede(flatten)]
+    inner: Inner,
+    suffix: u32,
 }
 
 fn parse<'de, T>(input: &'de str) -> Option<T>
@@ -74,5 +83,29 @@ fn missing_outer_field_misses() {
 #[test]
 fn missing_inner_field_misses() {
     let v: Option<Outer> = parse(r#"{"id": 7, "a": 1}"#);
+    assert!(v.is_none());
+}
+
+#[test]
+fn suffix_outer_then_inner_then_suffix() {
+    let o: OuterWithSuffix = parse(r#"{"prefix": 1, "a": 2, "b": 3, "suffix": 4}"#).unwrap();
+    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+}
+
+#[test]
+fn suffix_interleaved() {
+    let o: OuterWithSuffix = parse(r#"{"a": 2, "suffix": 4, "prefix": 1, "b": 3}"#).unwrap();
+    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+}
+
+#[test]
+fn suffix_missing_prefix_misses() {
+    let v: Option<OuterWithSuffix> = parse(r#"{"a": 2, "b": 3, "suffix": 4}"#);
+    assert!(v.is_none());
+}
+
+#[test]
+fn suffix_missing_suffix_misses() {
+    let v: Option<OuterWithSuffix> = parse(r#"{"prefix": 1, "a": 2, "b": 3}"#);
     assert!(v.is_none());
 }

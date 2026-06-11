@@ -1,3 +1,4 @@
+use const_array_concat::ConcatableArray;
 use core::future::Future;
 
 use crate::map_arm::NextKey;
@@ -145,7 +146,7 @@ pub trait Entry<'de>: Sized {
 
     type StrChunks: StrAccess<Claim = Self::Claim, Error = Self::Error>;
     type BytesChunks: BytesAccess<Claim = Self::Claim, Error = Self::Error>;
-    type NumberChunks: NumberAccess<Claim = Self::Claim, Error = Self::Error>;
+    type NumberChunks<Enc: NumberEncoding>: NumberAccess<Enc, Claim = Self::Claim, Error = Self::Error>;
     type Map: MapAccess<'de, MapClaim = Self::Claim, Error = Self::Error>;
     type Seq: SeqAccess<'de, SeqClaim = Self::Claim, Error = Self::Error>;
     type Enum: EnumAccess<'de, Claim = Self::Claim, Error = Self::Error>;
@@ -180,12 +181,14 @@ pub trait Entry<'de>: Sized {
     /// Handles all byte strings including those requiring transcoding.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
-    /// Begin streaming a number chunk-by-chunk. The [`Entry::Claim`] is
-    /// returned by [`NumberAccess::next_number_chunk`] when the number is
-    /// exhausted. Handles all numbers including those split across buffer
-    /// boundaries.
-    /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error>;
+    /// Begin streaming a variable-length number chunk-by-chunk.
+    /// The [`Entry::Claim`] is returned by [`NumberAccess::next_number_chunk`] when the
+    /// number is exhausted. `Enc` selects the wire encoding; formats hit only on
+    /// encodings they natively support and return `Ok(Probe::Miss)` otherwise.
+    /// `Ok(Probe::Miss)` on type or encoding mismatch; `Err` on fatal format error only.
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error>;
 
     /// Begin reading a map.  The [`Entry::Claim`] is returned by
     /// [`MapAccess::iterate`] when the map is exhausted.
@@ -297,13 +300,6 @@ pub trait StrAccess: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
 
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// Both `self` and the returned accessor are independent: advancing one
-    /// does not affect the other.  Both start from the current chunk
-    /// position and must each be driven to `Done` independently.
-    fn fork(&mut self) -> Self;
-
     /// Advance to the next chunk, passing it to `f`.
     ///
     /// - `Ok(Chunk::Data((self, r)))` - next chunk processed; accessor returned for the next call.
@@ -343,11 +339,6 @@ pub trait BytesAccess: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
 
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// See [`StrAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
-
     /// Advance to the next chunk, passing it to `f`.
     ///
     /// - `Ok(Chunk::Data((self, r)))` - next chunk processed; accessor returned for the next call.
@@ -361,20 +352,91 @@ pub trait BytesAccess: Sized {
 }
 
 // ---------------------------------------------------------------------------
+// NumberEncoding
+// ---------------------------------------------------------------------------
+
+/// Describes the wire encoding of a variable-length number token.
+///
+/// Each implementor declares `Data` (either `str` for text or `[u8]` for
+/// binary blobs) and provides conversions from the two raw representations
+/// formats hold internally.  The `NAME` const lets format impls branch at
+/// compile time (e.g. `if Enc::NAME == Ascii::NAME`) without specialization.
+///
+/// Three built-in encodings are provided: [`Ascii`], [`BigEndian`], and
+/// [`LittleEndian`].  Third-party formats can add their own.
+pub trait NumberEncoding {
+    /// The slice type yielded to callers: `str` for text, `[u8]` for binary.
+    type Data: ?Sized;
+
+    /// Stable string identifier for this encoding.
+    /// Format impls use `Enc::NAME == SomeEncoding::NAME` to decide Hit/Miss.
+    const NAME: &'static str;
+
+    /// Convert a raw byte slice to `&Self::Data`.
+    /// Panics if the bytes are not valid for this encoding (e.g. non-UTF-8 for `Ascii`).
+    fn from_bytes(bytes: &[u8]) -> &Self::Data;
+
+    /// Convert a `&str` to `&Self::Data`.
+    fn from_str(s: &str) -> &Self::Data;
+}
+
+/// ASCII text encoding — formats that emit numbers as decimal text (e.g. JSON).
+pub struct Ascii;
+/// Big-endian binary encoding — formats that emit numbers as big-endian byte blobs.
+pub struct BigEndian;
+/// Little-endian binary encoding — formats that emit numbers as little-endian byte blobs.
+pub struct LittleEndian;
+
+impl NumberEncoding for Ascii {
+    type Data = str;
+    const NAME: &'static str = "ascii";
+    fn from_bytes(bytes: &[u8]) -> &str {
+        core::str::from_utf8(bytes).unwrap()
+    }
+    fn from_str(s: &str) -> &str {
+        s
+    }
+}
+
+impl NumberEncoding for BigEndian {
+    type Data = [u8];
+    const NAME: &'static str = "big-endian";
+    fn from_bytes(b: &[u8]) -> &[u8] {
+        b
+    }
+    fn from_str(s: &str) -> &[u8] {
+        s.as_bytes()
+    }
+}
+
+impl NumberEncoding for LittleEndian {
+    type Data = [u8];
+    const NAME: &'static str = "little-endian";
+    fn from_bytes(b: &[u8]) -> &[u8] {
+        b
+    }
+    fn from_str(s: &str) -> &[u8] {
+        s.as_bytes()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NumberAccess
 // ---------------------------------------------------------------------------
 
-/// Streams a number's textual representation in zero-copy chunks.
+/// Streams a variable-length number in zero-copy chunks.
 /// Obtained from [`Entry::deserialize_number_chunks`].
 ///
-/// Numbers are primitives — the type is already known, so no probing or
-/// racing is needed. This accessor yields the number's digits (including
-/// sign, decimal point, and exponent) as `&str` chunks. Useful for
-/// arbitrary-precision number types that cannot be represented by fixed
-/// primitives like `i64` or `f64`.
+/// `Enc` controls the wire encoding: [`Ascii`] for text formats (JSON),
+/// [`BigEndian`] / [`LittleEndian`] for binary formats (msgpack bigints, etc.).
+/// Each chunk is passed as `&Enc::Data` — `&str` for `Ascii`, `&[u8]` for binary.
+///
+/// Useful for arbitrary-precision number types that cannot be represented by
+/// fixed primitives like `i64` or `f64`. Fixed-width natives use their own
+/// `deserialize_number_*` methods instead.
 ///
 /// ```rust,ignore
-/// let mut chunks = hit!(e.deserialize_number_chunks().await);
+/// let mut chunks = hit!(e.deserialize_number_chunks::<Ascii>().await);
 /// let mut out = String::new();
 /// let claim = loop {
 ///     match chunks.next_number_chunk(|s| out.push_str(s)).await? {
@@ -383,17 +445,12 @@ pub trait BytesAccess: Sized {
 ///     }
 /// };
 /// ```
-pub trait NumberAccess: Sized {
+pub trait NumberAccess<Enc: NumberEncoding = Ascii>: Sized {
     /// Proof-of-consumption token, returned when the number is exhausted.
     /// Must match the enclosing [`Entry::Claim`].
     type Claim;
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
-
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// See [`StrAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
 
     /// Advance to the next chunk, passing it to `f`.
     ///
@@ -403,7 +460,7 @@ pub trait NumberAccess: Sized {
     /// - `Pending` — no data yet.
     async fn next_number_chunk<R>(
         self,
-        f: impl FnOnce(&str) -> R,
+        f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
@@ -501,8 +558,6 @@ pub trait MapAccess<'de>: Sized {
 
     type KeyProbe: MapKeyProbe<'de, Error = Self::Error>;
 
-    fn fork(&mut self) -> Self;
-
     /// Drive the map iteration with the given arm stack.
     ///
     /// Returns `Hit((MapClaim, Outputs))` on success, `Miss` if a value
@@ -541,7 +596,6 @@ pub type EVP<'de, D> =
 
 pub use crate::enum_arm::EnumArmStack;
 pub use crate::map_arm::MapArmStack;
-pub use crate::map_arm::borrow::FlattenCont;
 
 // ---------------------------------------------------------------------------
 // SeqAccess
@@ -578,11 +632,6 @@ pub trait SeqAccess<'de>: Sized {
 
     /// Owned handle for one sequence element.  See [`SeqEntry`].
     type Elem: SeqEntry<'de, Claim = Self::ElemClaim, Error = Self::Error>;
-
-    /// Fork a sibling accessor at the same sequence position.
-    ///
-    /// See [`MapAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
 
     /// Advance to the next element, passing `N` owned [`SeqEntry`] handles to `f`.
     ///
@@ -665,10 +714,14 @@ pub trait EnumVariantProbe<'de>: Sized {
     /// Returns `Ok(Probe::Hit((Claim, matched_local_idx)))` on a match,
     /// `Ok(Probe::Miss)` if the current token is not a string or does not match
     /// any candidate.
-    async fn deserialize_unit_by_name<const N: usize>(
+    async fn deserialize_unit_by_name<W>(
         self,
-        _candidates: [(&'static str, usize); N],
-    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        _candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
         Ok(Probe::Miss)
     }
 
@@ -677,13 +730,15 @@ pub trait EnumVariantProbe<'de>: Sized {
     /// Returns `Ok(Probe::Hit((Claim, matched_local_idx, value)))` on a match,
     /// `Ok(Probe::Miss)` if the current token is not a single-key map or the key
     /// does not match any candidate.
-    async fn deserialize_payload_by_name<T, const N: usize>(
+    async fn deserialize_payload_by_name<T, W>(
         self,
-        _candidates: [(&'static str, usize); N],
+        _candidates: W,
         _extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         Ok(Probe::Miss)
     }
@@ -750,9 +805,6 @@ pub trait EnumAccess<'de>: Sized {
     type Claim: 'de;
 
     type VariantProbe: EnumVariantProbe<'de, Claim = Self::Claim, Error = Self::Error>;
-
-    /// Fork a sibling enum access handle at the same read position.
-    fn fork(&mut self) -> Self;
 
     /// Drive variant dispatch with the given arm stack.
     ///

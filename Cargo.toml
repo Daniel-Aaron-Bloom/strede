@@ -7,11 +7,13 @@ members = [
     "strede-cbor",
     "strede-test-util",
     "strede-bench",
+    "strede-postcard",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
+const-array-concat = "0.2"
 
 [workspace.package]
 version = "0.1.1"

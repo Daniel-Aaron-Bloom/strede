@@ -1,5 +1,5 @@
 use strede::owned::NumberAccessOwned;
-use strede::{Chunk, Probe};
+use strede::{Ascii, Chunk, Probe};
 
 /// A decimal floating-point number, represented as a sequence of decimal digits.
 #[derive(Clone, Debug, PartialEq)]
@@ -293,7 +293,7 @@ enum FastParseState {
 ///
 /// Returns `Probe::Miss` when the input is an integer (no `.`, `e`, or `E`),
 /// or when the exponent is malformed.
-pub(super) async fn parse_decimal_fast<A: NumberAccessOwned>(
+pub(super) async fn parse_decimal_fast<A: NumberAccessOwned<Ascii>>(
     mut chunks: A,
 ) -> Result<Probe<(A::Claim, DecimalFast, bool)>, A::Error> {
     let mut state = FastParseState::LeadingSign;
@@ -464,7 +464,7 @@ pub(super) async fn parse_decimal_fast<A: NumberAccessOwned>(
 /// Streaming `parse_decimal_seq`: builds a [`DecimalSeq`] from a chunked
 /// number stream. Returns `Probe::Miss` if the input has no `.`, `e`, or `E`
 /// (handing the win to one of the int contestants).
-pub(super) async fn parse_decimal_seq<A: NumberAccessOwned>(
+pub(super) async fn parse_decimal_seq<A: NumberAccessOwned<Ascii>>(
     mut chunks: A,
 ) -> Result<Probe<(A::Claim, DecimalSeq, bool)>, A::Error> {
     let mut d = DecimalSeq::default();
@@ -798,13 +798,9 @@ mod tests {
         }
     }
 
-    impl<'a> strede::owned::NumberAccessOwned for FakeAccess<'a> {
+    impl<'a> strede::owned::NumberAccessOwned<strede::Ascii> for FakeAccess<'a> {
         type Claim = ();
         type Error = Never;
-
-        fn fork(&mut self) -> Self {
-            self.clone()
-        }
 
         async fn next_number_chunk<R>(
             mut self,

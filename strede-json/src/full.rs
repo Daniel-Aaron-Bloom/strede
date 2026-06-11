@@ -25,10 +25,11 @@ use crate::{
 };
 
 use strede::{
-    BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
-    Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess, MapArmStack,
-    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey, NumberAccess,
-    Probe, SeqAccess, SeqEntry, StrAccess, hit, match_entry_str_against, utils::repeat,
+    Ascii, BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess,
+    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
+    NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit,
+    match_entry_str_against, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -289,7 +290,7 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     type SubDeserializer = JsonSubDeserializer<'de>;
     type StrChunks = JsonStrAccess<'de>;
     type BytesChunks = JsonBytesAccess<'de>;
-    type NumberChunks = JsonNumberAccess<'de>;
+    type NumberChunks<Enc: NumberEncoding> = JsonNumberAccess<'de>;
     type Map = JsonMapAccess<'de>;
     type Seq = JsonSeqAccess<'de>;
     type Enum = JsonEnumAccess<'de>;
@@ -368,7 +369,12 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
 
     // ---- Number chunks -----------------------------------------------------
 
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != Ascii::NAME {
+            return Ok(Probe::Miss);
+        }
         match self.token {
             Token::Number(access) => Ok(Probe::Hit(JsonNumberAccess {
                 access,
@@ -385,7 +391,6 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
             Token::Simple(SimpleToken::ObjectStart, tok) => Ok(Probe::Hit(JsonMapAccess {
                 tokenizer: tok,
                 src: self.src,
-                first: true,
             })),
             _ => Ok(Probe::Miss),
         }
@@ -567,15 +572,6 @@ impl<'de> StrAccess for JsonStrAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-            char_buf: self.char_buf,
-        }
-    }
-
     async fn next_str<R>(
         mut self,
         f: impl FnOnce(&str) -> R,
@@ -605,15 +601,6 @@ impl<'de> BytesAccess for JsonBytesAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-            char_buf: self.char_buf,
-        }
-    }
-
     async fn next_bytes<R>(
         mut self,
         f: impl FnOnce(&[u8]) -> R,
@@ -642,24 +629,16 @@ pub struct JsonNumberAccess<'de> {
     src: &'de [u8],
 }
 
-impl<'de> NumberAccess for JsonNumberAccess<'de> {
+impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for JsonNumberAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-        }
-    }
-
     async fn next_number_chunk<R>(
         mut self,
-        f: impl FnOnce(&str) -> R,
+        f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.access.next_chunk(&mut self.src) {
-            Ok(Some(chunk)) => Ok(Chunk::Data((self, f(chunk)))),
+            Ok(Some(chunk)) => Ok(Chunk::Data((self, f(Enc::from_str(chunk))))),
             Ok(None) => Ok(Chunk::Done(JsonClaim {
                 tokenizer: Tokenizer::new(),
                 src: self.src,
@@ -676,7 +655,6 @@ impl<'de> NumberAccess for JsonNumberAccess<'de> {
 pub struct JsonMapAccess<'de> {
     tokenizer: Tokenizer,
     src: &'de [u8],
-    first: bool,
 }
 
 /// Key probe: holds the start-of-key token and remaining source bytes.
@@ -842,15 +820,6 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'de> {
     type MapClaim = JsonClaim<'de>;
     type KeyProbe = JsonMapKeyProbe<'de>;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            tokenizer: self.tokenizer.clone(),
-            src: self.src,
-            first: self.first,
-        }
-    }
-
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
         mut arms: S,
@@ -1001,15 +970,6 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'de> {
     type ElemClaim = JsonClaim<'de>;
 
     type Elem = JsonSeqEntry<'de>;
-
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            tokenizer: self.tokenizer.clone(),
-            src: self.src,
-            first: self.first,
-        }
-    }
 
     #[inline(always)]
     async fn next<const N: usize, F, Fut, R>(
@@ -1241,14 +1201,6 @@ impl<'de> EnumAccess<'de> for JsonEnumAccess<'de> {
     type Claim = JsonClaim<'de>;
     type VariantProbe = JsonEnumVariantProbe<'de>;
 
-    fn fork(&mut self) -> Self {
-        Self {
-            token: self.token.clone(),
-            src: self.src,
-            start_src: self.start_src,
-        }
-    }
-
     async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStack<'de, Self::VariantProbe>,
@@ -1284,25 +1236,31 @@ impl<'de> EnumVariantProbe<'de> for JsonEnumVariantProbe<'de> {
         }
     }
 
-    async fn deserialize_unit_by_name<const N: usize>(
+    async fn deserialize_unit_by_name<W>(
         self,
-        candidates: [(&'static str, usize); N],
-    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
         let entry = JsonEntry {
             token: self.token,
             src: self.src,
             start_src: self.start_src,
         };
-        match_entry_str_against(entry, candidates).await
+        match_entry_str_against(entry, candidates.as_ref()).await
     }
 
-    async fn deserialize_payload_by_name<T, const N: usize>(
+    async fn deserialize_payload_by_name<T, W>(
         self,
-        candidates: [(&'static str, usize); N],
+        candidates: W,
         extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Expect a single-key object `{"VariantName": <payload>}`.
         let (mut src, tok) = match self.token {
@@ -1326,7 +1284,7 @@ impl<'de> EnumVariantProbe<'de> for JsonEnumVariantProbe<'de> {
         };
         let (key_claim, MatchVals(idx, _)) = hit!(
             key_probe
-                .deserialize_key::<MatchVals<usize, N>>(candidates)
+                .deserialize_key::<MatchVals<usize, W>>(candidates)
                 .await
         );
 

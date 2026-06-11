@@ -68,28 +68,16 @@ pub use strede_derive::{Deserialize, DeserializeOwned};
 // -- shared types --
 pub use error::DeserializeError;
 pub use never::Never;
+pub use const_array_concat::{ArrayConcat, ConcatableArray};
 pub use probe::{Chunk, Probe};
 pub use shared_buf::{Buffer, Handle, SharedBuf};
 
-/// Terminal flatten continuation: calls `map.iterate(SkipUnknownOwned(arms))` directly.
-/// Used for the last (or only) flatten field in a struct.
-/// Zero-alloc - may stack-overflow with deeply nested `StackConcat` types
-/// (typically 3+ flatten fields). Use [`FlattenTerminalBoxed`] to avoid this.
-pub struct FlattenTerminal;
-
-/// Terminal flatten continuation: calls `map.iterate(SkipUnknownOwned(arms))` via `Box::pin`.
-/// Heap-allocates the future to break the deeply-nested async state-machine chain
-/// produced by `StackConcat`, preventing stack overflow with 3+ flatten fields.
-/// Generated when `#[strede(flatten(boxed))]` is used.
-#[cfg(feature = "alloc")]
-pub struct FlattenTerminalBoxed;
-
 // -- borrow family --
 pub use borrow::{
-    BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
-    Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, FlattenCont, MapAccess,
-    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, SeqAccess,
-    SeqEntry, StrAccess,
+    Ascii, BigEndian, BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
+    LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
+    MapValueProbe, NumberAccess, NumberEncoding, SeqAccess, SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -143,9 +131,11 @@ macro_rules! __left_nest_pat {
 }
 
 // -- utility types --
-pub use impls::string_enum::{match_entry_str_against, match_str_chunks_against};
+pub use impls::string_enum::{
+    match_entry_str_against, match_str_chunks_against, match_str_chunks_against_owned,
+};
 pub use impls::{
-    FlattenMapAccess, FlattenMapAccessOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
+    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
     UnwrapOrElse,
 };
 
@@ -155,11 +145,11 @@ pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
 // -- owned family --
 pub use owned::{
     ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
-    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicatesOwned,
-    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, FlattenContOwned, MapAccessOwned, MapArm,
+    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates,
+    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, MapAccessOwned, MapArm,
     MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
     MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
-    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned, VirtualArmSlot,
+    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStack, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]

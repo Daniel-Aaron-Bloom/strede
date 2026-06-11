@@ -10,15 +10,32 @@ use crate::MsgpackError;
 /// many elements/pairs from the stream.
 ///
 /// Numbers, bool, and nil carry their values inline — no additional bytes to
-/// consume from the stream.
+/// consume from the stream.  Integer variants store raw big-endian wire bytes
+/// so consumers can inspect the original width and encoding.
 #[derive(Clone, Copy, Debug)]
 pub enum MsgpackToken {
     Nil,
     Bool(bool),
-    /// Positive integer (fixint 0x00–0x7f, uint8/16/32/64).
-    UInt(u64),
-    /// Negative or signed integer (negative fixint 0xe0–0xff, int8/16/32/64).
-    Int(i64),
+    /// Positive fixint (0x00–0x7f) — 1 wire byte.
+    UFixInt([u8; 1]),
+    /// uint8 (0xcc) — 1 wire byte.
+    UInt8([u8; 1]),
+    /// uint16 (0xcd) — 2 wire bytes, big-endian.
+    UInt16([u8; 2]),
+    /// uint32 (0xce) — 4 wire bytes, big-endian.
+    UInt32([u8; 4]),
+    /// uint64 (0xcf) — 8 wire bytes, big-endian.
+    UInt64([u8; 8]),
+    /// Negative fixint (0xe0–0xff) — 1 wire byte (two's-complement).
+    IFixInt([u8; 1]),
+    /// int8 (0xd0) — 1 wire byte.
+    Int8([u8; 1]),
+    /// int16 (0xd1) — 2 wire bytes, big-endian.
+    Int16([u8; 2]),
+    /// int32 (0xd2) — 4 wire bytes, big-endian.
+    Int32([u8; 4]),
+    /// int64 (0xd3) — 8 wire bytes, big-endian.
+    Int64([u8; 8]),
     Float32(f32),
     Float64(f64),
     /// UTF-8 string; payload is `len` bytes immediately following the header.
@@ -43,17 +60,25 @@ pub enum MsgpackToken {
     },
 }
 
-/// Read a multi-byte big-endian integer of size `N` from `src`, advancing it.
+/// Read `N` raw bytes from `src`, advancing it.
 /// Returns `Err(UnexpectedEnd)` if fewer than `N` bytes remain.
-macro_rules! read_be {
-    ($src:expr, $n:literal, $t:ty) => {{
+macro_rules! read_raw {
+    ($src:expr, $n:literal) => {{
         if $src.len() < $n {
             return Err(MsgpackError::UnexpectedEnd);
         }
         let mut b = [0u8; $n];
         b.copy_from_slice(&$src[..$n]);
         *$src = &$src[$n..];
-        <$t>::from_be_bytes(b)
+        b
+    }};
+}
+
+/// Read a multi-byte big-endian integer of size `N` from `src`, advancing it.
+/// Returns `Err(UnexpectedEnd)` if fewer than `N` bytes remain.
+macro_rules! read_be {
+    ($src:expr, $n:literal, $t:ty) => {{
+        <$t>::from_be_bytes(read_raw!($src, $n))
     }};
 }
 
@@ -80,7 +105,7 @@ pub fn next_token(src: &mut &[u8]) -> Result<MsgpackToken, MsgpackError> {
 pub fn parse_token(byte: u8, src: &mut &[u8]) -> Result<MsgpackToken, MsgpackError> {
     match byte {
         // positive fixint 0x00–0x7f
-        0x00..=0x7f => Ok(MsgpackToken::UInt(byte as u64)),
+        0x00..=0x7f => Ok(MsgpackToken::UFixInt([byte])),
         // fixmap 0x80–0x8f
         0x80..=0x8f => Ok(MsgpackToken::Map((byte & 0x0f) as usize)),
         // fixarray 0x90–0x9f
@@ -145,15 +170,15 @@ pub fn parse_token(byte: u8, src: &mut &[u8]) -> Result<MsgpackToken, MsgpackErr
             Ok(MsgpackToken::Float64(f64::from_bits(bits)))
         }
         // uint8 / uint16 / uint32 / uint64
-        0xcc => Ok(MsgpackToken::UInt(read_be!(src, 1, u8) as u64)),
-        0xcd => Ok(MsgpackToken::UInt(read_be!(src, 2, u16) as u64)),
-        0xce => Ok(MsgpackToken::UInt(read_be!(src, 4, u32) as u64)),
-        0xcf => Ok(MsgpackToken::UInt(read_be!(src, 8, u64))),
+        0xcc => Ok(MsgpackToken::UInt8(read_raw!(src, 1))),
+        0xcd => Ok(MsgpackToken::UInt16(read_raw!(src, 2))),
+        0xce => Ok(MsgpackToken::UInt32(read_raw!(src, 4))),
+        0xcf => Ok(MsgpackToken::UInt64(read_raw!(src, 8))),
         // int8 / int16 / int32 / int64
-        0xd0 => Ok(MsgpackToken::Int(read_be!(src, 1, i8) as i64)),
-        0xd1 => Ok(MsgpackToken::Int(read_be!(src, 2, i16) as i64)),
-        0xd2 => Ok(MsgpackToken::Int(read_be!(src, 4, i32) as i64)),
-        0xd3 => Ok(MsgpackToken::Int(read_be!(src, 8, i64))),
+        0xd0 => Ok(MsgpackToken::Int8(read_raw!(src, 1))),
+        0xd1 => Ok(MsgpackToken::Int16(read_raw!(src, 2))),
+        0xd2 => Ok(MsgpackToken::Int32(read_raw!(src, 4))),
+        0xd3 => Ok(MsgpackToken::Int64(read_raw!(src, 8))),
         // fixext1/2/4/8/16 — type byte + N data bytes, all embedded in token
         0xd4 => {
             if src.len() < 2 {
@@ -257,7 +282,7 @@ pub fn parse_token(byte: u8, src: &mut &[u8]) -> Result<MsgpackToken, MsgpackErr
             Ok(MsgpackToken::Map(count))
         }
         // negative fixint 0xe0–0xff
-        0xe0..=0xff => Ok(MsgpackToken::Int(byte as i8 as i64)),
+        0xe0..=0xff => Ok(MsgpackToken::IFixInt([byte])),
     }
 }
 
@@ -271,8 +296,16 @@ pub fn skip_value(src: &mut &[u8], tok: MsgpackToken) -> Result<(), MsgpackError
     match tok {
         MsgpackToken::Nil
         | MsgpackToken::Bool(_)
-        | MsgpackToken::UInt(_)
-        | MsgpackToken::Int(_)
+        | MsgpackToken::UFixInt(_)
+        | MsgpackToken::UInt8(_)
+        | MsgpackToken::UInt16(_)
+        | MsgpackToken::UInt32(_)
+        | MsgpackToken::UInt64(_)
+        | MsgpackToken::IFixInt(_)
+        | MsgpackToken::Int8(_)
+        | MsgpackToken::Int16(_)
+        | MsgpackToken::Int32(_)
+        | MsgpackToken::Int64(_)
         | MsgpackToken::Float32(_)
         | MsgpackToken::Float64(_)
         | MsgpackToken::FixExt { .. } => Ok(()),

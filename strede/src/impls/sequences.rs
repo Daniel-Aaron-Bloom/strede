@@ -1,5 +1,17 @@
 use super::*;
 use crate::{hit, or_miss, select_probe};
+use crate::borrow::{DeserializeFromMap, MapAccess, MapKeyProbe, MapValueProbe};
+use crate::owned::{BytesAccessOwned, DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned};
+
+/// Reinterpret a `Vec<u8>` as `Vec<T>` via raw-parts cast.
+/// # Safety
+/// Caller must have confirmed `TypId::of::<T>() == TypId::of::<u8>()`.
+#[cfg(feature = "alloc")]
+unsafe fn u8_vec_as_t<T>(v: alloc::vec::Vec<u8>) -> alloc::vec::Vec<T> {
+    let mut v = core::mem::ManuallyDrop::new(v);
+    // SAFETY: delegated to caller (T == u8, same size/alignment/drop).
+    unsafe { alloc::vec::Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity()) }
+}
 
 // -------------------------------------------------------------------------
 // Vec<T> — both families. Emits universal Deserialize (delegating through
@@ -18,6 +30,33 @@ where
 {
     type Extra = ();
     async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        if typeid::of::<T>() == typeid::of::<u8>() {
+            return d.entry(|[e1, e2, e3]| async move {
+                select_probe!(biased;
+                    async move {
+                        let (claim, b) = hit!(e1.deserialize_bytes().await);
+                        // Safety: T == u8 confirmed by TypId check.
+                        let v = unsafe { u8_vec_as_t(b.to_vec()) };
+                        Ok(Probe::Hit((claim, v)))
+                    },
+                    async move {
+                        let mut chunks = hit!(e2.deserialize_bytes_chunks().await);
+                        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        loop {
+                            match chunks.next_bytes(|b| out.extend_from_slice(b)).await? {
+                                Chunk::Data((new, ())) => chunks = new,
+                                Chunk::Done(claim) => {
+                                    // Safety: T == u8 confirmed by TypId check.
+                                    let v = unsafe { u8_vec_as_t(out) };
+                                    return Ok(Probe::Hit((claim, v)));
+                                }
+                            }
+                        }
+                    },
+                    e3.deserialize_seq_into::<Self>(()),
+                )
+            }).await;
+        }
         d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await })
             .await
     }
@@ -65,6 +104,27 @@ where
 {
     type Extra = ();
     async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
+        if typeid::of::<T>() == typeid::of::<u8>() {
+            return d.entry(|[e1, e2]| async move {
+                select_probe!(biased;
+                    async move {
+                        let mut chunks = hit!(e1.deserialize_bytes_chunks().await);
+                        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                        loop {
+                            match chunks.next_bytes(|b| out.extend_from_slice(b)).await? {
+                                Chunk::Data((new, ())) => chunks = new,
+                                Chunk::Done(claim) => {
+                                    // Safety: T == u8 confirmed by TypId check.
+                                    let v = unsafe { u8_vec_as_t(out) };
+                                    return Ok(Probe::Hit((claim, v)));
+                                }
+                            }
+                        }
+                    },
+                    e2.deserialize_seq_into::<Self>(()),
+                )
+            }).await;
+        }
         d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await })
             .await
     }
@@ -180,20 +240,91 @@ where
 
 macro_rules! impl_tuple {
     ($($T:ident $v:ident),+ $(,)?) => {
-        impl<'de, D, $($T),+> Deserialize<'de, D> for ($($T,)+)
+        impl<'de, M, $($T),+> DeserializeFromMap<'de, M> for ($($T,)+)
         where
-            D: Deserializer<'de>,
+            M: MapAccess<'de>,
             $(
                 $T: Deserialize<
                     'de,
-                    <<<D::Entry as Entry<'de>>::Seq as SeqAccess<'de>>::Elem as SeqEntry<'de>>::SubDeserializer,
+                    <crate::borrow::VP<'de, M::KeyProbe> as MapValueProbe<'de>>::ValueSubDeserializer,
                     Extra = (),
                 >,
             )+
         {
             type Extra = ();
+            async fn deserialize_from_map(
+                map: M,
+                _: (),
+            ) -> Result<Probe<(M::MapClaim, Self)>, M::Error> {
+                let arms = crate::MapArmBase
+                    $(+ crate::MapArm(crate::MapArmSlot::new(
+                        |mut __kp: M::KeyProbe, __i: usize| async move {
+                            let (__kc, ()) = hit!(__kp.deserialize_key_by_index(__i).await);
+                            Ok(Probe::Hit((__kc, ())))
+                        },
+                        |__vp: crate::borrow::VP<'de, M::KeyProbe>, _k: ()| async move {
+                            let (__vc, __v) = hit!(__vp.deserialize_value::<$T>(()).await);
+                            Ok(Probe::Hit((__vc, ((), __v))))
+                        }
+                    )))+;
+                match map.iterate(arms).await? {
+                    Probe::Hit((claim, crate::map_outputs!($($v,)+))) => {
+                        Ok(Probe::Hit((claim, ($(or_miss!($v.map(|((), v)| v)),)+))))
+                    }
+                    Probe::Miss => Ok(Probe::Miss),
+                }
+            }
+        }
+
+        impl<M, $($T),+> DeserializeFromMapOwned<M> for ($($T,)+)
+        where
+            M: MapAccessOwned,
+            $(
+                $T: DeserializeOwned<
+                    <crate::owned::VP<M::KeyProbe> as MapValueProbeOwned>::ValueSubDeserializer,
+                    Extra = (),
+                >,
+            )+
+        {
+            type Extra = ();
+            async fn deserialize_from_map_owned(
+                map: M,
+                _: (),
+            ) -> Result<Probe<(M::MapClaim, Self)>, M::Error> {
+                let arms = crate::MapArmBase
+                    $(+ crate::MapArm(crate::MapArmSlot::new(
+                        |mut __kp: M::KeyProbe, __i: usize| async move {
+                            let (__kc, ()) = hit!(__kp.deserialize_key_by_index(__i).await);
+                            Ok(Probe::Hit((__kc, ())))
+                        },
+                        |__vp: crate::owned::VP<M::KeyProbe>, _k: ()| async move {
+                            let (__vc, __v) = hit!(__vp.deserialize_value::<$T>(()).await);
+                            Ok(Probe::Hit((__vc, ((), __v))))
+                        }
+                    )))+;
+                match map.iterate(arms).await? {
+                    Probe::Hit((claim, crate::map_outputs!($($v,)+))) => {
+                        Ok(Probe::Hit((claim, ($(or_miss!($v.map(|((), v)| v)),)+))))
+                    }
+                    Probe::Miss => Ok(Probe::Miss),
+                }
+            }
+        }
+
+        impl<'de, D, $($T),+> Deserialize<'de, D> for ($($T,)+)
+        where
+            D: Deserializer<'de>,
+            ($($T,)+): DeserializeFromMap<'de, <D::Entry as Entry<'de>>::Map, Extra = ()>,
+            ($($T,)+): DeserializeFromSeq<'de, <D::Entry as Entry<'de>>::Seq, Extra = ()>,
+        {
+            type Extra = ();
             async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await }).await
+                d.entry(|[e1, e2]| async move {
+                    select_probe!(biased;
+                        e1.deserialize_map_into::<Self>(()),
+                        e2.deserialize_seq_into::<Self>(()),
+                    )
+                }).await
             }
         }
 
@@ -225,16 +356,17 @@ macro_rules! impl_tuple {
         impl<D, $($T),+> DeserializeOwned<D> for ($($T,)+)
         where
             D: DeserializerOwned,
-            $(
-                $T: DeserializeOwned<
-                    <<<D::Entry as EntryOwned>::Seq as SeqAccessOwned>::Elem as SeqEntryOwned>::SubDeserializer,
-                    Extra = (),
-                >,
-            )+
+            ($($T,)+): DeserializeFromMapOwned<<D::Entry as EntryOwned>::Map, Extra = ()>,
+            ($($T,)+): DeserializeFromSeqOwned<<D::Entry as EntryOwned>::Seq, Extra = ()>,
         {
             type Extra = ();
             async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-                d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await }).await
+                d.entry(|[e1, e2]| async move {
+                    select_probe!(biased;
+                        e1.deserialize_map_into::<Self>(()),
+                        e2.deserialize_seq_into::<Self>(()),
+                    )
+                }).await
             }
         }
 

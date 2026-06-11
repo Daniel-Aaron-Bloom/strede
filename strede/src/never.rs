@@ -19,8 +19,8 @@ pub struct Never<'a, Claim, Error>(
 use crate::borrow::{
     BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
     Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess, MapArmStack,
-    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, SeqAccess, SeqEntry,
-    StrAccess,
+    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, NumberEncoding, SeqAccess,
+    SeqEntry, StrAccess,
 };
 use crate::owned::{
     BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
@@ -58,7 +58,7 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> Entry<'de> for crate::Neve
     type SubDeserializer = crate::Never<'n, C, E>;
     type StrChunks = crate::Never<'n, C, E>;
     type BytesChunks = crate::Never<'n, C, E>;
-    type NumberChunks = crate::Never<'n, C, E>;
+    type NumberChunks<Enc: NumberEncoding> = crate::Never<'n, C, E>;
     type Map = crate::Never<'n, C, E>;
     type Seq = crate::Never<'n, C, E>;
     type Enum = crate::Never<'n, C, E>;
@@ -74,7 +74,9 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> Entry<'de> for crate::Neve
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
         match self.0 {}
     }
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
         match self.0 {}
     }
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
@@ -143,9 +145,6 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> EnumAccess<'de> for crate:
     type Error = E;
     type Claim = C;
     type VariantProbe = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn iterate<S>(self, _arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStack<'de, Self::VariantProbe>,
@@ -177,9 +176,6 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> EnumVariantProbe<'de>
 impl<'n, C, E: DeserializeError> StrAccess for crate::Never<'n, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_str<R>(
         self,
         _f: impl FnOnce(&str) -> R,
@@ -191,9 +187,6 @@ impl<'n, C, E: DeserializeError> StrAccess for crate::Never<'n, C, E> {
 impl<'n, C, E: DeserializeError> BytesAccess for crate::Never<'n, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_bytes<R>(
         self,
         _f: impl FnOnce(&[u8]) -> R,
@@ -202,15 +195,12 @@ impl<'n, C, E: DeserializeError> BytesAccess for crate::Never<'n, C, E> {
     }
 }
 
-impl<'n, C, E: DeserializeError> NumberAccess for crate::Never<'n, C, E> {
+impl<'n, C, E: DeserializeError, Enc: NumberEncoding> NumberAccess<Enc> for crate::Never<'n, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_number_chunk<R>(
         self,
-        _f: impl FnOnce(&str) -> R,
+        _f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.0 {}
     }
@@ -221,9 +211,6 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> SeqAccess<'de> for crate::
     type SeqClaim = C;
     type ElemClaim = C;
     type Elem = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next<const N: usize, F, Fut, R>(
         self,
         _f: F,
@@ -258,9 +245,6 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> MapAccess<'de> for crate::
     type Error = E;
     type MapClaim = C;
     type KeyProbe = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
         _arms: S,
@@ -362,7 +346,7 @@ impl<'n, C, E: DeserializeError> EntryOwned for crate::Never<'n, C, E> {
     type SubDeserializer = crate::Never<'n, C, E>;
     type StrChunks = crate::Never<'n, C, E>;
     type BytesChunks = crate::Never<'n, C, E>;
-    type NumberChunks = crate::Never<'n, C, E>;
+    type NumberChunks<Enc: NumberEncoding> = crate::Never<'n, C, E>;
     type Map = crate::Never<'n, C, E>;
     type Seq = crate::Never<'n, C, E>;
     type Enum = crate::Never<'n, C, E>;
@@ -372,7 +356,9 @@ impl<'n, C, E: DeserializeError> EntryOwned for crate::Never<'n, C, E> {
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
         match self.0 {}
     }
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
         match self.0 {}
     }
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
@@ -441,9 +427,6 @@ impl<'n, C, E: DeserializeError> EnumAccessOwned for crate::Never<'n, C, E> {
     type Error = E;
     type Claim = C;
     type VariantProbe = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn iterate<S>(self, _arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStackOwned<Self::VariantProbe>,
@@ -473,9 +456,6 @@ impl<'n, C, E: DeserializeError> EnumVariantProbeOwned for crate::Never<'n, C, E
 impl<C, E: DeserializeError> StrAccessOwned for crate::Never<'_, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_str<R>(
         self,
         _f: impl FnOnce(&str) -> R,
@@ -487,9 +467,6 @@ impl<C, E: DeserializeError> StrAccessOwned for crate::Never<'_, C, E> {
 impl<C, E: DeserializeError> BytesAccessOwned for crate::Never<'_, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_bytes<R>(
         self,
         _f: impl FnOnce(&[u8]) -> R,
@@ -498,15 +475,12 @@ impl<C, E: DeserializeError> BytesAccessOwned for crate::Never<'_, C, E> {
     }
 }
 
-impl<C, E: DeserializeError> NumberAccessOwned for crate::Never<'_, C, E> {
+impl<C, E: DeserializeError, Enc: NumberEncoding> NumberAccessOwned<Enc> for crate::Never<'_, C, E> {
     type Claim = C;
     type Error = E;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next_number_chunk<R>(
         self,
-        _f: impl FnOnce(&str) -> R,
+        _f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.0 {}
     }
@@ -517,9 +491,6 @@ impl<'n, C, E: DeserializeError> SeqAccessOwned for crate::Never<'n, C, E> {
     type SeqClaim = C;
     type ElemClaim = C;
     type Elem = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn next<const N: usize, F, Fut, R>(
         self,
         _f: F,
@@ -554,9 +525,6 @@ impl<'n, C, E: DeserializeError> MapAccessOwned for crate::Never<'n, C, E> {
     type Error = E;
     type MapClaim = C;
     type KeyProbe = crate::Never<'n, C, E>;
-    fn fork(&mut self) -> Self {
-        match self.0 {}
-    }
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
         self,
         _arms: S,

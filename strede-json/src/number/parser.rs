@@ -15,7 +15,7 @@
 //! `biased_fp_to_float` exactly once after the race resolves.
 
 use strede::owned::NumberAccessOwned;
-use strede::{Chunk, Probe, hit};
+use strede::{Ascii, Chunk, Probe, hit};
 
 use super::decimal_seq::{DecimalSeq, parse_decimal_fast, parse_decimal_seq};
 
@@ -35,7 +35,7 @@ pub(super) struct BiasedFp {
 ///
 /// Returns `Probe::Miss` if the input contains a sign, decimal point, or
 /// exponent, or if the digits overflow `u64`.
-pub(super) async fn parse_int_pos<A: NumberAccessOwned>(
+pub(super) async fn parse_int_pos<A: NumberAccessOwned<Ascii>>(
     mut chunks: A,
 ) -> Result<Probe<(A::Claim, u64)>, A::Error> {
     let mut acc: u64 = 0;
@@ -56,7 +56,7 @@ pub(super) async fn parse_int_pos<A: NumberAccessOwned>(
 ///
 /// Returns `Probe::Miss` if the input lacks a leading `-`, contains a
 /// decimal point or exponent, or overflows `i64`.
-pub(super) async fn parse_int_neg<A: NumberAccessOwned>(
+pub(super) async fn parse_int_neg<A: NumberAccessOwned<Ascii>>(
     mut chunks: A,
 ) -> Result<Probe<(A::Claim, i64)>, A::Error> {
     // Pull chunks until we see the leading `-`, then fall into the digit loop.
@@ -140,7 +140,7 @@ fn fold_pos_digits(s: &str, mut acc: u64) -> Option<u64> {
 /// rounded result (truncated significant digits, ambiguous rounding).
 /// Callers race this with [`parse_float_slow`] so a miss here is always
 /// covered.
-pub(super) async fn parse_float_fast<A: NumberAccessOwned>(
+pub(super) async fn parse_float_fast<A: NumberAccessOwned<Ascii>>(
     chunks: A,
 ) -> Result<Probe<(A::Claim, BiasedFp, bool)>, A::Error> {
     let (claim, num, negative) = hit!(parse_decimal_fast(chunks).await);
@@ -1029,7 +1029,7 @@ fn compute_product_approx(q: i64, w: u64, precision: usize) -> (u64, u64) {
 ///
 /// Always succeeds for any well-formed JSON float; returns `Probe::Miss`
 /// only when the input is not a float at all (no `.`, `e`, or `E`).
-pub(super) async fn parse_float_slow<A: NumberAccessOwned>(
+pub(super) async fn parse_float_slow<A: NumberAccessOwned<Ascii>>(
     chunks: A,
 ) -> Result<Probe<(A::Claim, BiasedFp, bool)>, A::Error> {
     // f64-specialized constants from std's `RawFloat for f64`.

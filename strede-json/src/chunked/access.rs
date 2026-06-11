@@ -34,7 +34,7 @@ use strede::utils::repeat;
 use strede::{
     Buffer, BytesAccessOwned, Chunk, DeserializeOwned, Handle, MapAccessOwned, MapArmStackOwned,
     MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned, NextKey,
-    NumberAccessOwned, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned, hit,
+    NumberAccessOwned, NumberEncoding, Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned, hit,
 };
 
 use super::{
@@ -56,16 +56,6 @@ pub struct ChunkedJsonStrAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedJsonStrAccess<'s, B, F> {
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
-
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            access: self.access,
-            offset: self.offset,
-            char_buf: self.char_buf,
-        }
-    }
 
     async fn next_str<R>(
         mut self,
@@ -139,16 +129,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedJsonBytes
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            access: self.access,
-            offset: self.offset,
-            char_buf: self.char_buf,
-        }
-    }
-
     async fn next_bytes<R>(
         mut self,
         f: impl FnOnce(&[u8]) -> R,
@@ -216,22 +196,15 @@ pub struct ChunkedJsonNumberAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(super) offset: usize,
 }
 
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> NumberAccessOwned for ChunkedJsonNumberAccess<'s, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwned<Enc>
+    for ChunkedJsonNumberAccess<'s, B, F>
+{
     type Claim = ChunkedJsonClaim<'s, B, F>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            access: self.access,
-            offset: self.offset,
-        }
-    }
-
     async fn next_number_chunk<R>(
         mut self,
-        f: impl FnOnce(&str) -> R,
+        f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         loop {
             let pre_offset = self.offset;
@@ -244,7 +217,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> NumberAccessOwned for ChunkedJsonNumb
             };
             match result {
                 Ok(Some(chunk)) => {
-                    let v = f(chunk);
+                    let v = f(Enc::from_str(chunk));
                     return Ok(Chunk::Data((self, v)));
                 }
                 Ok(None) => {
@@ -472,15 +445,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAcce
     type MapClaim = ChunkedJsonClaim<'s, B, F>;
     type KeyProbe = ChunkedJsonKeyProbe<'s, B, F>;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            tokenizer: self.tokenizer.clone(),
-            offset: self.offset,
-        }
-    }
-
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
         mut self,
         mut arms: S,
@@ -628,16 +592,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedJsonSeqAcce
     type SeqClaim = ChunkedJsonClaim<'s, B, F>;
     type ElemClaim = ChunkedJsonClaim<'s, B, F>;
     type Elem = ChunkedJsonSeqEntry<'s, B, F>;
-
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            tokenizer: self.tokenizer.clone(),
-            offset: self.offset,
-            first: self.first,
-        }
-    }
 
     #[inline(always)]
     async fn next<const N: usize, Fn_, Fut, R>(

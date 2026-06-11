@@ -81,6 +81,7 @@ let result = SharedBuf::with_async(
 | map (definite) | 5 | `Map(Some(n))` | named structs, maps |
 | map (indefinite) | 5 | `Map(None)` | same |
 | semantic tag | 6 | `Tag(u64)` | stripped by default; use `CborTag<T, H>` to inspect |
+| bignum (tag 2/3) | 6 | `Tag(2\|3)` + `Bstr` | `deserialize_number_chunks::<BigEndian>()` streams magnitude bytes |
 | false / true | 7 | `Bool(bool)` | `bool` |
 | null / undefined | 7 | `Null` / `Undefined` | `()`, `Option<T>` (None) |
 | float16 | 7 | `Float16(f32)` | `f32`, `f64` |
@@ -99,6 +100,8 @@ Unrecognised format bytes return `Probe::Miss`, not an error.
 ## Struct and enum representations
 
 These match the rest of the strede ecosystem and the derive macro.
+All representations work with both the borrow family (`#[derive(strede::Deserialize)]`)
+and the owned/streaming family (`#[derive(strede::DeserializeOwned)]`).
 
 ### Named struct — map
 
@@ -263,7 +266,7 @@ any key type (including non-string and non-integer keys) is supported.
 All [strede derive attributes](https://crates.io/crates/strede) work
 unchanged with CBOR: `rename`, `rename_all`, `alias`, `default`,
 `default = "expr"`, `skip_deserializing`, `allow_unknown_fields`,
-`transparent`, `flatten`, `flatten(boxed)`, `tag`, `tag + content`,
+`transparent`, `flatten`, `tag`, `tag + content`,
 `untagged`, `other`, `from`, `try_from`, `deserialize_with`,
 `deserialize_owned_with`, `with`, `bound`, `borrow`, `crate`.
 
@@ -271,7 +274,7 @@ unchanged with CBOR: `rename`, `rename_all`, `alias`, `default`,
 
 | Feature | Description |
 |---|---|
-| `alloc` | Enables `CborValue`, heap-allocated string/bytes decoding (`String`, `Vec<u8>`), and `#[strede(flatten(boxed))]` for deeply-nested flatten chains. |
+| `alloc` | Enables `CborValue` and heap-allocated string/bytes decoding (`String`, `Vec<u8>`). |
 
 ## Error type
 
@@ -296,13 +299,6 @@ unchanged with CBOR: `rename`, `rename_all`, `alias`, `default`,
   text string returns a zero-copy `Probe::Hit`. Multi-chunk indefinite strings
   return `Probe::Miss` from `deserialize_bytes` / `deserialize_str`; use
   `deserialize_bytes_chunks` / `deserialize_str_chunks` to consume all chunks.
-- **`deserialize_number_chunks`** is not implemented; numeric types decode
-  directly from wire integers and floats rather than going through a text chunk
-  accessor. Code that calls `deserialize_number_chunks` on a CBOR entry will
-  get `Probe::Miss`.
-- **BigNum tags (tag 2/3)** are not decoded into integers. They pass through as
-  `Tag { number: 2/3, value: Bstr(...) }` in `CborValue` and return
-  `Probe::Miss` for built-in integer types.
 
 ## Workspace
 

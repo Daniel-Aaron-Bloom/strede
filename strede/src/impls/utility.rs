@@ -1,3 +1,5 @@
+use const_array_concat::ConcatableArray;
+
 use super::*;
 use crate::{hit, select_probe};
 
@@ -152,19 +154,22 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for Match {
 }
 
 // -------------------------------------------------------------------------
-// MatchVals<T> — discriminator probe with N candidates returning T on hit.
-// Universal over any `D: Deserializer`.  `T: Copy` so the candidate array
-// can move into both race arms.
+// MatchVals<T, A> — discriminator probe with candidates returning T on hit.
+// A is any ConcatableArray of (&'static str, T) pairs — plain arrays work,
+// and so does ArrayConcat for callers that concatenate multiple candidate
+// lists at compile time. T: Copy so candidates move into both race arms.
 // -------------------------------------------------------------------------
 
-pub struct MatchVals<T, const N: usize>(pub T, pub PhantomData<[(); N]>);
+pub struct MatchVals<T, A>(pub T, pub PhantomData<fn() -> A>);
 
-impl<'de, D, T, const N: usize> Deserialize<'de, D> for MatchVals<T, N>
+impl<'de, D, T, A> Deserialize<'de, D> for MatchVals<T, A>
 where
     D: Deserializer<'de>,
     T: Copy,
+    A: ConcatableArray<T = (&'static str, T)> + Copy + AsRef<[(&'static str, T)]>,
+    A::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
 {
-    type Extra = [(&'static str, T); N];
+    type Extra = A;
     async fn deserialize(
         d: D,
         candidates: Self::Extra,
@@ -173,7 +178,7 @@ where
             select_probe! {
                 async move {
                     let (claim, s) = hit!(e1.deserialize_str().await);
-                    for (k, v) in &candidates {
+                    for (k, v) in candidates.as_ref() {
                         if s == *k {
                             return Ok(Probe::Hit((claim, MatchVals(*v, PhantomData))));
                         }
@@ -182,33 +187,37 @@ where
                 },
                 async move {
                     let mut chunks = hit!(e2.deserialize_str_chunks().await);
-                    let mut viable = [true; N];
+                    let mut viable = candidates.map(|_| true);
                     let mut consumed: usize = 0;
                     loop {
                         let result = chunks.next_str(|s: &str| {
                             let new_consumed = consumed + s.len();
-                            for i in 0..N {
-                                if !viable[i] {
+                            let viable_slice = viable.as_mut();
+                            let cands = candidates.as_ref();
+                            for i in 0..cands.len() {
+                                if !viable_slice[i] {
                                     continue;
                                 }
-                                let k = candidates[i].0;
+                                let k = cands[i].0;
                                 if new_consumed > k.len()
                                     || &k.as_bytes()[consumed..new_consumed] != s.as_bytes()
                                 {
-                                    viable[i] = false;
+                                    viable_slice[i] = false;
                                 }
                             }
                             consumed = new_consumed;
                         }).await?;
-                        if !viable.iter().any(|v| *v) {
+                        if !viable.as_ref().iter().any(|&v| v) {
                             return Ok(Probe::Miss);
                         }
                         match result {
                             Chunk::Data((new, ())) => chunks = new,
                             Chunk::Done(claim) => {
-                                for i in 0..N {
-                                    if viable[i] && candidates[i].0.len() == consumed {
-                                        return Ok(Probe::Hit((claim, MatchVals(candidates[i].1, PhantomData))));
+                                let viable_slice = viable.as_ref();
+                                let cands = candidates.as_ref();
+                                for i in 0..cands.len() {
+                                    if viable_slice[i] && cands[i].0.len() == consumed {
+                                        return Ok(Probe::Hit((claim, MatchVals(cands[i].1, PhantomData))));
                                     }
                                 }
                                 return Ok(Probe::Miss);
@@ -221,49 +230,55 @@ where
     }
 }
 
-impl<D, T, const N: usize> DeserializeOwned<D> for MatchVals<T, N>
+impl<D, T, A> DeserializeOwned<D> for MatchVals<T, A>
 where
     D: DeserializerOwned,
     T: Copy,
+    A: ConcatableArray<T = (&'static str, T)> + Copy + AsRef<[(&'static str, T)]>,
+    A::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
 {
-    type Extra = [(&'static str, T); N];
+    type Extra = A;
     async fn deserialize_owned(
         d: D,
         candidates: Self::Extra,
     ) -> Result<Probe<(D::Claim, Self)>, D::Error> {
         d.entry(|[e]| async move {
             let mut chunks = hit!(e.deserialize_str_chunks().await);
-            let mut viable = [true; N];
+            let mut viable = candidates.map(|_| true);
             let mut consumed: usize = 0;
             loop {
                 let result = chunks
                     .next_str(|s: &str| {
                         let new_consumed = consumed + s.len();
-                        for i in 0..N {
-                            if !viable[i] {
+                        let viable_slice = viable.as_mut();
+                        let cands = candidates.as_ref();
+                        for i in 0..cands.len() {
+                            if !viable_slice[i] {
                                 continue;
                             }
-                            let k = candidates[i].0;
+                            let k = cands[i].0;
                             if new_consumed > k.len()
                                 || &k.as_bytes()[consumed..new_consumed] != s.as_bytes()
                             {
-                                viable[i] = false;
+                                viable_slice[i] = false;
                             }
                         }
                         consumed = new_consumed;
                     })
                     .await?;
-                if !viable.iter().any(|v| *v) {
+                if !viable.as_ref().iter().any(|&v| v) {
                     return Ok(Probe::Miss);
                 }
                 match result {
                     Chunk::Data((new, ())) => chunks = new,
                     Chunk::Done(claim) => {
-                        for i in 0..N {
-                            if viable[i] && candidates[i].0.len() == consumed {
+                        let viable_slice = viable.as_ref();
+                        let cands = candidates.as_ref();
+                        for i in 0..cands.len() {
+                            if viable_slice[i] && cands[i].0.len() == consumed {
                                 return Ok(Probe::Hit((
                                     claim,
-                                    MatchVals(candidates[i].1, PhantomData),
+                                    MatchVals(cands[i].1, PhantomData),
                                 )));
                             }
                         }

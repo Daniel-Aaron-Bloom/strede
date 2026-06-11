@@ -43,6 +43,15 @@ struct Outer {
     inner: Inner,
 }
 
+// Field before AND after the flatten — exercises the before/after arm split.
+#[derive(Debug, PartialEq, DeriveDeserializeOwned)]
+struct OuterWithSuffix {
+    prefix: u32,
+    #[strede(flatten)]
+    inner: Inner,
+    suffix: u32,
+}
+
 #[test]
 fn outer_then_inner() {
     let msg = build_map(&[
@@ -107,4 +116,52 @@ fn missing_inner_field_misses() {
         (fixstr("a").as_slice(), &[1u8]),
     ]);
     assert_eq!(parse!(Outer, &msg), None);
+}
+
+#[test]
+fn suffix_outer_then_inner_then_suffix() {
+    let msg = build_map(&[
+        (fixstr("prefix").as_slice(), &[1u8]),
+        (fixstr("a").as_slice(), &[2u8]),
+        (fixstr("b").as_slice(), &[3u8]),
+        (fixstr("suffix").as_slice(), &[4u8]),
+    ]);
+    assert_eq!(
+        parse!(OuterWithSuffix, &msg),
+        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+    );
+}
+
+#[test]
+fn suffix_interleaved() {
+    let msg = build_map(&[
+        (fixstr("a").as_slice(), &[2u8]),
+        (fixstr("suffix").as_slice(), &[4u8]),
+        (fixstr("prefix").as_slice(), &[1u8]),
+        (fixstr("b").as_slice(), &[3u8]),
+    ]);
+    assert_eq!(
+        parse!(OuterWithSuffix, &msg),
+        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+    );
+}
+
+#[test]
+fn suffix_missing_prefix_misses() {
+    let msg = build_map(&[
+        (fixstr("a").as_slice(), &[2u8]),
+        (fixstr("b").as_slice(), &[3u8]),
+        (fixstr("suffix").as_slice(), &[4u8]),
+    ]);
+    assert_eq!(parse!(OuterWithSuffix, &msg), None);
+}
+
+#[test]
+fn suffix_missing_suffix_misses() {
+    let msg = build_map(&[
+        (fixstr("prefix").as_slice(), &[1u8]),
+        (fixstr("a").as_slice(), &[2u8]),
+        (fixstr("b").as_slice(), &[3u8]),
+    ]);
+    assert_eq!(parse!(OuterWithSuffix, &msg), None);
 }

@@ -23,9 +23,11 @@ use crate::{
     token::{CborToken, next_token, skip_value},
 };
 use strede::{
-    BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
-    Deserializer, Entry, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
-    MapValueProbe, Never, NextKey, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
+    BigEndian, BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
+    MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals,
+    NextKey, NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess,
+    hit, match_entry_str_against, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,7 @@ impl<'de> CborDeserializer<'de> {
 pub struct CborSubDeserializer<'de> {
     src: &'de [u8],
     pending_tok: CborToken,
+    bignum_tag: Option<u64>,
 }
 
 impl<'de> CborSubDeserializer<'de> {
@@ -67,6 +70,16 @@ impl<'de> CborSubDeserializer<'de> {
         Self {
             src,
             pending_tok: tok,
+            bignum_tag: None,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_bignum(src: &'de [u8], tok: CborToken, bignum_tag: Option<u64>) -> Self {
+        Self {
+            src,
+            pending_tok: tok,
+            bignum_tag,
         }
     }
 }
@@ -83,11 +96,34 @@ fn strip_tags(src: &mut &[u8], tok: CborToken) -> Result<Option<CborToken>, Cbor
     loop {
         match cur {
             CborToken::Tag(n) => {
-                // Ignored handler: just continue
                 let _ = n;
                 cur = next_token(src)?;
             }
             other => return Ok(Some(other)),
+        }
+    }
+}
+
+/// Like `strip_tags` but also records the innermost bignum tag (2 or 3) seen.
+/// Returns `(bignum_tag, inner_token)` where `bignum_tag` is `Some(2)` or
+/// `Some(3)` if the outermost meaningful tag was a CBOR bignum tag, else `None`.
+fn strip_tags_bignum(
+    src: &mut &[u8],
+    tok: CborToken,
+) -> Result<Option<(Option<u64>, CborToken)>, CborError> {
+    let mut cur = tok;
+    let mut bignum_tag: Option<u64> = None;
+    loop {
+        match cur {
+            CborToken::Tag(n @ (2 | 3)) => {
+                bignum_tag = Some(n);
+                cur = next_token(src)?;
+            }
+            CborToken::Tag(_) => {
+                bignum_tag = None;
+                cur = next_token(src)?;
+            }
+            other => return Ok(Some((bignum_tag, other))),
         }
     }
 }
@@ -123,13 +159,14 @@ where
     Fut: core::future::Future<Output = Result<Probe<(CborClaim<'de>, R)>, CborError>>,
 {
     let raw_tok = next_token(&mut de.src)?;
-    let tok = match strip_tags(&mut de.src, raw_tok)? {
+    let (bignum_tag, tok) = match strip_tags_bignum(&mut de.src, raw_tok)? {
         Some(t) => t,
         None => return Ok(Probe::Miss),
     };
     let entry = CborEntry {
         token: tok,
         src: de.src,
+        bignum_tag,
     };
     match f(repeat(entry, |e| e.clone())).await? {
         Probe::Hit((claim, r)) => {
@@ -180,6 +217,7 @@ impl<'de> Deserializer<'de> for CborSubDeserializer<'de> {
         let entry = CborEntry {
             token: self.pending_tok,
             src: self.src,
+            bignum_tag: self.bignum_tag,
         };
         f(repeat(entry, |e| e.clone())).await
     }
@@ -192,6 +230,9 @@ impl<'de> Deserializer<'de> for CborSubDeserializer<'de> {
 pub struct CborEntry<'de> {
     pub(crate) token: CborToken,
     pub(crate) src: &'de [u8],
+    /// Set to `Some(2)` or `Some(3)` when this entry is the payload of a CBOR
+    /// bignum tag (unsigned or negative). Used by `deserialize_number_chunks`.
+    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'de> CborEntry<'de> {
@@ -199,6 +240,7 @@ impl<'de> CborEntry<'de> {
         Self {
             token: self.token,
             src: self.src,
+            bignum_tag: self.bignum_tag,
         }
     }
 
@@ -283,10 +325,10 @@ impl<'de> Entry<'de> for CborEntry<'de> {
     type SubDeserializer = CborSubDeserializer<'de>;
     type StrChunks = CborStrAccess<'de>;
     type BytesChunks = CborBytesAccess<'de>;
-    type NumberChunks = Never<'de, CborClaim<'de>, CborError>;
+    type NumberChunks<Enc: NumberEncoding> = CborNumberAccess<'de>;
     type Map = CborMapAccess<'de>;
     type Seq = CborSeqAccess<'de>;
-    type Enum = Never<'de, CborClaim<'de>, CborError>;
+    type Enum = CborEnumAccess<'de>;
 
     fn fork(&mut self) -> Self {
         self.clone()
@@ -399,10 +441,25 @@ impl<'de> Entry<'de> for CborEntry<'de> {
         }
     }
 
-    // ---- Numbers (CBOR uses binary tokens, no text representation) ----------
+    // ---- Numbers ------------------------------------------------------------
 
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
-        Ok(Probe::Miss)
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != BigEndian::NAME {
+            return Ok(Probe::Miss);
+        }
+        match (self.bignum_tag, self.token) {
+            (Some(2 | 3), CborToken::Bstr(len)) => Ok(Probe::Hit(CborNumberAccess {
+                src: self.src,
+                state: BytesState::Definite { remaining: len },
+            })),
+            (Some(2 | 3), CborToken::BstrIndef) => Ok(Probe::Hit(CborNumberAccess {
+                src: self.src,
+                state: BytesState::Indefinite,
+            })),
+            _ => Ok(Probe::Miss),
+        }
     }
 
     // ---- Map / Seq ----------------------------------------------------------
@@ -486,17 +543,30 @@ impl<'de> Entry<'de> for CborEntry<'de> {
     }
 
     async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
-        Ok(Probe::Miss)
+        match self.token {
+            CborToken::Tstr(_) | CborToken::TstrIndef | CborToken::Map(_) => {
+                Ok(Probe::Hit(CborEnumAccess {
+                    token: self.token,
+                    src: self.src,
+                }))
+            }
+            _ => Ok(Probe::Miss),
+        }
     }
 
+    #[inline(always)]
     async fn deserialize_enum_into<T>(
         self,
-        _extra: T::Extra,
+        extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeFromEnum<'de, Self::Enum>,
     {
-        Ok(Probe::Miss)
+        let e = match Entry::deserialize_enum(self).await? {
+            Probe::Hit(e) => e,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        T::deserialize_from_enum(e, extra).await
     }
 
     #[inline(always)]
@@ -616,20 +686,6 @@ impl<'de> StrAccess for CborStrAccess<'de> {
     type Claim = CborClaim<'de>;
     type Error = CborError;
 
-    fn fork(&mut self) -> Self {
-        let state = match &self.state {
-            StrState::Definite { remaining } => StrState::Definite {
-                remaining: *remaining,
-            },
-            StrState::Indefinite => StrState::Indefinite,
-            StrState::Done => StrState::Done,
-        };
-        Self {
-            src: self.src,
-            state,
-        }
-    }
-
     async fn next_str<R>(
         self,
         f: impl FnOnce(&str) -> R,
@@ -709,20 +765,6 @@ impl<'de> BytesAccess for CborBytesAccess<'de> {
     type Claim = CborClaim<'de>;
     type Error = CborError;
 
-    fn fork(&mut self) -> Self {
-        let state = match &self.state {
-            BytesState::Definite { remaining } => BytesState::Definite {
-                remaining: *remaining,
-            },
-            BytesState::Indefinite => BytesState::Indefinite,
-            BytesState::Done => BytesState::Done,
-        };
-        Self {
-            src: self.src,
-            state,
-        }
-    }
-
     async fn next_bytes<R>(
         self,
         f: impl FnOnce(&[u8]) -> R,
@@ -780,6 +822,74 @@ impl<'de> BytesAccess for CborBytesAccess<'de> {
 }
 
 // ---------------------------------------------------------------------------
+// CborNumberAccess — borrow family number chunk accessor (BigEndian bignums)
+// ---------------------------------------------------------------------------
+
+pub struct CborNumberAccess<'de> {
+    src: &'de [u8],
+    state: BytesState,
+}
+
+impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for CborNumberAccess<'de> {
+    type Claim = CborClaim<'de>;
+    type Error = CborError;
+
+    async fn next_number_chunk<R>(
+        self,
+        f: impl FnOnce(&Enc::Data) -> R,
+    ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
+        // Only reachable when Enc == BigEndian; other encodings never produce this accessor.
+        match self.state {
+            BytesState::Done | BytesState::Definite { remaining: 0 } => {
+                Ok(Chunk::Done(CborClaim {
+                    src: self.src,
+                    remaining_after: 0,
+                }))
+            }
+            BytesState::Definite { remaining } => {
+                if self.src.len() < remaining {
+                    return Err(CborError::UnexpectedEnd);
+                }
+                let (payload, rest) = self.src.split_at(remaining);
+                let r = f(Enc::from_bytes(payload));
+                Ok(Chunk::Data((
+                    Self {
+                        src: rest,
+                        state: BytesState::Done,
+                    },
+                    r,
+                )))
+            }
+            BytesState::Indefinite => {
+                let mut src = self.src;
+                let tok = next_token(&mut src)?;
+                match tok {
+                    CborToken::Break => Ok(Chunk::Done(CborClaim {
+                        src,
+                        remaining_after: 0,
+                    })),
+                    CborToken::Bstr(len) => {
+                        if src.len() < len {
+                            return Err(CborError::UnexpectedEnd);
+                        }
+                        let (payload, rest) = src.split_at(len);
+                        let r = f(Enc::from_bytes(payload));
+                        Ok(Chunk::Data((
+                            Self {
+                                src: rest,
+                                state: BytesState::Indefinite,
+                            },
+                            r,
+                        )))
+                    }
+                    _ => Err(CborError::UnexpectedByte { byte: 0 }),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Map access type chain
 // ---------------------------------------------------------------------------
 
@@ -796,9 +906,8 @@ impl<'de> MapKeyClaim<'de> for CborClaim<'de> {
     type ValueProbe = CborMapValueProbe<'de>;
 
     async fn into_value_probe(mut self) -> Result<Self::ValueProbe, Self::Error> {
-        // Strip tags before value token
         let raw = next_token(&mut self.src)?;
-        let value_tok = match strip_tags(&mut self.src, raw)? {
+        let (bignum_tag, value_tok) = match strip_tags_bignum(&mut self.src, raw)? {
             Some(t) => t,
             None => return Err(CborError::UnexpectedByte { byte: 0 }),
         };
@@ -806,6 +915,7 @@ impl<'de> MapKeyClaim<'de> for CborClaim<'de> {
             src: self.src,
             value_tok,
             remaining_after: self.remaining_after,
+            bignum_tag,
         })
     }
 }
@@ -917,6 +1027,7 @@ pub struct CborMapValueProbe<'de> {
     src: &'de [u8],
     value_tok: CborToken,
     remaining_after: usize,
+    bignum_tag: Option<u64>,
 }
 
 impl<'de> CborMapValueProbe<'de> {
@@ -925,6 +1036,7 @@ impl<'de> CborMapValueProbe<'de> {
             src: self.src,
             value_tok: self.value_tok,
             remaining_after: self.remaining_after,
+            bignum_tag: self.bignum_tag,
         }
     }
 }
@@ -947,7 +1059,7 @@ impl<'de> MapValueProbe<'de> for CborMapValueProbe<'de> {
         V: Deserialize<'de, Self::ValueSubDeserializer>,
     {
         let remaining_after = self.remaining_after;
-        let sub = CborSubDeserializer::new(self.src, self.value_tok);
+        let sub = CborSubDeserializer::new_bignum(self.src, self.value_tok, self.bignum_tag);
         match V::deserialize(sub, extra).await? {
             Probe::Hit((claim, v)) => Ok(Probe::Hit((
                 CborClaim {
@@ -976,13 +1088,6 @@ impl<'de> MapAccess<'de> for CborMapAccess<'de> {
     type Error = CborError;
     type MapClaim = CborClaim<'de>;
     type KeyProbe = CborMapKeyProbe<'de>;
-
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
 
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
@@ -1080,6 +1185,7 @@ pub struct CborSeqAccess<'de> {
 pub struct CborSeqEntry<'de> {
     pub(crate) src: &'de [u8],
     pub(crate) elem_tok: CborToken,
+    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'de> CborSeqEntry<'de> {
@@ -1087,6 +1193,7 @@ impl<'de> CborSeqEntry<'de> {
         Self {
             src: self.src,
             elem_tok: self.elem_tok,
+            bignum_tag: self.bignum_tag,
         }
     }
 }
@@ -1109,7 +1216,7 @@ where
         }))),
         Some(n) => {
             let raw = next_token(&mut src)?;
-            let elem_tok = match strip_tags(&mut src, raw)? {
+            let (bignum_tag, elem_tok) = match strip_tags_bignum(&mut src, raw)? {
                 Some(t) => t,
                 None => return Err(CborError::UnexpectedByte { byte: 0 }),
             };
@@ -1117,7 +1224,7 @@ where
                 src,
                 remaining: Some(n - 1),
             };
-            let entry = CborSeqEntry { src, elem_tok };
+            let entry = CborSeqEntry { src, elem_tok, bignum_tag };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
                 src: claim.src,
@@ -1134,11 +1241,11 @@ where
                     remaining_after: 0,
                 })));
             }
-            let elem_tok = match strip_tags(&mut src, raw)? {
+            let (bignum_tag, elem_tok) = match strip_tags_bignum(&mut src, raw)? {
                 Some(t) => t,
                 None => return Err(CborError::UnexpectedByte { byte: 0 }),
             };
-            let entry = CborSeqEntry { src, elem_tok };
+            let entry = CborSeqEntry { src, elem_tok, bignum_tag };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
                 src: claim.src,
@@ -1154,13 +1261,6 @@ impl<'de> SeqAccess<'de> for CborSeqAccess<'de> {
     type SeqClaim = CborClaim<'de>;
     type ElemClaim = CborClaim<'de>;
     type Elem = CborSeqEntry<'de>;
-
-    fn fork(&mut self) -> Self {
-        Self {
-            src: self.src,
-            remaining: self.remaining,
-        }
-    }
 
     #[inline(always)]
     async fn next<const N: usize, F, Fut, R>(
@@ -1189,7 +1289,7 @@ impl<'de> SeqEntry<'de> for CborSeqEntry<'de> {
     where
         T: Deserialize<'de, Self::SubDeserializer>,
     {
-        let sub = CborSubDeserializer::new(self.src, self.elem_tok);
+        let sub = CborSubDeserializer::new_bignum(self.src, self.elem_tok, self.bignum_tag);
         T::deserialize(sub, extra).await
     }
 
@@ -1201,5 +1301,154 @@ impl<'de> SeqEntry<'de> for CborSeqEntry<'de> {
             src,
             remaining_after: 0,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CborEnumAccess / CborEnumVariantProbe
+// ---------------------------------------------------------------------------
+
+/// [`EnumAccess`] for CBOR externally-tagged enums.
+///
+/// - Unit variants: bare text string (`"VariantName"`)
+/// - Non-unit variants: single-key map (`{"VariantName": <payload>}`)
+pub struct CborEnumAccess<'de> {
+    token: CborToken,
+    src: &'de [u8],
+}
+
+impl<'de> EnumAccess<'de> for CborEnumAccess<'de> {
+    type Error = CborError;
+    type Claim = CborClaim<'de>;
+    type VariantProbe = CborEnumVariantProbe<'de>;
+
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStack<'de, Self::VariantProbe>,
+    {
+        let vp = CborEnumVariantProbe {
+            token: self.token,
+            src: self.src,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
+    }
+}
+
+/// [`EnumVariantProbe`] for CBOR externally-tagged enums.
+pub struct CborEnumVariantProbe<'de> {
+    token: CborToken,
+    src: &'de [u8],
+}
+
+impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
+    type Error = CborError;
+    type Claim = CborClaim<'de>;
+    type PayloadDeserializer = CborSubDeserializer<'de>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            token: self.token,
+            src: self.src,
+        }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        let entry = CborEntry {
+            token: self.token,
+            src: self.src,
+            bignum_tag: None,
+        };
+        match_entry_str_against(entry, candidates.as_ref()).await
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        // Expect a single-key map `{"VariantName": <payload>}`.
+        let (mut src, remaining) = match self.token {
+            CborToken::Map(Some(n)) if n >= 1 => (self.src, Some(n - 1)),
+            CborToken::Map(None) => (self.src, None),
+            _ => return Ok(Probe::Miss),
+        };
+
+        // Read the key token.
+        let raw_key = next_token(&mut src)?;
+        let key_tok = match strip_tags(&mut src, raw_key)? {
+            Some(t) => t,
+            None => return Ok(Probe::Miss),
+        };
+
+        // Match key against candidates using MatchVals.
+        let key_entry = CborEntry {
+            token: key_tok,
+            src,
+            bignum_tag: None,
+        };
+        let (key_claim, MatchVals(idx, _)) = hit!(
+            key_entry
+                .deserialize_value::<MatchVals<usize, W>>(candidates)
+                .await
+        );
+
+        // Read value token.
+        let mut val_src = key_claim.src;
+        let raw_val = next_token(&mut val_src)?;
+        let val_tok = match strip_tags(&mut val_src, raw_val)? {
+            Some(t) => t,
+            None => return Ok(Probe::Miss),
+        };
+
+        let sub = CborSubDeserializer::new(val_src, val_tok);
+        let (val_claim, t) = hit!(T::deserialize(sub, extra).await);
+
+        // Verify no additional keys follow (externally-tagged = exactly one KV pair).
+        let map_done = match remaining {
+            Some(0) => CborClaim {
+                src: val_claim.src,
+                remaining_after: 0,
+            },
+            None => {
+                // Indefinite map: expect break byte.
+                let mut s = val_claim.src;
+                let tok = next_token(&mut s)?;
+                match tok {
+                    CborToken::Break => CborClaim {
+                        src: s,
+                        remaining_after: 0,
+                    },
+                    _ => return Ok(Probe::Miss),
+                }
+            }
+            _ => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_done, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+    {
+        let sub = CborSubDeserializer::new(self.src, self.token);
+        T::deserialize(sub, extra).await
     }
 }

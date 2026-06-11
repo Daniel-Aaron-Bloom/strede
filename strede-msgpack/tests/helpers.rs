@@ -20,6 +20,11 @@ pub fn fixarray(count: usize) -> u8 {
     0x90 | count as u8
 }
 
+/// Helper: encode a uint8 value
+pub fn uint8(v: u8) -> Vec<u8> {
+    vec![0xcc, v]
+}
+
 /// Helper: encode a uint16 value
 pub fn uint16(v: u16) -> Vec<u8> {
     let mut out = vec![0xcd];
@@ -34,6 +39,13 @@ pub fn uint32(v: u32) -> Vec<u8> {
     out
 }
 
+/// Helper: encode a uint64 value
+pub fn uint64(v: u64) -> Vec<u8> {
+    let mut out = vec![0xcf];
+    out.extend_from_slice(&v.to_be_bytes());
+    out
+}
+
 /// Helper: encode an int8 value
 pub fn int8(v: i8) -> Vec<u8> {
     vec![0xd0, v as u8]
@@ -42,6 +54,13 @@ pub fn int8(v: i8) -> Vec<u8> {
 /// Helper: encode an int16 value
 pub fn int16(v: i16) -> Vec<u8> {
     let mut out = vec![0xd1];
+    out.extend_from_slice(&v.to_be_bytes());
+    out
+}
+
+/// Helper: encode an int64 value
+pub fn int64(v: i64) -> Vec<u8> {
+    let mut out = vec![0xd3];
     out.extend_from_slice(&v.to_be_bytes());
     out
 }

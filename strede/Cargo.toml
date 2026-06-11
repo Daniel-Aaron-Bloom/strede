@@ -20,8 +20,10 @@ rc = []
 [dependencies]
 strede-derive = { path = "../strede-derive", version = "=0.1.1" }
 arrayvec = { workspace = true }
+const-array-concat = { workspace = true }
 pin-list = { version = "0.1.2", default-features = false }
 pin-project = "1.1.11"
+typeid = "1"
 
 [dev-dependencies]
 strede-test-util = { path = "../strede-test-util" }

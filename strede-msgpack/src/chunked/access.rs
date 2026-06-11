@@ -26,15 +26,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedMsgpackStrA
     type Claim = ChunkedMsgpackClaim<'s, B, F>;
     type Error = MsgpackError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            offset: self.offset,
-            remaining: self.remaining,
-        }
-    }
-
     async fn next_str<R>(
         mut self,
         f: impl FnOnce(&str) -> R,
@@ -88,15 +79,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned
     type Claim = ChunkedMsgpackClaim<'s, B, F>;
     type Error = MsgpackError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            offset: self.offset,
-            remaining: self.remaining,
-        }
-    }
-
     async fn next_bytes<R>(
         mut self,
         f: impl FnOnce(&[u8]) -> R,
@@ -139,6 +121,17 @@ pub struct ChunkedMsgpackKeyProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     key_tok: MsgpackToken,
     offset: usize,
     remaining_after: usize,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedMsgpackKeyProbe<'s, B, F> {
+    pub(super) fn new(
+        handle: Handle<'s, B, F>,
+        key_tok: MsgpackToken,
+        offset: usize,
+        remaining_after: usize,
+    ) -> Self {
+        Self { handle, key_tok, offset, remaining_after }
+    }
 }
 
 pub struct ChunkedMsgpackValueProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
@@ -298,15 +291,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedMsgpackMapA
     type MapClaim = ChunkedMsgpackClaim<'s, B, F>;
     type KeyProbe = ChunkedMsgpackKeyProbe<'s, B, F>;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            offset: self.offset,
-            remaining: self.remaining,
-        }
-    }
-
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
         mut self,
         mut arms: S,
@@ -423,16 +407,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqAccessOwned for ChunkedMsgpackSeqA
     type SeqClaim = ChunkedMsgpackClaim<'s, B, F>;
     type ElemClaim = ChunkedMsgpackClaim<'s, B, F>;
     type Elem = ChunkedMsgpackSeqEntry<'s, B, F>;
-
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            offset: self.offset,
-            remaining: self.remaining,
-            first: self.first,
-        }
-    }
 
     #[inline(always)]
     async fn next<const N: usize, Fn_, Fut, R>(

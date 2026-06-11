@@ -21,7 +21,9 @@ use strede::utils::repeat;
 use strede::{
     Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
     DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
-    EnumVariantProbeOwned, Handle, Never, Probe, SharedBuf, hit,
+    BigEndian, EnumVariantProbeOwned, Handle, MatchVals, NextKey, NumberAccessOwned,
+    NumberEncoding, Probe, SharedBuf,
+    hit,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,7 +113,7 @@ async fn decode_header<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     byte: u8,
 ) -> Result<(Handle<'s, B, F>, MsgpackToken), MsgpackError> {
     match byte {
-        0x00..=0x7f => Ok((handle, MsgpackToken::UInt(byte as u64))),
+        0x00..=0x7f => Ok((handle, MsgpackToken::UFixInt([byte]))),
         0x80..=0x8f => Ok((handle, MsgpackToken::Map((byte & 0x0f) as usize))),
         0x90..=0x9f => Ok((handle, MsgpackToken::Array((byte & 0x0f) as usize))),
         0xa0..=0xbf => Ok((handle, MsgpackToken::Str((byte & 0x1f) as usize))),
@@ -182,36 +184,36 @@ async fn decode_header<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             ))
         }
         0xcc => {
-            let (h, [v]) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
-            Ok((h, MsgpackToken::UInt(v as u64)))
+            let (h, b) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
+            Ok((h, MsgpackToken::UInt8(b)))
         }
         0xcd => {
             let (h, b) = read_bytes_exact::<_, _, 2>(handle, offset).await?;
-            Ok((h, MsgpackToken::UInt(u16::from_be_bytes(b) as u64)))
+            Ok((h, MsgpackToken::UInt16(b)))
         }
         0xce => {
             let (h, b) = read_bytes_exact::<_, _, 4>(handle, offset).await?;
-            Ok((h, MsgpackToken::UInt(u32::from_be_bytes(b) as u64)))
+            Ok((h, MsgpackToken::UInt32(b)))
         }
         0xcf => {
             let (h, b) = read_bytes_exact::<_, _, 8>(handle, offset).await?;
-            Ok((h, MsgpackToken::UInt(u64::from_be_bytes(b))))
+            Ok((h, MsgpackToken::UInt64(b)))
         }
         0xd0 => {
-            let (h, [v]) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
-            Ok((h, MsgpackToken::Int(v as i8 as i64)))
+            let (h, b) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
+            Ok((h, MsgpackToken::Int8(b)))
         }
         0xd1 => {
             let (h, b) = read_bytes_exact::<_, _, 2>(handle, offset).await?;
-            Ok((h, MsgpackToken::Int(i16::from_be_bytes(b) as i64)))
+            Ok((h, MsgpackToken::Int16(b)))
         }
         0xd2 => {
             let (h, b) = read_bytes_exact::<_, _, 4>(handle, offset).await?;
-            Ok((h, MsgpackToken::Int(i32::from_be_bytes(b) as i64)))
+            Ok((h, MsgpackToken::Int32(b)))
         }
         0xd3 => {
             let (h, b) = read_bytes_exact::<_, _, 8>(handle, offset).await?;
-            Ok((h, MsgpackToken::Int(i64::from_be_bytes(b))))
+            Ok((h, MsgpackToken::Int64(b)))
         }
         // fixext1/2/4/8/16: type byte + N data bytes, all embedded in token
         0xd4 => {
@@ -312,7 +314,7 @@ async fn decode_header<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             let (h, b) = read_bytes_exact::<_, _, 4>(handle, offset).await?;
             Ok((h, MsgpackToken::Map(u32::from_be_bytes(b) as usize)))
         }
-        0xe0..=0xff => Ok((handle, MsgpackToken::Int(byte as i8 as i64))),
+        0xe0..=0xff => Ok((handle, MsgpackToken::IFixInt([byte]))),
     }
 }
 
@@ -500,8 +502,16 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     match tok {
         MsgpackToken::Nil
         | MsgpackToken::Bool(_)
-        | MsgpackToken::UInt(_)
-        | MsgpackToken::Int(_)
+        | MsgpackToken::UFixInt(_)
+        | MsgpackToken::UInt8(_)
+        | MsgpackToken::UInt16(_)
+        | MsgpackToken::UInt32(_)
+        | MsgpackToken::UInt64(_)
+        | MsgpackToken::IFixInt(_)
+        | MsgpackToken::Int8(_)
+        | MsgpackToken::Int16(_)
+        | MsgpackToken::Int32(_)
+        | MsgpackToken::Int64(_)
         | MsgpackToken::Float32(_)
         | MsgpackToken::Float64(_)
         | MsgpackToken::FixExt { .. } => return Ok(handle),
@@ -549,8 +559,16 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
         match next_tok {
             MsgpackToken::Nil
             | MsgpackToken::Bool(_)
-            | MsgpackToken::UInt(_)
-            | MsgpackToken::Int(_)
+            | MsgpackToken::UFixInt(_)
+            | MsgpackToken::UInt8(_)
+            | MsgpackToken::UInt16(_)
+            | MsgpackToken::UInt32(_)
+            | MsgpackToken::UInt64(_)
+            | MsgpackToken::IFixInt(_)
+            | MsgpackToken::Int8(_)
+            | MsgpackToken::Int16(_)
+            | MsgpackToken::Int32(_)
+            | MsgpackToken::Int64(_)
             | MsgpackToken::Float32(_)
             | MsgpackToken::Float64(_)
             | MsgpackToken::FixExt { .. } => {}
@@ -671,8 +689,16 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedMsgpackEntry<'s, B, F> {
         self,
     ) -> Result<Probe<(ChunkedMsgpackClaim<'s, B, F>, T)>, MsgpackError> {
         let v = match self.token {
-            MsgpackToken::UInt(n) => T::from_uint(n),
-            MsgpackToken::Int(n) => T::from_int(n),
+            MsgpackToken::UFixInt(b) => T::from_ufixint(b),
+            MsgpackToken::UInt8(b) => T::from_uint8(b),
+            MsgpackToken::UInt16(b) => T::from_uint16(b),
+            MsgpackToken::UInt32(b) => T::from_uint32(b),
+            MsgpackToken::UInt64(b) => T::from_uint64(b),
+            MsgpackToken::IFixInt(b) => T::from_ifixint(b),
+            MsgpackToken::Int8(b) => T::from_int8(b),
+            MsgpackToken::Int16(b) => T::from_int16(b),
+            MsgpackToken::Int32(b) => T::from_int32(b),
+            MsgpackToken::Int64(b) => T::from_int64(b),
             MsgpackToken::Float32(f) => T::from_f32(f),
             MsgpackToken::Float64(f) => T::from_f64(f),
             _ => return Ok(Probe::Miss),
@@ -813,7 +839,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
     type SubDeserializer = ChunkedMsgpackSubDeserializer<'s, B, F>;
     type StrChunks = access::ChunkedMsgpackStrAccess<'s, B, F>;
     type BytesChunks = access::ChunkedMsgpackBytesAccess<'s, B, F>;
-    type NumberChunks = Never<'s, ChunkedMsgpackClaim<'s, B, F>, MsgpackError>;
+    type NumberChunks<Enc: NumberEncoding> = ChunkedMsgpackNumberAccess<'s, B, F>;
     type Map = access::ChunkedMsgpackMapAccess<'s, B, F>;
     type Seq = access::ChunkedMsgpackSeqAccess<'s, B, F>;
     type Enum = ChunkedMsgpackEnumAccess<'s, B, F>;
@@ -852,9 +878,28 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
         }
     }
 
-    #[inline(always)]
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
-        Ok(Probe::Miss)
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(self) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != BigEndian::NAME {
+            return Ok(Probe::Miss);
+        }
+        match self.token {
+            MsgpackToken::UFixInt(_)
+            | MsgpackToken::UInt8(_)
+            | MsgpackToken::UInt16(_)
+            | MsgpackToken::UInt32(_)
+            | MsgpackToken::UInt64(_)
+            | MsgpackToken::IFixInt(_)
+            | MsgpackToken::Int8(_)
+            | MsgpackToken::Int16(_)
+            | MsgpackToken::Int32(_)
+            | MsgpackToken::Int64(_) => Ok(Probe::Hit(ChunkedMsgpackNumberAccess {
+                token: self.token,
+                handle: self.handle,
+                offset: self.offset,
+                done: false,
+            })),
+            _ => Ok(Probe::Miss),
+        }
     }
 
     #[inline(always)]
@@ -936,18 +981,33 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
         T::deserialize_from_seq_owned(seq, extra).await
     }
 
+    #[inline(always)]
     async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
-        Ok(Probe::Miss)
+        match self.token {
+            MsgpackToken::Str(_) | MsgpackToken::Map(_) => {
+                Ok(Probe::Hit(ChunkedMsgpackEnumAccess {
+                    handle: self.handle,
+                    token: self.token,
+                    offset: self.offset,
+                }))
+            }
+            _ => Ok(Probe::Miss),
+        }
     }
 
+    #[inline(always)]
     async fn deserialize_enum_into<T>(
         self,
-        _extra: T::Extra,
+        extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
     where
         T: DeserializeFromEnumOwned<Self::Enum>,
     {
-        Ok(Probe::Miss)
+        let e = match EntryOwned::deserialize_enum(self).await? {
+            Probe::Hit(e) => e,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        T::deserialize_from_enum_owned(e, extra).await
     }
 
     #[inline(always)]
@@ -963,15 +1023,59 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
 }
 
 // ---------------------------------------------------------------------------
-// ChunkedMsgpackEnumAccess — stub (not yet implemented)
+// ChunkedMsgpackNumberAccess
 // ---------------------------------------------------------------------------
 
-/// Stub [`EnumAccessOwned`] for the chunked MessagePack deserializer.
-///
-/// Owned-family enum deserialization is not yet implemented.
-/// `iterate` always returns `Probe::Miss`.
+pub struct ChunkedMsgpackNumberAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    token: MsgpackToken,
+    handle: Handle<'s, B, F>,
+    offset: usize,
+    done: bool,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwned<Enc>
+    for ChunkedMsgpackNumberAccess<'s, B, F>
+{
+    type Claim = ChunkedMsgpackClaim<'s, B, F>;
+    type Error = MsgpackError;
+
+    async fn next_number_chunk<R>(
+        mut self,
+        f: impl FnOnce(&Enc::Data) -> R,
+    ) -> Result<strede::Chunk<(Self, R), Self::Claim>, Self::Error> {
+        if self.done {
+            return Ok(strede::Chunk::Done(ChunkedMsgpackClaim {
+                offset: self.offset,
+                handle: self.handle,
+                remaining_after: 0,
+            }));
+        }
+        let bytes: &[u8] = match &self.token {
+            MsgpackToken::UFixInt(b) | MsgpackToken::UInt8(b)
+            | MsgpackToken::IFixInt(b) | MsgpackToken::Int8(b) => b.as_slice(),
+            MsgpackToken::UInt16(b) | MsgpackToken::Int16(b) => b.as_slice(),
+            MsgpackToken::UInt32(b) | MsgpackToken::Int32(b) => b.as_slice(),
+            MsgpackToken::UInt64(b) | MsgpackToken::Int64(b) => b.as_slice(),
+            _ => unreachable!(),
+        };
+        let r = f(Enc::from_bytes(bytes));
+        self.done = true;
+        Ok(strede::Chunk::Data((self, r)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChunkedMsgpackEnumAccess / ChunkedMsgpackEnumVariantProbe
+// ---------------------------------------------------------------------------
+//
+// Externally-tagged enums:
+//   - Unit variants:     bare string token  ("VariantName")
+//   - Non-unit variants: single-key map     ({"VariantName": <payload>})
+
 pub struct ChunkedMsgpackEnumAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    _handle: Handle<'s, B, F>,
+    handle: Handle<'s, B, F>,
+    token: MsgpackToken,
+    offset: usize,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedMsgpackEnumAccess<'s, B, F> {
@@ -979,23 +1083,25 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedMsgpackEnu
     type Claim = ChunkedMsgpackClaim<'s, B, F>;
     type VariantProbe = ChunkedMsgpackEnumVariantProbe<'s, B, F>;
 
-    fn fork(&mut self) -> Self {
-        Self {
-            _handle: self._handle.fork(),
-        }
-    }
-
-    async fn iterate<S>(self, _arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
     where
         S: EnumArmStackOwned<Self::VariantProbe>,
     {
-        Ok(Probe::Miss)
+        let vp = ChunkedMsgpackEnumVariantProbe {
+            handle: self.handle,
+            token: self.token,
+            offset: self.offset,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
     }
 }
 
-/// Stub [`EnumVariantProbeOwned`] for the chunked MessagePack deserializer.
 pub struct ChunkedMsgpackEnumVariantProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    _handle: Handle<'s, B, F>,
+    handle: Handle<'s, B, F>,
+    token: MsgpackToken,
+    offset: usize,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
@@ -1007,8 +1113,127 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
 
     fn fork(&mut self) -> Self {
         Self {
-            _handle: self._handle.fork(),
+            handle: self.handle.fork(),
+            token: self.token,
+            offset: self.offset,
         }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        use access::ChunkedMsgpackStrAccess;
+        use strede::StrAccessOwned as _;
+
+        let mut str_access = match self.token {
+            MsgpackToken::Str(len) => ChunkedMsgpackStrAccess {
+                handle: self.handle,
+                offset: self.offset,
+                remaining: len,
+            },
+            _ => return Ok(Probe::Miss),
+        };
+
+        let mut viable = candidates.map(|_| true);
+        let cands = candidates.as_ref();
+        let mut consumed: usize = 0;
+        loop {
+            let result = str_access
+                .next_str(|s: &str| {
+                    let new_consumed = consumed + s.len();
+                    let v = viable.as_mut();
+                    for (i, &(k, _)) in cands.iter().enumerate() {
+                        if !v[i] {
+                            continue;
+                        }
+                        if new_consumed > k.len()
+                            || &k.as_bytes()[consumed..new_consumed] != s.as_bytes()
+                        {
+                            v[i] = false;
+                        }
+                    }
+                    consumed = new_consumed;
+                })
+                .await?;
+            if !viable.as_ref().iter().any(|v| *v) {
+                return Ok(Probe::Miss);
+            }
+            match result {
+                strede::Chunk::Data((new, ())) => str_access = new,
+                strede::Chunk::Done(claim) => {
+                    let v = viable.as_ref();
+                    for (i, &(k, idx)) in cands.iter().enumerate() {
+                        if v[i] && k.len() == consumed {
+                            return Ok(Probe::Hit((claim, idx)));
+                        }
+                    }
+                    return Ok(Probe::Miss);
+                }
+            }
+        }
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        use access::ChunkedMsgpackKeyProbe;
+        use strede::{MapKeyClaimOwned as _, MapKeyProbeOwned as _, MapValueClaimOwned as _, MapValueProbeOwned as _};
+
+        // Expect a single-key map {"VariantName": <payload>}.
+        let count = match self.token {
+            MsgpackToken::Map(n) if n >= 1 => n,
+            _ => return Ok(Probe::Miss),
+        };
+
+        let mut offset = self.offset;
+        let (handle, key_tok) = next_dispatch(self.handle, &mut offset).await?;
+
+        let key_probe = ChunkedMsgpackKeyProbe::new(handle, key_tok, offset, count - 1);
+
+        let (key_claim, MatchVals(idx, _)) = match key_probe
+            .deserialize_key::<MatchVals<usize, W>>(candidates)
+            .await?
+        {
+            Probe::Hit(v) => v,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        let value_probe = key_claim.into_value_probe().await?;
+        let (value_claim, t) = match value_probe.deserialize_value::<T>(extra).await? {
+            Probe::Hit(v) => v,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        // Externally-tagged enum has exactly one key-value pair.
+        let map_claim = match value_claim.next_key(0, 0).await? {
+            NextKey::Done(c) => c,
+            NextKey::Entry(_) => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_claim, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        let sub = ChunkedMsgpackSubDeserializer::new(self.handle, self.offset, self.token);
+        T::deserialize_owned(sub, extra).await
     }
 }
 

@@ -4,13 +4,13 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::{
-    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicatesOwned,
+    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicates,
     MapArmBase, MapArmSlot, SlotDispatchProj, SlotDispatchState, SlotRaceState, StackConcat,
-    TagDispatchProj, TagDispatchState, TagInjectingStackOwned, TagRaceState, VirtualArmSlot,
+    TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
     WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
 };
 use crate::Probe;
-use crate::borrow::{MapAccess, MapKeyProbe, VC as BVC, VP as BVP};
+use crate::borrow::{MapKeyProbe, VC as BVC, VP as BVP};
 
 // ---------------------------------------------------------------------------
 // MapArmStack<'de, KP> - borrow-family arm stack
@@ -24,6 +24,9 @@ use crate::borrow::{MapAccess, MapKeyProbe, VC as BVC, VP as BVP};
 pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
     const SIZE: usize;
 
+    /// Number of real (non-virtual) arms. See [`crate::MapArmStackOwned::FIELD_COUNT`].
+    const FIELD_COUNT: usize;
+
     /// Left-nested tuple of `Option<(K, V)>` for each arm.
     type Outputs;
 
@@ -36,7 +39,7 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
 
     type RaceState;
 
-    fn init_race(&mut self, kp: KP, arm_base: usize) -> Self::RaceState;
+    fn init_race(&mut self, kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState;
     #[allow(clippy::type_complexity)]
     fn poll_race_one(
         &mut self,
@@ -60,7 +63,7 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
-        let mut race_state = core::pin::pin!(self.init_race(kp, 0));
+        let mut race_state = core::pin::pin!(self.init_race(kp, 0, 0));
         core::future::poll_fn(|cx| {
             let mut all_miss = true;
             for i in 0..Self::SIZE {
@@ -103,6 +106,7 @@ pub trait MapArmStack<'de, KP: MapKeyProbe<'de>>: Sized {
 
 impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
     const SIZE: usize = 0;
+    const FIELD_COUNT: usize = 0;
     type Outputs = ();
 
     #[inline(always)]
@@ -117,7 +121,7 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
     type RaceState = ();
 
     #[inline(always)]
-    fn init_race(&mut self, _kp: KP, _arm_base: usize) {}
+    fn init_race(&mut self, _kp: KP, _arm_base: usize, _field_base: usize) {}
     #[inline(always)]
     fn poll_race_one(
         &mut self,
@@ -160,6 +164,7 @@ where
     ValFut: Future<Output = Result<Probe<(BVC<'de, KP>, (K, V))>, KP::Error>>,
 {
     const SIZE: usize = Rest::SIZE + 1;
+    const FIELD_COUNT: usize = Rest::FIELD_COUNT + 1;
     type Outputs = (Rest::Outputs, Option<(K, V)>);
 
     #[inline(always)]
@@ -174,15 +179,15 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = if self.1.state.is_done() {
             None
         } else {
-            Some((self.1.key_fn)(kp, arm_base + Self::SIZE - 1))
+            Some((self.1.key_fn)(kp, field_base + Self::FIELD_COUNT - 1))
         };
         SlotRaceState {
-            rest: self.0.init_race(rest_kp, arm_base),
+            rest: self.0.init_race(rest_kp, arm_base, field_base),
             this: this_fut,
         }
     }
@@ -268,6 +273,7 @@ where
     ValFut: Future<Output = Result<Probe<(BVC<'de, KP>, ())>, KP::Error>>,
 {
     const SIZE: usize = Rest::SIZE + 1;
+    const FIELD_COUNT: usize = Rest::FIELD_COUNT;
     type Outputs = Rest::Outputs;
 
     #[inline(always)]
@@ -282,11 +288,11 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = (self.1.key_fn)(kp, arm_base + Self::SIZE - 1);
         SlotRaceState {
-            rest: self.0.init_race(rest_kp, arm_base),
+            rest: self.0.init_race(rest_kp, arm_base, field_base),
             this: Some(this_fut),
         }
     }
@@ -349,73 +355,26 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// FlattenCont - continuation trait for multi-flatten chains (borrow family)
-// ---------------------------------------------------------------------------
-
-/// Continuation hook for [`crate::FlattenMapAccess`]. Determines what happens
-/// after the outer and inner arm stacks are combined via [`StackConcat`].
-///
-/// Terminal case ([`crate::FlattenTerminal`] / [`crate::FlattenTerminalBoxed`]):
-/// runs `map.iterate(arms)` directly.
-///
-/// Intermediate case (generated by the derive macro for multi-flatten): wraps
-/// the inner map in another [`crate::FlattenMapAccess`] keyed to the next
-/// flatten field and drives that field's `DeserializeFromMap` impl. The
-/// next-field's deserialized value is stashed in a cell captured by the
-/// continuation; the upstream-arms outputs are forwarded back as the result.
-pub trait FlattenCont<'de, M: MapAccess<'de>>: Sized {
-    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error>;
-}
-
-impl<'de, M: MapAccess<'de>> FlattenCont<'de, M> for crate::FlattenTerminal {
-    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> {
-        let (claim, out) = crate::hit!(map.iterate(arms).await);
-        Ok(Probe::Hit((claim, out)))
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'de, M: MapAccess<'de>> FlattenCont<'de, M> for crate::FlattenTerminalBoxed {
-    async fn finish<Arms: MapArmStack<'de, M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> {
-        #[allow(clippy::type_complexity)]
-        let r: Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> =
-            alloc::boxed::Box::pin(map.iterate(arms)).await;
-        let (claim, out) = crate::hit!(r);
-        Ok(Probe::Hit((claim, out)))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Wrapper impls for MapArmStack (borrow family)
 // ---------------------------------------------------------------------------
 
-// --- DetectDuplicatesOwned impl ---
+// --- DetectDuplicates impl ---
 
-impl<'de, KP, S, const M: usize, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStack<'de, KP>
-    for DetectDuplicatesOwned<S, M, KeyFn, SkipFn>
+impl<'de, KP, S, W, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStack<'de, KP>
+    for DetectDuplicates<S, W, KeyFn, SkipFn>
 where
     KP: MapKeyProbe<'de>,
     S: MapArmStack<'de, KP>,
+    W: AsRef<[(&'static str, usize)]>,
     KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<
-        Output = Result<Probe<(KP::KeyClaim, crate::impls::MatchVals<usize, { M }>)>, KP::Error>,
+        Output = Result<Probe<(KP::KeyClaim, crate::impls::MatchVals<usize, W>)>, KP::Error>,
     >,
     SkipFn: FnMut(BVP<'de, KP>) -> SkipFut,
     SkipFut: Future<Output = Result<BVC<'de, KP>, KP::Error>>,
 {
     const SIZE: usize = S::SIZE + 1;
+    const FIELD_COUNT: usize = S::FIELD_COUNT;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -430,11 +389,11 @@ where
     type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let dup_kp = kp.fork();
         let dup_fut = (self.key_fn)(dup_kp, arm_base + Self::SIZE - 1);
         WrapperRaceState {
-            inner: self.inner.init_race(kp, arm_base),
+            inner: self.inner.init_race(kp, arm_base, field_base),
             virtual_arm: Some(dup_fut),
         }
     }
@@ -450,7 +409,7 @@ where
         if arm_index == Self::SIZE - 1 {
             match poll_key_slot(projected.virtual_arm, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, matched)))) => {
-                    self.dup = self.wire_names[matched.0].0;
+                    self.dup = self.wire_names.as_ref()[matched.0].0;
                     Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
                 }
                 Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
@@ -496,10 +455,10 @@ where
     }
 }
 
-// --- TagInjectingStackOwned impl ---
+// --- TagInjectingStack impl ---
 
-impl<'de, 'v, KP, S, const N: usize, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStack<'de, KP>
-    for TagInjectingStackOwned<'v, S, N, TagKeyFn, TagValFn>
+impl<'de, 'v, KP, S, W, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStack<'de, KP>
+    for TagInjectingStack<'v, S, W, TagKeyFn, TagValFn>
 where
     KP: MapKeyProbe<'de>,
     S: MapArmStack<'de, KP>,
@@ -507,10 +466,11 @@ where
     TagKeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::impls::Match)>, KP::Error>>,
     TagValFn: FnMut(BVP<'de, KP>) -> TagValFut,
     TagValFut: Future<
-        Output = Result<Probe<(BVC<'de, KP>, crate::impls::MatchVals<usize, { N }>)>, KP::Error>,
+        Output = Result<Probe<(BVC<'de, KP>, crate::impls::MatchVals<usize, W>)>, KP::Error>,
     >,
 {
     const SIZE: usize = S::SIZE + 1;
+    const FIELD_COUNT: usize = S::FIELD_COUNT;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -525,14 +485,14 @@ where
     type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let inner_kp = kp.fork();
         // Tag arm is always at global index 0; arm_base is irrelevant for it
         // but we pass arm_base to the closure for consistency.
         let tag_fut = (self.tag_key_fn)(kp, arm_base);
         TagRaceState {
             tag_fut: Some(tag_fut),
-            inner: self.inner.init_race(inner_kp, arm_base + 1),
+            inner: self.inner.init_race(inner_kp, arm_base + 1, field_base),
         }
     }
 
@@ -607,6 +567,7 @@ where
     B: MapArmStack<'de, KP>,
 {
     const SIZE: usize = A::SIZE + B::SIZE;
+    const FIELD_COUNT: usize = A::FIELD_COUNT + B::FIELD_COUNT;
     type Outputs = (A::Outputs, B::Outputs);
 
     #[inline(always)]
@@ -621,11 +582,11 @@ where
     type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP, arm_base: usize) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let b_kp = kp.fork();
         ConcatRaceState {
-            a: self.0.init_race(kp, arm_base),
-            b: self.1.init_race(b_kp, arm_base + A::SIZE),
+            a: self.0.init_race(kp, arm_base, field_base),
+            b: self.1.init_race(b_kp, arm_base + A::SIZE, field_base + A::FIELD_COUNT),
         }
     }
 
