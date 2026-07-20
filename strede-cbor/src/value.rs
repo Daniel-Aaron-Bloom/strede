@@ -362,7 +362,7 @@ macro_rules! impl_value_owned {
                             let c = ChunkedCborClaim {
                                 offset: access.offset,
                                 handle: access.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             };
                             Ok(Probe::Hit((c, CborValue::Bstr(bytes))))
                         }
@@ -377,7 +377,7 @@ macro_rules! impl_value_owned {
                             let c = ChunkedCborClaim {
                                 offset: access.offset,
                                 handle: access.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             };
                             Ok(Probe::Hit((c, CborValue::Bstr(bytes))))
                         }
@@ -394,7 +394,7 @@ macro_rules! impl_value_owned {
                             let c = ChunkedCborClaim {
                                 offset: access.offset,
                                 handle: access.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             };
                             Ok(Probe::Hit((c, CborValue::Tstr(s))))
                         }
@@ -409,7 +409,7 @@ macro_rules! impl_value_owned {
                             let c = ChunkedCborClaim {
                                 offset: access.offset,
                                 handle: access.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             };
                             Ok(Probe::Hit((c, CborValue::Tstr(s))))
                         }
@@ -614,7 +614,7 @@ async fn deserialize_map_owned<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             ChunkedCborClaim {
                 handle,
                 offset,
-                remaining_after: 0,
+                remaining_after: None,
             },
             CborValue::Map(pairs),
         )))
