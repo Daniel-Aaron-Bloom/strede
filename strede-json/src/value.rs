@@ -158,6 +158,7 @@ where
 {
     const SIZE: usize = 1;
     const FIELD_COUNT: usize = 1;
+    type Dynamic = strede::True;
     type Outputs = Vec<(Cow<'de, str>, ValueBorrowed<'de>)>;
 
     fn unsatisfied_count(&self) -> usize {
@@ -354,6 +355,7 @@ where
 {
     const SIZE: usize = 1;
     const FIELD_COUNT: usize = 1;
+    type Dynamic = strede::True;
     type Outputs = Vec<(String, ValueOwned)>;
 
     fn unsatisfied_count(&self) -> usize {
