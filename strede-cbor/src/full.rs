@@ -24,10 +24,10 @@ use crate::{
 };
 use strede::{
     BigEndian, BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap,
-    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
-    MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals,
-    NextKey, NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess,
-    hit, match_entry_str_against, utils::repeat,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess,
+    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
+    NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit,
+    match_entry_str_against, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -1091,13 +1091,56 @@ impl<'de> MapAccess<'de> for CborMapAccess<'de> {
 
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        mut arms: S,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        let mut src = self.src;
+        cbor_map_iterate(self, arms).await
+    }
 
-        // Build the first key probe (or return immediately for definite empty map).
-        let mut key_probe_opt: Option<CborMapKeyProbe<'de>> = match self.remaining {
-            Some(0) => {
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        cbor_map_iterate(self, arms).await
+    }
+}
+
+/// Shared body for [`MapAccess::iterate`] / [`MapAccess::iterate_dyn`] — CBOR
+/// maps (definite or `Break`-terminated indefinite) are wire-identical for
+/// structs and dynamic collections, so both trait methods delegate here
+/// rather than one calling the other.
+async fn cbor_map_iterate<'de, S: MapArmStack<'de, CborMapKeyProbe<'de>>>(
+    map: CborMapAccess<'de>,
+    mut arms: S,
+) -> Result<Probe<(CborClaim<'de>, S::Outputs)>, CborError> {
+    let mut src = map.src;
+
+    // Build the first key probe (or return immediately for definite empty map).
+    let mut key_probe_opt: Option<CborMapKeyProbe<'de>> = match map.remaining {
+        Some(0) => {
+            return Ok(Probe::Hit((
+                CborClaim {
+                    src,
+                    remaining_after: 0,
+                },
+                arms.take_outputs(),
+            )));
+        }
+        Some(n) => {
+            let raw = next_token(&mut src)?;
+            let key_tok = match strip_tags(&mut src, raw)? {
+                Some(t) => t,
+                None => return Err(CborError::UnexpectedByte { byte: 0 }),
+            };
+            Some(CborMapKeyProbe {
+                src,
+                key_tok,
+                remaining_after: n - 1,
+            })
+        }
+        None => {
+            // Indefinite: check for immediate break
+            let raw = next_token(&mut src)?;
+            if matches!(raw, CborToken::Break) {
                 return Ok(Probe::Hit((
                     CborClaim {
                         src,
@@ -1106,67 +1149,42 @@ impl<'de> MapAccess<'de> for CborMapAccess<'de> {
                     arms.take_outputs(),
                 )));
             }
-            Some(n) => {
-                let raw = next_token(&mut src)?;
-                let key_tok = match strip_tags(&mut src, raw)? {
-                    Some(t) => t,
-                    None => return Err(CborError::UnexpectedByte { byte: 0 }),
-                };
-                Some(CborMapKeyProbe {
-                    src,
-                    key_tok,
-                    remaining_after: n - 1,
-                })
-            }
-            None => {
-                // Indefinite: check for immediate break
-                let raw = next_token(&mut src)?;
-                if matches!(raw, CborToken::Break) {
-                    return Ok(Probe::Hit((
-                        CborClaim {
-                            src,
-                            remaining_after: 0,
-                        },
-                        arms.take_outputs(),
-                    )));
-                }
-                let key_tok = match strip_tags(&mut src, raw)? {
-                    Some(t) => t,
-                    None => return Err(CborError::UnexpectedByte { byte: 0 }),
-                };
-                Some(CborMapKeyProbe {
-                    src,
-                    key_tok,
-                    remaining_after: usize::MAX,
-                })
-            }
+            let key_tok = match strip_tags(&mut src, raw)? {
+                Some(t) => t,
+                None => return Err(CborError::UnexpectedByte { byte: 0 }),
+            };
+            Some(CborMapKeyProbe {
+                src,
+                key_tok,
+                remaining_after: usize::MAX,
+            })
+        }
+    };
+
+    loop {
+        let key_probe = key_probe_opt.take().unwrap();
+
+        let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit(x) => x,
         };
 
-        loop {
-            let key_probe = key_probe_opt.take().unwrap();
+        let value_probe = key_claim.into_value_probe().await?;
 
-            let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
+        let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit(x) => x,
+        };
 
-            let value_probe = key_claim.into_value_probe().await?;
-
-            let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
-
-            match value_claim
-                .next_key(arms.unsatisfied_count(), arms.open_count())
-                .await?
-            {
-                NextKey::Done(map_claim) => {
-                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                }
-                NextKey::Entry(next_kp) => {
-                    key_probe_opt = Some(next_kp);
-                }
+        match value_claim
+            .next_key(arms.unsatisfied_count(), arms.open_count())
+            .await?
+        {
+            NextKey::Done(map_claim) => {
+                return Ok(Probe::Hit((map_claim, arms.take_outputs())));
+            }
+            NextKey::Entry(next_kp) => {
+                key_probe_opt = Some(next_kp);
             }
         }
     }
@@ -1224,7 +1242,11 @@ where
                 src,
                 remaining: Some(n - 1),
             };
-            let entry = CborSeqEntry { src, elem_tok, bignum_tag };
+            let entry = CborSeqEntry {
+                src,
+                elem_tok,
+                bignum_tag,
+            };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
                 src: claim.src,
@@ -1245,7 +1267,11 @@ where
                 Some(t) => t,
                 None => return Err(CborError::UnexpectedByte { byte: 0 }),
             };
-            let entry = CborSeqEntry { src, elem_tok, bignum_tag };
+            let entry = CborSeqEntry {
+                src,
+                elem_tok,
+                bignum_tag,
+            };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
                 src: claim.src,
@@ -1359,7 +1385,9 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         let entry = CborEntry {
@@ -1377,7 +1405,9 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Expect a single-key map `{"VariantName": <payload>}`.

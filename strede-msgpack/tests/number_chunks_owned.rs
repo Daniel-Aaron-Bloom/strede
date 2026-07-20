@@ -3,7 +3,10 @@
 mod helpers;
 use helpers::*;
 
-use strede::{Ascii, BigEndian, Chunk, DeserializerOwned, EntryOwned, LittleEndian, NumberAccessOwned, Probe, SharedBuf};
+use strede::{
+    Ascii, BigEndian, Chunk, DeserializerOwned, EntryOwned, LittleEndian, NumberAccessOwned, Probe,
+    SharedBuf,
+};
 use strede_msgpack::chunked::ChunkedMsgpackDeserializer;
 use strede_test_util::block_on_loop;
 
@@ -11,24 +14,36 @@ fn collect_be(input: &[u8]) -> Option<Vec<u8>> {
     let input: &[u8] = input;
     block_on_loop(SharedBuf::with_async(
         input,
-        async |buf: &mut &[u8]| { *buf = &[]; },
+        async |buf: &mut &[u8]| {
+            *buf = &[];
+        },
         async |shared| {
             let de = ChunkedMsgpackDeserializer::new(shared);
-            match de.entry(|[e]| async move {
-                let mut acc = match e.deserialize_number_chunks::<BigEndian>().await? {
-                    Probe::Hit(a) => a,
-                    Probe::Miss => return Ok(Probe::Miss),
-                };
-                let mut bytes = Vec::<u8>::new();
-                loop {
-                    match <_ as NumberAccessOwned<BigEndian>>::next_number_chunk(acc, |b: &[u8]| b.to_vec()).await? {
-                        Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+            match de
+                .entry(|[e]| async move {
+                    let mut acc = match e.deserialize_number_chunks::<BigEndian>().await? {
+                        Probe::Hit(a) => a,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+                    let mut bytes = Vec::<u8>::new();
+                    loop {
+                        match <_ as NumberAccessOwned<BigEndian>>::next_number_chunk(
+                            acc,
+                            |b: &[u8]| b.to_vec(),
+                        )
+                        .await?
+                        {
+                            Chunk::Data((next, chunk)) => {
+                                bytes.extend_from_slice(&chunk);
+                                acc = next;
+                            }
+                            Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+                        }
                     }
-                }
-            })
-            .await
-            .unwrap() {
+                })
+                .await
+                .unwrap()
+            {
                 Probe::Hit((_, v)) => Some(v),
                 Probe::Miss => None,
             }
@@ -40,24 +55,35 @@ fn collect_ascii(input: &[u8]) -> Option<Vec<u8>> {
     let input: &[u8] = input;
     block_on_loop(SharedBuf::with_async(
         input,
-        async |buf: &mut &[u8]| { *buf = &[]; },
+        async |buf: &mut &[u8]| {
+            *buf = &[];
+        },
         async |shared| {
             let de = ChunkedMsgpackDeserializer::new(shared);
-            match de.entry(|[e]| async move {
-                let mut acc = match e.deserialize_number_chunks::<Ascii>().await? {
-                    Probe::Hit(a) => a,
-                    Probe::Miss => return Ok(Probe::Miss),
-                };
-                let mut bytes = Vec::<u8>::new();
-                loop {
-                    match <_ as NumberAccessOwned<Ascii>>::next_number_chunk(acc, |b: &str| b.as_bytes().to_vec()).await? {
-                        Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+            match de
+                .entry(|[e]| async move {
+                    let mut acc = match e.deserialize_number_chunks::<Ascii>().await? {
+                        Probe::Hit(a) => a,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+                    let mut bytes = Vec::<u8>::new();
+                    loop {
+                        match <_ as NumberAccessOwned<Ascii>>::next_number_chunk(acc, |b: &str| {
+                            b.as_bytes().to_vec()
+                        })
+                        .await?
+                        {
+                            Chunk::Data((next, chunk)) => {
+                                bytes.extend_from_slice(&chunk);
+                                acc = next;
+                            }
+                            Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+                        }
                     }
-                }
-            })
-            .await
-            .unwrap() {
+                })
+                .await
+                .unwrap()
+            {
                 Probe::Hit((_, v)) => Some(v),
                 Probe::Miss => None,
             }
@@ -69,24 +95,36 @@ fn collect_le(input: &[u8]) -> Option<Vec<u8>> {
     let input: &[u8] = input;
     block_on_loop(SharedBuf::with_async(
         input,
-        async |buf: &mut &[u8]| { *buf = &[]; },
+        async |buf: &mut &[u8]| {
+            *buf = &[];
+        },
         async |shared| {
             let de = ChunkedMsgpackDeserializer::new(shared);
-            match de.entry(|[e]| async move {
-                let mut acc = match e.deserialize_number_chunks::<LittleEndian>().await? {
-                    Probe::Hit(a) => a,
-                    Probe::Miss => return Ok(Probe::Miss),
-                };
-                let mut bytes = Vec::<u8>::new();
-                loop {
-                    match <_ as NumberAccessOwned<LittleEndian>>::next_number_chunk(acc, |b: &[u8]| b.to_vec()).await? {
-                        Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
-                        Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+            match de
+                .entry(|[e]| async move {
+                    let mut acc = match e.deserialize_number_chunks::<LittleEndian>().await? {
+                        Probe::Hit(a) => a,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+                    let mut bytes = Vec::<u8>::new();
+                    loop {
+                        match <_ as NumberAccessOwned<LittleEndian>>::next_number_chunk(
+                            acc,
+                            |b: &[u8]| b.to_vec(),
+                        )
+                        .await?
+                        {
+                            Chunk::Data((next, chunk)) => {
+                                bytes.extend_from_slice(&chunk);
+                                acc = next;
+                            }
+                            Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
+                        }
                     }
-                }
-            })
-            .await
-            .unwrap() {
+                })
+                .await
+                .unwrap()
+            {
                 Probe::Hit((_, v)) => Some(v),
                 Probe::Miss => None,
             }
@@ -111,7 +149,10 @@ fn uint16_be() {
 
 #[test]
 fn uint32_be() {
-    assert_eq!(collect_be(&uint32(0x01020304)), Some(vec![0x01, 0x02, 0x03, 0x04]));
+    assert_eq!(
+        collect_be(&uint32(0x01020304)),
+        Some(vec![0x01, 0x02, 0x03, 0x04])
+    );
 }
 
 #[test]

@@ -99,24 +99,48 @@ fn missing_inner_field_misses() {
 
 #[test]
 fn suffix_outer_then_inner_then_suffix() {
-    let o: OuterWithSuffix = parse!(OuterWithSuffix, &br#"{"prefix": 1, "a": 2, "b": 3, "suffix": 4}"#[..]).unwrap();
-    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+    let o: OuterWithSuffix = parse!(
+        OuterWithSuffix,
+        &br#"{"prefix": 1, "a": 2, "b": 3, "suffix": 4}"#[..]
+    )
+    .unwrap();
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
 }
 
 #[test]
 fn suffix_interleaved() {
-    let o: OuterWithSuffix = parse!(OuterWithSuffix, &br#"{"a": 2, "suffix": 4, "prefix": 1, "b": 3}"#[..]).unwrap();
-    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+    let o: OuterWithSuffix = parse!(
+        OuterWithSuffix,
+        &br#"{"a": 2, "suffix": 4, "prefix": 1, "b": 3}"#[..]
+    )
+    .unwrap();
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
 }
 
 #[test]
 fn suffix_missing_prefix_misses() {
-    let v: Option<OuterWithSuffix> = parse!(OuterWithSuffix, &br#"{"a": 2, "b": 3, "suffix": 4}"#[..]);
+    let v: Option<OuterWithSuffix> =
+        parse!(OuterWithSuffix, &br#"{"a": 2, "b": 3, "suffix": 4}"#[..]);
     assert!(v.is_none());
 }
 
 #[test]
 fn suffix_missing_suffix_misses() {
-    let v: Option<OuterWithSuffix> = parse!(OuterWithSuffix, &br#"{"prefix": 1, "a": 2, "b": 3}"#[..]);
+    let v: Option<OuterWithSuffix> =
+        parse!(OuterWithSuffix, &br#"{"prefix": 1, "a": 2, "b": 3}"#[..]);
     assert!(v.is_none());
 }

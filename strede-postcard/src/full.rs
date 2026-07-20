@@ -483,6 +483,14 @@ impl<'de> MapValueClaim<'de> for PostcardClaim<'de> {
 pub struct PostcardMapKeyProbe<'de> {
     pub(crate) src: &'de [u8],
     pub(crate) current_idx: usize,
+    /// `true` for a dynamic-collection key slot (HashMap/BTreeMap via
+    /// `CollectMap`), where the key is real wire bytes to be decoded via
+    /// `deserialize_key`. `false` for a struct field, where fields have no
+    /// wire key names at all and `deserialize_key` must stay a no-op `Miss`
+    /// — dynamic-only, since the derive races `deserialize_key::<Match>`
+    /// against `deserialize_key_by_index` for every struct field, and a real
+    /// decode attempt there could misparse arbitrary field bytes.
+    pub(crate) dynamic: bool,
 }
 
 impl<'de> PostcardMapKeyProbe<'de> {
@@ -490,6 +498,7 @@ impl<'de> PostcardMapKeyProbe<'de> {
         Self {
             src: self.src,
             current_idx: self.current_idx,
+            dynamic: self.dynamic,
         }
     }
 }
@@ -505,13 +514,17 @@ impl<'de> MapKeyProbe<'de> for PostcardMapKeyProbe<'de> {
 
     async fn deserialize_key<K>(
         self,
-        _extra: K::Extra,
+        extra: K::Extra,
     ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error>
     where
         K: Deserialize<'de, Self::KeySubDeserializer>,
     {
-        // Postcard has no wire key names — name-based matching always misses.
-        Ok(Probe::Miss)
+        if !self.dynamic {
+            // Struct fields have no wire key names — name-based matching always misses.
+            return Ok(Probe::Miss);
+        }
+        let sub = PostcardSubDeserializer::new(self.src);
+        K::deserialize(sub, extra).await
     }
 
     async fn deserialize_key_by_index(
@@ -573,37 +586,95 @@ impl<'de> MapAccess<'de> for PostcardMapAccess<'de> {
 
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        mut arms: S,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        let mut src = self.src;
-        let mut current = self.current;
+        iterate_static(self.src, self.current, arms).await
+    }
 
-        loop {
-            if arms.unsatisfied_count() == 0 {
-                return Ok(Probe::Hit((PostcardClaim { src }, arms.take_outputs())));
-            }
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        iterate_dynamic(self.src, arms).await
+    }
+}
 
-            let kp = PostcardMapKeyProbe {
-                src,
-                current_idx: current,
-            };
+/// Unbounded collection (HashMap/BTreeMap via `CollectMap`): postcard writes an
+/// explicit varint length for these, unlike structs. Loops exactly `count`
+/// times — NOT via `unsatisfied_count() == 0` like [`iterate_static`], since
+/// `CollectMap`'s `unsatisfied_count()` is hardcoded to 0 and would terminate
+/// before reading anything.
+///
+/// Split out from [`MapAccess::iterate`] (rather than an `if`/`else` inline)
+/// so each mode gets its own async state machine instead of one fn's layout
+/// covering the union of both — halves the await-point count the compiler has
+/// to lay out per call site, which matters because `iterate` is monomorphized
+/// deeply (every struct field type nests another `iterate` call).
+async fn iterate_dynamic<'de, S: MapArmStack<'de, PostcardMapKeyProbe<'de>>>(
+    src: &'de [u8],
+    mut arms: S,
+) -> Result<Probe<(PostcardClaim<'de>, S::Outputs)>, PostcardError> {
+    let (count, consumed) = decode_varint(src)?;
+    let mut src = &src[consumed..];
 
-            let (arm_index, key_claim) = match arms.race_keys(kp).await? {
-                Probe::Hit(x) => x,
-                Probe::Miss => return Ok(Probe::Miss),
-            };
-            let _ = arm_index;
+    for _ in 0..count {
+        let kp = PostcardMapKeyProbe {
+            src,
+            current_idx: 0,
+            dynamic: true,
+        };
 
-            let value_probe = key_claim.into_value_probe().await?;
+        let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+            Probe::Hit(x) => x,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
 
-            let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
-                Probe::Hit(x) => x,
-                Probe::Miss => return Ok(Probe::Miss),
-            };
+        let value_probe = key_claim.into_value_probe().await?;
 
-            src = value_claim.src;
-            current += 1;
+        let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
+            Probe::Hit(x) => x,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        src = value_claim.src;
+    }
+
+    Ok(Probe::Hit((PostcardClaim { src }, arms.take_outputs())))
+}
+
+/// Struct fields: no wire framing at all; driven by the arm stack becoming
+/// satisfied (`unsatisfied_count() == 0`), matching fields positionally via
+/// `current_idx`. See [`iterate_dynamic`] for why this is a separate fn.
+async fn iterate_static<'de, S: MapArmStack<'de, PostcardMapKeyProbe<'de>>>(
+    mut src: &'de [u8],
+    mut current: usize,
+    mut arms: S,
+) -> Result<Probe<(PostcardClaim<'de>, S::Outputs)>, PostcardError> {
+    loop {
+        if arms.unsatisfied_count() == 0 {
+            return Ok(Probe::Hit((PostcardClaim { src }, arms.take_outputs())));
         }
+
+        let kp = PostcardMapKeyProbe {
+            src,
+            current_idx: current,
+            dynamic: false,
+        };
+
+        let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+            Probe::Hit(x) => x,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        let value_probe = key_claim.into_value_probe().await?;
+
+        let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
+            Probe::Hit(x) => x,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+
+        src = value_claim.src;
+        current += 1;
     }
 }
 

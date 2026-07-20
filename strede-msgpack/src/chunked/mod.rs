@@ -19,11 +19,10 @@ use crate::token::MsgpackToken;
 use core::future::Future;
 use strede::utils::repeat;
 use strede::{
-    Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    BigEndian, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
     DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
-    BigEndian, EnumVariantProbeOwned, Handle, MatchVals, NextKey, NumberAccessOwned,
-    NumberEncoding, Probe, SharedBuf,
-    hit,
+    EnumVariantProbeOwned, Handle, MatchVals, NextKey, NumberAccessOwned, NumberEncoding, Probe,
+    RawSlot, SharedBuf, hit,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,6 +34,69 @@ pub struct ChunkedMsgpackClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
     /// Remaining map key-value pairs after this claim (map context only); 0 otherwise.
     pub(crate) remaining_after: usize,
+}
+
+// ---------------------------------------------------------------------------
+// RawSlot — drives `strede::PairSeqMapAccess`. Msgpack maps are wire-identical
+// to "N pairs in a flat, count-prefixed stream", so the key/value probe
+// quintet is generic infrastructure rather than hand-rolled here; see
+// `access::ChunkedMsgpackMapAccess` (removed) for the shape this replaces.
+// ---------------------------------------------------------------------------
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> RawSlot for ChunkedMsgpackClaim<'s, B, F> {
+    type Error = MsgpackError;
+    type Token = MsgpackToken;
+    type SubDeserializer = ChunkedMsgpackSubDeserializer<'s, B, F>;
+
+    #[inline(always)]
+    fn fork(&mut self) -> Self {
+        Self {
+            offset: self.offset,
+            handle: self.handle.fork(),
+            remaining_after: self.remaining_after,
+        }
+    }
+
+    #[inline(always)]
+    async fn next_token(mut self) -> Result<(Self, Self::Token), Self::Error> {
+        let (handle, tok) = next_dispatch(self.handle, &mut self.offset).await?;
+        Ok((
+            Self {
+                handle,
+                offset: self.offset,
+                remaining_after: self.remaining_after,
+            },
+            tok,
+        ))
+    }
+
+    #[inline(always)]
+    fn into_sub_deserializer(self, token: Self::Token) -> Self::SubDeserializer {
+        ChunkedMsgpackSubDeserializer::new(self.handle, self.offset, token)
+    }
+
+    #[inline(always)]
+    async fn skip_token(mut self, token: Self::Token) -> Result<Self, Self::Error> {
+        let handle = skip_value_chunked(self.handle, &mut self.offset, token).await?;
+        Ok(Self {
+            handle,
+            offset: self.offset,
+            remaining_after: self.remaining_after,
+        })
+    }
+
+    #[inline(always)]
+    fn remaining_after(&self) -> Option<usize> {
+        // Msgpack maps are always definite-length (fixmap/map16/map32 all
+        // carry an explicit pair count) — `None` never occurs.
+        Some(self.remaining_after)
+    }
+
+    #[inline(always)]
+    fn with_remaining_after(mut self, remaining: Option<usize>) -> Self {
+        self.remaining_after = remaining.expect("msgpack maps are always definite-length");
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +902,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
     type StrChunks = access::ChunkedMsgpackStrAccess<'s, B, F>;
     type BytesChunks = access::ChunkedMsgpackBytesAccess<'s, B, F>;
     type NumberChunks<Enc: NumberEncoding> = ChunkedMsgpackNumberAccess<'s, B, F>;
-    type Map = access::ChunkedMsgpackMapAccess<'s, B, F>;
+    type Map = strede::PairSeqMapAccess<ChunkedMsgpackClaim<'s, B, F>>;
     type Seq = access::ChunkedMsgpackSeqAccess<'s, B, F>;
     type Enum = ChunkedMsgpackEnumAccess<'s, B, F>;
     #[inline(always)]
@@ -878,7 +940,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
         }
     }
 
-    async fn deserialize_number_chunks<Enc: NumberEncoding>(self) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
         if Enc::NAME != BigEndian::NAME {
             return Ok(Probe::Miss);
         }
@@ -905,11 +969,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedMsgpackEntry<'s
     #[inline(always)]
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
         match self.token {
-            MsgpackToken::Map(count) => Ok(Probe::Hit(access::ChunkedMsgpackMapAccess {
-                handle: self.handle,
-                offset: self.offset,
-                remaining: count,
-            })),
+            MsgpackToken::Map(count) => Ok(Probe::Hit(strede::PairSeqMapAccess::new(
+                ChunkedMsgpackClaim {
+                    handle: self.handle,
+                    offset: self.offset,
+                    remaining_after: 0,
+                },
+                Some(count),
+            ))),
             _ => Ok(Probe::Miss),
         }
     }
@@ -1051,8 +1118,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
             }));
         }
         let bytes: &[u8] = match &self.token {
-            MsgpackToken::UFixInt(b) | MsgpackToken::UInt8(b)
-            | MsgpackToken::IFixInt(b) | MsgpackToken::Int8(b) => b.as_slice(),
+            MsgpackToken::UFixInt(b)
+            | MsgpackToken::UInt8(b)
+            | MsgpackToken::IFixInt(b)
+            | MsgpackToken::Int8(b) => b.as_slice(),
             MsgpackToken::UInt16(b) | MsgpackToken::Int16(b) => b.as_slice(),
             MsgpackToken::UInt32(b) | MsgpackToken::Int32(b) => b.as_slice(),
             MsgpackToken::UInt64(b) | MsgpackToken::Int64(b) => b.as_slice(),
@@ -1124,7 +1193,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         use access::ChunkedMsgpackStrAccess;
@@ -1185,11 +1256,15 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: DeserializeOwned<Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
-        use access::ChunkedMsgpackKeyProbe;
-        use strede::{MapKeyClaimOwned as _, MapKeyProbeOwned as _, MapValueClaimOwned as _, MapValueProbeOwned as _};
+        use strede::{
+            MapKeyClaimOwned as _, MapKeyProbeOwned as _, MapValueClaimOwned as _,
+            MapValueProbeOwned as _, PairSeqKeyProbe,
+        };
 
         // Expect a single-key map {"VariantName": <payload>}.
         let count = match self.token {
@@ -1199,8 +1274,13 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
 
         let mut offset = self.offset;
         let (handle, key_tok) = next_dispatch(self.handle, &mut offset).await?;
+        let cursor = ChunkedMsgpackClaim {
+            handle,
+            offset,
+            remaining_after: 0,
+        };
 
-        let key_probe = ChunkedMsgpackKeyProbe::new(handle, key_tok, offset, count - 1);
+        let key_probe = PairSeqKeyProbe::new(cursor, key_tok, Some(count - 1));
 
         let (key_claim, MatchVals(idx, _)) = match key_probe
             .deserialize_key::<MatchVals<usize, W>>(candidates)

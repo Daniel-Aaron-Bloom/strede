@@ -446,64 +446,85 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedJsonMapAcce
     type KeyProbe = ChunkedJsonKeyProbe<'s, B, F>;
 
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
-        mut self,
-        mut arms: S,
+        self,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        let mut pending: Option<Token> = None;
-        let start_offset = self.offset;
-        let (handle, tok) = next_dispatch(
-            self.handle,
-            &mut self.tokenizer,
-            &mut self.offset,
-            &mut pending,
-        )
-        .await?;
+        json_map_iterate_owned(self, arms).await
+    }
 
-        let mut key_probe = match tok {
-            Token::Simple(SimpleToken::ObjectEnd, t) => {
-                // Empty map.
-                let claim = ChunkedJsonClaim {
-                    tokenizer: t,
-                    offset: self.offset,
-                    handle,
-                };
-                return Ok(Probe::Hit((claim, arms.take_outputs())));
-            }
-            key_tok => ChunkedJsonKeyProbe {
+    async fn iterate_dyn<S: MapArmStackOwned<Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        json_map_iterate_owned(self, arms).await
+    }
+}
+
+/// Shared body for [`MapAccessOwned::iterate`] / [`MapAccessOwned::iterate_dyn`]
+/// — JSON objects are wire-identical for structs and dynamic collections
+/// (both are just `{"key": value, ...}`), so both trait methods delegate here
+/// rather than one calling the other.
+async fn json_map_iterate_owned<'s, B: Buffer, F: AsyncFnMut(&mut B), S>(
+    mut map: ChunkedJsonMapAccessOwned<'s, B, F>,
+    mut arms: S,
+) -> Result<Probe<(ChunkedJsonClaim<'s, B, F>, S::Outputs)>, JsonError>
+where
+    S: MapArmStackOwned<ChunkedJsonKeyProbe<'s, B, F>>,
+{
+    let mut pending: Option<Token> = None;
+    let start_offset = map.offset;
+    let (handle, tok) = next_dispatch(
+        map.handle,
+        &mut map.tokenizer,
+        &mut map.offset,
+        &mut pending,
+    )
+    .await?;
+
+    let mut key_probe = match tok {
+        Token::Simple(SimpleToken::ObjectEnd, t) => {
+            // Empty map.
+            let claim = ChunkedJsonClaim {
+                tokenizer: t,
+                offset: map.offset,
                 handle,
-                key_tok,
-                tokenizer: self.tokenizer,
-                offset: self.offset,
-                start_offset,
-            },
+            };
+            return Ok(Probe::Hit((claim, arms.take_outputs())));
+        }
+        key_tok => ChunkedJsonKeyProbe {
+            handle,
+            key_tok,
+            tokenizer: map.tokenizer,
+            offset: map.offset,
+            start_offset,
+        },
+    };
+
+    loop {
+        // Race all arms' key callbacks against this round's key probe.
+        let value_claim: ChunkedJsonClaim<'s, B, F> = match arms.race_keys(key_probe).await? {
+            Probe::Hit((arm_index, key_claim)) => {
+                // A known arm matched. Convert key claim → value probe.
+                let vp: ChunkedJsonValueProbe<'s, B, F> = key_claim.into_value_probe().await?;
+                match arms.dispatch_value(arm_index, vp).await? {
+                    Probe::Hit((vc, ())) => vc,
+                    Probe::Miss => return Ok(Probe::Miss),
+                }
+            }
+            Probe::Miss => {
+                // No arm matched this key - whole map is a Miss.
+                return Ok(Probe::Miss);
+            }
         };
 
-        loop {
-            // Race all arms' key callbacks against this round's key probe.
-            let value_claim: ChunkedJsonClaim<'s, B, F> = match arms.race_keys(key_probe).await? {
-                Probe::Hit((arm_index, key_claim)) => {
-                    // A known arm matched. Convert key claim → value probe.
-                    let vp: ChunkedJsonValueProbe<'s, B, F> = key_claim.into_value_probe().await?;
-                    match arms.dispatch_value(arm_index, vp).await? {
-                        Probe::Hit((vc, ())) => vc,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    }
-                }
-                Probe::Miss => {
-                    // No arm matched this key - whole map is a Miss.
-                    return Ok(Probe::Miss);
-                }
-            };
-
-            // Advance to next key or end of map.
-            match value_claim
-                .next_key(arms.unsatisfied_count(), arms.open_count())
-                .await?
-            {
-                strede::NextKey::Entry(next_kp) => key_probe = next_kp,
-                strede::NextKey::Done(map_claim) => {
-                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                }
+        // Advance to next key or end of map.
+        match value_claim
+            .next_key(arms.unsatisfied_count(), arms.open_count())
+            .await?
+        {
+            strede::NextKey::Entry(next_kp) => key_probe = next_kp,
+            strede::NextKey::Done(map_claim) => {
+                return Ok(Probe::Hit((map_claim, arms.take_outputs())));
             }
         }
     }

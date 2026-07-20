@@ -95,6 +95,17 @@ pub fn build_map(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Build an indefinite-length map (header `0xbf` + pairs + break `0xff`)
+pub fn build_map_indef(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = vec![0xbf];
+    for (k, v) in pairs {
+        out.extend_from_slice(k);
+        out.extend_from_slice(v);
+    }
+    out.push(0xff);
+    out
+}
+
 /// Encode a semantic tag
 pub fn tag(number: u64) -> Vec<u8> {
     encode_head(6, number as usize)

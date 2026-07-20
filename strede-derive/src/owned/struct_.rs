@@ -117,6 +117,7 @@ pub(super) fn expand_owned(
         // Build generics with DeserializeOwned bound only for the transparent field.
         let mut impl_gen = input.generics.clone();
         insert_d_owned(&mut impl_gen, krate);
+        let d_ident = format_ident!("__D");
         {
             let wc = impl_gen.make_where_clause();
             if let Some(preds) = &container_attrs.bound {
@@ -134,14 +135,22 @@ pub(super) fn expand_owned(
                     transparent_ty,
                     &transparent_cf.bound,
                     has_custom,
-                    |ty| field_bound_owned(krate, ty, FieldContext::Direct),
+                    |ty| field_bound_owned(krate, ty, FieldContext::Direct, &d_ident),
                 );
                 if let Some(ft) = &transparent_cf.from {
-                    wc.predicates
-                        .push(field_bound_owned(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_owned(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 } else if let Some(ft) = &transparent_cf.try_from {
-                    wc.predicates
-                        .push(field_bound_owned(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_owned(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 }
             }
         }
@@ -997,7 +1006,7 @@ pub(super) fn expand_owned(
                 fn wire_names() -> Self::WireNames {
                     #wire_names_body_tokens
                 }
-                fn make_arms() -> impl #krate::MapArmStackOwned<__KP, Outputs = Self::Outputs> {
+                fn make_arms() -> impl #krate::MapArmStackOwned<__KP, Outputs = Self::Outputs, Dynamic = #krate::False> {
                     #make_arms_body_tokens
                 }
                 fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {

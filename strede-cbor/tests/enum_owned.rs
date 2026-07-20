@@ -81,11 +81,7 @@ fn struct_variant_move() {
         (&helpers::tstr("x"), &[helpers::uint_small(3)]),
         (&helpers::tstr("y"), &[helpers::uint_small(7)]),
     ]);
-    let outer = concat(&[
-        &helpers::map(1),
-        &helpers::tstr("Move"),
-        &inner,
-    ]);
+    let outer = concat(&[&helpers::map(1), &helpers::tstr("Move"), &inner]);
     assert_eq!(parse!(Event, &outer), Some(Event::Move { x: 3, y: 7 }));
 }
 
@@ -97,6 +93,48 @@ fn newtype_variant_wrap() {
         &helpers::uint8(42),
     ]);
     assert_eq!(parse!(Event, &outer), Some(Event::Wrap(42)));
+}
+
+#[test]
+fn struct_variant_move_indefinite_inner_map() {
+    // Inner map (struct fields) is indefinite-length; outer single-key map stays definite.
+    let inner = helpers::build_map_indef(&[
+        (&helpers::tstr("x"), &[helpers::uint_small(3)]),
+        (&helpers::tstr("y"), &[helpers::uint_small(7)]),
+    ]);
+    let outer = concat(&[&helpers::map(1), &helpers::tstr("Move"), &inner]);
+    assert_eq!(parse!(Event, &outer), Some(Event::Move { x: 3, y: 7 }));
+}
+
+#[test]
+fn struct_variant_move_indefinite_outer_map() {
+    // Outer single-key map (variant dispatch via `deserialize_payload_by_name`)
+    // is indefinite-length; exercises the Break-terminated enum-payload path.
+    let inner = helpers::build_map(&[
+        (&helpers::tstr("x"), &[helpers::uint_small(3)]),
+        (&helpers::tstr("y"), &[helpers::uint_small(7)]),
+    ]);
+    let outer = concat(&[&[0xbf], &helpers::tstr("Move"), &inner, &[0xff]]);
+    assert_eq!(parse!(Event, &outer), Some(Event::Move { x: 3, y: 7 }));
+}
+
+#[test]
+fn struct_variant_move_indefinite_both_maps() {
+    let inner = helpers::build_map_indef(&[
+        (&helpers::tstr("x"), &[helpers::uint_small(3)]),
+        (&helpers::tstr("y"), &[helpers::uint_small(7)]),
+    ]);
+    let outer = concat(&[&[0xbf], &helpers::tstr("Move"), &inner, &[0xff]]);
+    assert_eq!(parse!(Event, &outer), Some(Event::Move { x: 3, y: 7 }));
+}
+
+#[test]
+fn empty_indefinite_map_misses_required_fields() {
+    // An indefinite map with zero pairs (immediate break) must not satisfy
+    // Move's required x/y fields.
+    let inner = helpers::build_map_indef(&[]);
+    let outer = concat(&[&helpers::map(1), &helpers::tstr("Move"), &inner]);
+    assert_eq!(parse!(Event, &outer), None);
 }
 
 #[test]
@@ -150,9 +188,7 @@ fn internally_tagged_rect() {
 
 #[test]
 fn internally_tagged_unknown_misses() {
-    let enc = helpers::build_map(&[
-        (&helpers::tstr("type"), &helpers::tstr("Triangle")),
-    ]);
+    let enc = helpers::build_map(&[(&helpers::tstr("type"), &helpers::tstr("Triangle"))]);
     assert_eq!(parse!(Shape, &enc), None);
 }
 
@@ -169,17 +205,13 @@ enum Tagged {
 
 #[test]
 fn adjacently_tagged_unit() {
-    let enc = helpers::build_map(&[
-        (&helpers::tstr("t"), &helpers::tstr("Unit")),
-    ]);
+    let enc = helpers::build_map(&[(&helpers::tstr("t"), &helpers::tstr("Unit"))]);
     assert_eq!(parse!(Tagged, &enc), Some(Tagged::Unit));
 }
 
 #[test]
 fn adjacently_tagged_payload() {
-    let content = helpers::build_map(&[
-        (&helpers::tstr("n"), &[helpers::uint_small(7)]),
-    ]);
+    let content = helpers::build_map(&[(&helpers::tstr("n"), &[helpers::uint_small(7)])]);
     let enc = helpers::build_map(&[
         (&helpers::tstr("t"), &helpers::tstr("Payload")),
         (&helpers::tstr("c"), &content),
@@ -189,9 +221,7 @@ fn adjacently_tagged_payload() {
 
 #[test]
 fn adjacently_tagged_content_before_tag() {
-    let content = helpers::build_map(&[
-        (&helpers::tstr("n"), &[helpers::uint_small(3)]),
-    ]);
+    let content = helpers::build_map(&[(&helpers::tstr("n"), &[helpers::uint_small(3)])]);
     let enc = helpers::build_map(&[
         (&helpers::tstr("c"), &content),
         (&helpers::tstr("t"), &helpers::tstr("Payload")),
@@ -212,8 +242,14 @@ enum Status {
 
 #[test]
 fn rename_all_snake_case() {
-    assert_eq!(parse!(Status, &helpers::tstr("is_active")), Some(Status::IsActive));
-    assert_eq!(parse!(Status, &helpers::tstr("not_found")), Some(Status::NotFound));
+    assert_eq!(
+        parse!(Status, &helpers::tstr("is_active")),
+        Some(Status::IsActive)
+    );
+    assert_eq!(
+        parse!(Status, &helpers::tstr("not_found")),
+        Some(Status::NotFound)
+    );
     assert_eq!(parse!(Status, &helpers::tstr("IsActive")), None);
 }
 
@@ -230,10 +266,16 @@ enum WithOther {
 
 #[test]
 fn other_variant_known() {
-    assert_eq!(parse!(WithOther, &helpers::tstr("Known")), Some(WithOther::Known));
+    assert_eq!(
+        parse!(WithOther, &helpers::tstr("Known")),
+        Some(WithOther::Known)
+    );
 }
 
 #[test]
 fn other_variant_catches_unknown() {
-    assert_eq!(parse!(WithOther, &helpers::tstr("Anything")), Some(WithOther::Unknown));
+    assert_eq!(
+        parse!(WithOther, &helpers::tstr("Anything")),
+        Some(WithOther::Unknown)
+    );
 }

@@ -117,7 +117,11 @@ fn suffix_outer_then_inner_then_suffix() {
     ]);
     assert_eq!(
         parse::<OuterWithSuffix>(&msg),
-        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+        Some(OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        })
     );
 }
 
@@ -131,7 +135,11 @@ fn suffix_interleaved() {
     ]);
     assert_eq!(
         parse::<OuterWithSuffix>(&msg),
-        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+        Some(OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        })
     );
 }
 

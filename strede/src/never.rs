@@ -251,6 +251,13 @@ impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> MapAccess<'de> for crate::
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
         match self.0 {}
     }
+
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        _arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        match self.0 {}
+    }
 }
 
 impl<'n: 'de, 'de, C: 'de, E: DeserializeError + 'de> MapKeyProbe<'de> for crate::Never<'n, C, E> {
@@ -526,6 +533,13 @@ impl<'n, C, E: DeserializeError> MapAccessOwned for crate::Never<'n, C, E> {
     type MapClaim = C;
     type KeyProbe = crate::Never<'n, C, E>;
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
+        self,
+        _arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        match self.0 {}
+    }
+
+    async fn iterate_dyn<S: MapArmStackOwned<Self::KeyProbe>>(
         self,
         _arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {

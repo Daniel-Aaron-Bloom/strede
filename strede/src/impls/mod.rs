@@ -25,6 +25,7 @@ use core::marker::PhantomData;
 
 mod flat_source;
 mod maps;
+mod pair_seq_map;
 mod sequences;
 pub mod string_enum;
 mod strings;
@@ -32,5 +33,6 @@ mod tag_flatten;
 mod utility;
 
 pub use flat_source::{MapFieldProvider, MapFieldProviderOwned};
+pub use pair_seq_map::{PairSeqKeyProbe, PairSeqMapAccess, PairSeqValueProbe, PairStep, RawSlot};
 pub use tag_flatten::{TagAwareMap, TagAwareMapOwned};
 pub use utility::{Match, MatchVals, Skip, UnwrapOrElse};

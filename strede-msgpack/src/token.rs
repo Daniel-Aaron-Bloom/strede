@@ -77,9 +77,7 @@ macro_rules! read_raw {
 /// Read a multi-byte big-endian integer of size `N` from `src`, advancing it.
 /// Returns `Err(UnexpectedEnd)` if fewer than `N` bytes remain.
 macro_rules! read_be {
-    ($src:expr, $n:literal, $t:ty) => {{
-        <$t>::from_be_bytes(read_raw!($src, $n))
-    }};
+    ($src:expr, $n:literal, $t:ty) => {{ <$t>::from_be_bytes(read_raw!($src, $n)) }};
 }
 
 /// Read the next MessagePack token from `src`, advancing it past the header

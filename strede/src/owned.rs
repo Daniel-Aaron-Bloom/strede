@@ -2,8 +2,8 @@ use const_array_concat::ConcatableArray;
 use core::future::Future;
 
 pub use crate::map_arm::{
-    ArmState, DetectDuplicates, MapArm, MapArmBase, MapArmSlot, NextKey, StackConcat,
-    TagInjectingStack, VirtualArmSlot,
+    ArmState, DetectDuplicates, False, MapArm, MapArmBase, MapArmSlot, NextKey, StackConcat,
+    TagInjectingStack, True, VirtualArmSlot,
 };
 use crate::borrow::{Ascii, NumberEncoding};
 use crate::{Chunk, DeserializeError, Probe};
@@ -493,11 +493,26 @@ pub trait MapAccessOwned: Sized {
     type MapClaim;
     type KeyProbe: MapKeyProbeOwned<Error = Self::Error>;
 
-    /// Drive the map iteration with the given arm stack.
+    /// Drive the map iteration with the given arm stack, for a fixed
+    /// compile-time field set (structs, enums) whose end is signaled by the
+    /// arm stack becoming satisfied. See [`crate::MapArmStackOwned::Dynamic`].
     ///
     /// Returns `Hit((MapClaim, Outputs))` on success, `Miss` if a value
     /// type mismatched or a required field was missing, `Err` on format errors.
     async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;
+
+    /// Drive the map iteration for an unbounded/runtime-sized collection
+    /// (e.g. HashMap's `CollectMap`) rather than a fixed schema — see
+    /// [`crate::MapArmStackOwned::Dynamic`]. No default: most formats' maps
+    /// are wire-uniform regardless of consumer shape, in which case both this
+    /// and [`Self::iterate`] should delegate to one shared helper rather than
+    /// one calling the other. Formats with a genuinely different wire shape
+    /// for schema-less collections give this a real, different implementation
+    /// instead.
+    async fn iterate_dyn<S: MapArmStackOwned<Self::KeyProbe>>(
         self,
         arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;

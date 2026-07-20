@@ -4,7 +4,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::{
-    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicates,
+    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicates, False,
     MapArmBase, MapArmSlot, SlotDispatchProj, SlotDispatchState, SlotRaceState, StackConcat,
     TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
     WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
@@ -35,6 +35,14 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
     /// tag-inject) do not contribute. Used to compute positional field indices
     /// for formats like postcard that identify fields by position rather than name.
     const FIELD_COUNT: usize;
+
+    /// [`crate::True`] for arm stacks representing an unbounded/runtime-sized
+    /// collection (e.g. HashMap's `CollectMap`) that requires the format to
+    /// read an explicit wire-level length before iterating; [`crate::False`]
+    /// for a fixed compile-time field set (structs, enums) whose end is
+    /// signaled by the arm stack becoming satisfied. No default: every impl
+    /// must pick one explicitly. See [`crate::MapArmStack::Dynamic`].
+    type Dynamic;
 
     /// Left-nested tuple of `Option<(K, V)>` for each arm.
     type Outputs;
@@ -157,6 +165,7 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
 impl<KP: MapKeyProbeOwned> MapArmStackOwned<KP> for MapArmBase {
     const SIZE: usize = 0;
     const FIELD_COUNT: usize = 0;
+    type Dynamic = False;
     type Outputs = ();
 
     #[inline(always)]
@@ -222,6 +231,7 @@ where
 {
     const SIZE: usize = Rest::SIZE + 1;
     const FIELD_COUNT: usize = Rest::FIELD_COUNT + 1;
+    type Dynamic = Rest::Dynamic;
     type Outputs = (Rest::Outputs, Option<(K, V)>);
 
     #[inline(always)]
@@ -333,6 +343,7 @@ where
 {
     const SIZE: usize = Rest::SIZE + 1;
     const FIELD_COUNT: usize = Rest::FIELD_COUNT;
+    type Dynamic = Rest::Dynamic;
     type Outputs = Rest::Outputs;
 
     #[inline(always)]
@@ -434,6 +445,7 @@ where
 {
     const SIZE: usize = S::SIZE + 1;
     const FIELD_COUNT: usize = S::FIELD_COUNT;
+    type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -529,6 +541,7 @@ where
 {
     const SIZE: usize = S::SIZE + 1;
     const FIELD_COUNT: usize = S::FIELD_COUNT;
+    type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -621,10 +634,14 @@ impl<KP, A, B> MapArmStackOwned<KP> for StackConcat<A, B>
 where
     KP: MapKeyProbeOwned,
     A: MapArmStackOwned<KP>,
-    B: MapArmStackOwned<KP>,
+    // Enforced at the type level, not via a runtime/const-eval assertion:
+    // a StackConcat mixing a DYNAMIC (unbounded collection) side with a
+    // non-DYNAMIC side simply fails to type-check.
+    B: MapArmStackOwned<KP, Dynamic = A::Dynamic>,
 {
     const SIZE: usize = A::SIZE + B::SIZE;
     const FIELD_COUNT: usize = A::FIELD_COUNT + B::FIELD_COUNT;
+    type Dynamic = A::Dynamic;
     type Outputs = (A::Outputs, B::Outputs);
 
     #[inline(always)]

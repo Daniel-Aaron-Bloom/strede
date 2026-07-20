@@ -110,56 +110,104 @@ impl_parse_num_sint!(i8, i16, i32, i64);
 
 impl ParseNum for f32 {
     #[inline(always)]
-    fn from_ufixint(v: [u8; 1]) -> Option<Self> { Some(v[0] as f32) }
+    fn from_ufixint(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as f32)
+    }
     #[inline(always)]
-    fn from_uint8(v: [u8; 1]) -> Option<Self> { Some(v[0] as f32) }
+    fn from_uint8(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as f32)
+    }
     #[inline(always)]
-    fn from_uint16(v: [u8; 2]) -> Option<Self> { Some(u16::from_be_bytes(v) as f32) }
+    fn from_uint16(v: [u8; 2]) -> Option<Self> {
+        Some(u16::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_uint32(v: [u8; 4]) -> Option<Self> { Some(u32::from_be_bytes(v) as f32) }
+    fn from_uint32(v: [u8; 4]) -> Option<Self> {
+        Some(u32::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_uint64(v: [u8; 8]) -> Option<Self> { Some(u64::from_be_bytes(v) as f32) }
+    fn from_uint64(v: [u8; 8]) -> Option<Self> {
+        Some(u64::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_ifixint(v: [u8; 1]) -> Option<Self> { Some(v[0] as i8 as f32) }
+    fn from_ifixint(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as i8 as f32)
+    }
     #[inline(always)]
-    fn from_int8(v: [u8; 1]) -> Option<Self> { Some(v[0] as i8 as f32) }
+    fn from_int8(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as i8 as f32)
+    }
     #[inline(always)]
-    fn from_int16(v: [u8; 2]) -> Option<Self> { Some(i16::from_be_bytes(v) as f32) }
+    fn from_int16(v: [u8; 2]) -> Option<Self> {
+        Some(i16::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_int32(v: [u8; 4]) -> Option<Self> { Some(i32::from_be_bytes(v) as f32) }
+    fn from_int32(v: [u8; 4]) -> Option<Self> {
+        Some(i32::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_int64(v: [u8; 8]) -> Option<Self> { Some(i64::from_be_bytes(v) as f32) }
+    fn from_int64(v: [u8; 8]) -> Option<Self> {
+        Some(i64::from_be_bytes(v) as f32)
+    }
     #[inline(always)]
-    fn from_f32(v: f32) -> Option<Self> { Some(v) }
+    fn from_f32(v: f32) -> Option<Self> {
+        Some(v)
+    }
     #[inline(always)]
-    fn from_f64(v: f64) -> Option<Self> { Some(v as f32) }
+    fn from_f64(v: f64) -> Option<Self> {
+        Some(v as f32)
+    }
 }
 
 impl ParseNum for f64 {
     #[inline(always)]
-    fn from_ufixint(v: [u8; 1]) -> Option<Self> { Some(v[0] as f64) }
+    fn from_ufixint(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as f64)
+    }
     #[inline(always)]
-    fn from_uint8(v: [u8; 1]) -> Option<Self> { Some(v[0] as f64) }
+    fn from_uint8(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as f64)
+    }
     #[inline(always)]
-    fn from_uint16(v: [u8; 2]) -> Option<Self> { Some(u16::from_be_bytes(v) as f64) }
+    fn from_uint16(v: [u8; 2]) -> Option<Self> {
+        Some(u16::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_uint32(v: [u8; 4]) -> Option<Self> { Some(u32::from_be_bytes(v) as f64) }
+    fn from_uint32(v: [u8; 4]) -> Option<Self> {
+        Some(u32::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_uint64(v: [u8; 8]) -> Option<Self> { Some(u64::from_be_bytes(v) as f64) }
+    fn from_uint64(v: [u8; 8]) -> Option<Self> {
+        Some(u64::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_ifixint(v: [u8; 1]) -> Option<Self> { Some(v[0] as i8 as f64) }
+    fn from_ifixint(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as i8 as f64)
+    }
     #[inline(always)]
-    fn from_int8(v: [u8; 1]) -> Option<Self> { Some(v[0] as i8 as f64) }
+    fn from_int8(v: [u8; 1]) -> Option<Self> {
+        Some(v[0] as i8 as f64)
+    }
     #[inline(always)]
-    fn from_int16(v: [u8; 2]) -> Option<Self> { Some(i16::from_be_bytes(v) as f64) }
+    fn from_int16(v: [u8; 2]) -> Option<Self> {
+        Some(i16::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_int32(v: [u8; 4]) -> Option<Self> { Some(i32::from_be_bytes(v) as f64) }
+    fn from_int32(v: [u8; 4]) -> Option<Self> {
+        Some(i32::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_int64(v: [u8; 8]) -> Option<Self> { Some(i64::from_be_bytes(v) as f64) }
+    fn from_int64(v: [u8; 8]) -> Option<Self> {
+        Some(i64::from_be_bytes(v) as f64)
+    }
     #[inline(always)]
-    fn from_f32(v: f32) -> Option<Self> { Some(v as f64) }
+    fn from_f32(v: f32) -> Option<Self> {
+        Some(v as f64)
+    }
     #[inline(always)]
-    fn from_f64(v: f64) -> Option<Self> { Some(v) }
+    fn from_f64(v: f64) -> Option<Self> {
+        Some(v)
+    }
 }
 
 // ---------------------------------------------------------------------------

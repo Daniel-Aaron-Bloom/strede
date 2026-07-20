@@ -14,14 +14,14 @@
 #[cfg(not(feature = "arbitrary_precision"))]
 use core::marker::PhantomData;
 
+use strede::Ascii;
 #[cfg(all(feature = "arbitrary_precision", feature = "alloc"))]
 use strede::Chunk;
 #[cfg(not(feature = "arbitrary_precision"))]
 use strede::borrow::{Deserialize, Deserializer, Entry};
-use strede::owned::{DeserializeOwned, DeserializerOwned, EntryOwned};
 #[cfg(feature = "arbitrary_precision")]
 use strede::owned::NumberAccessOwned;
-use strede::Ascii;
+use strede::owned::{DeserializeOwned, DeserializerOwned, EntryOwned};
 #[cfg(not(all(feature = "arbitrary_precision", feature = "alloc")))]
 use strede::select_probe;
 use strede::{Probe, hit};

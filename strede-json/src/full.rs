@@ -822,56 +822,74 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'de> {
 
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        mut arms: S,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        // Get the first key probe (or end-of-map for empty maps).
-        let mut key_probe_opt: Option<JsonMapKeyProbe<'de>> = {
-            let mut src = self.src;
-            let tok = self.tokenizer;
-            let start_src = src;
-            match tok.next_token(&mut src) {
-                Ok(Token::Simple(SimpleToken::ObjectEnd, new_tok)) => {
-                    // Empty map.
-                    return Ok(Probe::Hit((
-                        JsonClaim {
-                            tokenizer: new_tok,
-                            src,
-                        },
-                        arms.take_outputs(),
-                    )));
-                }
-                Ok(key_tok) => Some(JsonMapKeyProbe {
-                    src,
-                    start_src,
-                    key_tok,
-                }),
-                Err(e) => return Err(e),
+        json_map_iterate(self, arms).await
+    }
+
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        json_map_iterate(self, arms).await
+    }
+}
+
+/// Shared body for [`MapAccess::iterate`] / [`MapAccess::iterate_dyn`] — JSON
+/// objects are wire-identical for structs and dynamic collections (both are
+/// just `{"key": value, ...}`), so both trait methods delegate here rather
+/// than one calling the other.
+async fn json_map_iterate<'de, S: MapArmStack<'de, JsonMapKeyProbe<'de>>>(
+    map: JsonMapAccess<'de>,
+    mut arms: S,
+) -> Result<Probe<(JsonClaim<'de>, S::Outputs)>, JsonError> {
+    // Get the first key probe (or end-of-map for empty maps).
+    let mut key_probe_opt: Option<JsonMapKeyProbe<'de>> = {
+        let mut src = map.src;
+        let tok = map.tokenizer;
+        let start_src = src;
+        match tok.next_token(&mut src) {
+            Ok(Token::Simple(SimpleToken::ObjectEnd, new_tok)) => {
+                // Empty map.
+                return Ok(Probe::Hit((
+                    JsonClaim {
+                        tokenizer: new_tok,
+                        src,
+                    },
+                    arms.take_outputs(),
+                )));
             }
+            Ok(key_tok) => Some(JsonMapKeyProbe {
+                src,
+                start_src,
+                key_tok,
+            }),
+            Err(e) => return Err(e),
+        }
+    };
+
+    loop {
+        let key_probe = match key_probe_opt.take() {
+            Some(kp) => kp,
+            None => unreachable!(),
         };
 
-        loop {
-            let key_probe = match key_probe_opt.take() {
-                Some(kp) => kp,
-                None => unreachable!(),
-            };
-
-            match arms.race_keys(key_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit((arm_index, key_claim)) => {
-                    let value_probe = key_claim.into_value_probe().await?;
-                    match arms.dispatch_value(arm_index, value_probe).await? {
-                        Probe::Miss => return Ok(Probe::Miss),
-                        Probe::Hit((value_claim, ())) => {
-                            match value_claim
-                                .next_key(arms.unsatisfied_count(), arms.open_count())
-                                .await?
-                            {
-                                strede::NextKey::Done(map_claim) => {
-                                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                                }
-                                strede::NextKey::Entry(next_kp) => {
-                                    key_probe_opt = Some(next_kp);
-                                }
+        match arms.race_keys(key_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit((arm_index, key_claim)) => {
+                let value_probe = key_claim.into_value_probe().await?;
+                match arms.dispatch_value(arm_index, value_probe).await? {
+                    Probe::Miss => return Ok(Probe::Miss),
+                    Probe::Hit((value_claim, ())) => {
+                        match value_claim
+                            .next_key(arms.unsatisfied_count(), arms.open_count())
+                            .await?
+                        {
+                            strede::NextKey::Done(map_claim) => {
+                                return Ok(Probe::Hit((map_claim, arms.take_outputs())));
+                            }
+                            strede::NextKey::Entry(next_kp) => {
+                                key_probe_opt = Some(next_kp);
                             }
                         }
                     }
@@ -1241,7 +1259,9 @@ impl<'de> EnumVariantProbe<'de> for JsonEnumVariantProbe<'de> {
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         let entry = JsonEntry {
@@ -1259,7 +1279,9 @@ impl<'de> EnumVariantProbe<'de> for JsonEnumVariantProbe<'de> {
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Expect a single-key object `{"VariantName": <payload>}`.

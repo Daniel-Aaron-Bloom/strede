@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Data, DeriveInput};
 
 use crate::common::{
@@ -40,8 +40,12 @@ fn gen_container_from_borrow(
         if let Some(preds) = &container_attrs.bound {
             wc.predicates.extend(preds.iter().cloned());
         } else {
-            wc.predicates
-                .push(field_bound_borrow(krate, from_ty, FieldContext::Direct));
+            wc.predicates.push(field_bound_borrow(
+                krate,
+                from_ty,
+                FieldContext::Direct,
+                &format_ident!("__D"),
+            ));
         }
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();

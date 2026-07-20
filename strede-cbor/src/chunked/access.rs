@@ -2,16 +2,14 @@
 
 use super::{
     ChunkedCborClaim, ChunkedCborSubDeserializer, next_dispatch, refill, skip_value_chunked,
-    strip_tags_bignum_dispatch, strip_tags_dispatch,
+    strip_tags_bignum_dispatch,
 };
 use crate::CborError;
 use crate::token::CborToken;
 use core::future::Future;
 use strede::{
-    Buffer, BytesAccessOwned, Chunk, DeserializeOwned, Handle, MapAccessOwned,
-    MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned,
-    NextKey, NumberAccessOwned, NumberEncoding, Probe, SeqAccessOwned, SeqEntryOwned,
-    StrAccessOwned, hit, utils::repeat,
+    Buffer, BytesAccessOwned, Chunk, DeserializeOwned, Handle, NumberAccessOwned, NumberEncoding,
+    Probe, SeqAccessOwned, SeqEntryOwned, StrAccessOwned, hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,10 +17,14 @@ use strede::{
 // ---------------------------------------------------------------------------
 
 pub enum ChunkedStrState {
-    Definite { remaining: usize },
+    Definite {
+        remaining: usize,
+    },
     /// A definite-length sub-chunk inside an indefinite string; when remaining
     /// hits 0, transitions back to `Indefinite` instead of returning `Done`.
-    DefiniteInsideIndef { remaining: usize },
+    DefiniteInsideIndef {
+        remaining: usize,
+    },
     Indefinite,
 }
 
@@ -46,7 +48,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedCborStrAcce
                     return Ok(Chunk::Done(ChunkedCborClaim {
                         offset: self.offset,
                         handle: self.handle,
-                        remaining_after: 0,
+                        remaining_after: None,
                     }));
                 }
                 ChunkedStrState::DefiniteInsideIndef { remaining: 0 } => {
@@ -68,9 +70,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedCborStrAcce
                         let r = f(s);
                         self.offset += take;
                         self.state = match self.state {
-                            ChunkedStrState::Definite { .. } => {
-                                ChunkedStrState::Definite { remaining: remaining - take }
-                            }
+                            ChunkedStrState::Definite { .. } => ChunkedStrState::Definite {
+                                remaining: remaining - take,
+                            },
                             _ => ChunkedStrState::DefiniteInsideIndef {
                                 remaining: remaining - take,
                             },
@@ -81,15 +83,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedCborStrAcce
                     // loop to retry with fresh data
                 }
                 ChunkedStrState::Indefinite => {
-                    let (handle, chunk_tok) =
-                        next_dispatch(self.handle, &mut self.offset).await?;
+                    let (handle, chunk_tok) = next_dispatch(self.handle, &mut self.offset).await?;
                     self.handle = handle;
                     match chunk_tok {
                         CborToken::Break => {
                             return Ok(Chunk::Done(ChunkedCborClaim {
                                 offset: self.offset,
                                 handle: self.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             }));
                         }
                         CborToken::Tstr(0) => {
@@ -109,10 +110,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedCborStrAcce
 }
 
 pub enum ChunkedBytesState {
-    Definite { remaining: usize },
+    Definite {
+        remaining: usize,
+    },
     /// A definite-length sub-chunk inside an indefinite bytes sequence; when
     /// remaining hits 0, transitions back to `Indefinite` instead of `Done`.
-    DefiniteInsideIndef { remaining: usize },
+    DefiniteInsideIndef {
+        remaining: usize,
+    },
     Indefinite,
 }
 
@@ -136,7 +141,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedCborBytes
                     return Ok(Chunk::Done(ChunkedCborClaim {
                         offset: self.offset,
                         handle: self.handle,
-                        remaining_after: 0,
+                        remaining_after: None,
                     }));
                 }
                 ChunkedBytesState::DefiniteInsideIndef { remaining: 0 } => {
@@ -153,9 +158,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedCborBytes
                         let r = f(&self.handle.buf()[start..end]);
                         self.offset += take;
                         self.state = match self.state {
-                            ChunkedBytesState::Definite { .. } => {
-                                ChunkedBytesState::Definite { remaining: remaining - take }
-                            }
+                            ChunkedBytesState::Definite { .. } => ChunkedBytesState::Definite {
+                                remaining: remaining - take,
+                            },
                             _ => ChunkedBytesState::DefiniteInsideIndef {
                                 remaining: remaining - take,
                             },
@@ -166,15 +171,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> BytesAccessOwned for ChunkedCborBytes
                     // loop to retry with fresh data
                 }
                 ChunkedBytesState::Indefinite => {
-                    let (handle, chunk_tok) =
-                        next_dispatch(self.handle, &mut self.offset).await?;
+                    let (handle, chunk_tok) = next_dispatch(self.handle, &mut self.offset).await?;
                     self.handle = handle;
                     match chunk_tok {
                         CborToken::Break => {
                             return Ok(Chunk::Done(ChunkedCborClaim {
                                 offset: self.offset,
                                 handle: self.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             }));
                         }
                         CborToken::Bstr(len) => {
@@ -216,7 +220,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
                     return Ok(Chunk::Done(ChunkedCborClaim {
                         offset: self.offset,
                         handle: self.handle,
-                        remaining_after: 0,
+                        remaining_after: None,
                     }));
                 }
                 ChunkedBytesState::DefiniteInsideIndef { remaining: 0 } => {
@@ -232,9 +236,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
                         let r = f(Enc::from_bytes(&self.handle.buf()[start..end]));
                         self.offset += take;
                         self.state = match self.state {
-                            ChunkedBytesState::Definite { .. } => {
-                                ChunkedBytesState::Definite { remaining: remaining - take }
-                            }
+                            ChunkedBytesState::Definite { .. } => ChunkedBytesState::Definite {
+                                remaining: remaining - take,
+                            },
                             _ => ChunkedBytesState::DefiniteInsideIndef {
                                 remaining: remaining - take,
                             },
@@ -244,20 +248,18 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
                     self.handle = refill(self.handle, &mut self.offset).await?;
                 }
                 ChunkedBytesState::Indefinite => {
-                    let (handle, chunk_tok) =
-                        next_dispatch(self.handle, &mut self.offset).await?;
+                    let (handle, chunk_tok) = next_dispatch(self.handle, &mut self.offset).await?;
                     self.handle = handle;
                     match chunk_tok {
                         CborToken::Break => {
                             return Ok(Chunk::Done(ChunkedCborClaim {
                                 offset: self.offset,
                                 handle: self.handle,
-                                remaining_after: 0,
+                                remaining_after: None,
                             }));
                         }
                         CborToken::Bstr(len) => {
-                            self.state =
-                                ChunkedBytesState::DefiniteInsideIndef { remaining: len };
+                            self.state = ChunkedBytesState::DefiniteInsideIndef { remaining: len };
                         }
                         _ => return Err(CborError::UnexpectedByte { byte: 0 }),
                     }
@@ -268,276 +270,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
 }
 
 // ---------------------------------------------------------------------------
-// MapAccess
+// MapAccess — see `strede::PairSeqMapAccess` (generic over `RawSlot`,
+// implemented for `ChunkedCborClaim` in `mod.rs`). CBOR maps (definite or
+// `Break`-terminated indefinite) are wire-identical to "N pairs in a flat
+// stream", so the key/value probe quintet is generic infrastructure rather
+// than hand-rolled here.
 // ---------------------------------------------------------------------------
-
-pub struct ChunkedCborMapAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    pub(super) handle: Handle<'s, B, F>,
-    pub(super) offset: usize,
-    /// `Some(n)` = definite with n pairs remaining, `None` = indefinite
-    pub(super) remaining: Option<usize>,
-}
-
-pub struct ChunkedCborKeyProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'s, B, F>,
-    key_tok: CborToken,
-    offset: usize,
-    remaining_after: usize,
-}
-
-pub struct ChunkedCborValueProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
-    handle: Handle<'s, B, F>,
-    value_tok: CborToken,
-    offset: usize,
-    remaining_after: usize,
-    bignum_tag: Option<u64>,
-}
-
-// MapKeyClaimOwned and MapValueClaimOwned on ChunkedCborClaim
-
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyClaimOwned for ChunkedCborClaim<'s, B, F> {
-    type Error = CborError;
-    type MapClaim = ChunkedCborClaim<'s, B, F>;
-    type ValueProbe = ChunkedCborValueProbe<'s, B, F>;
-
-    async fn into_value_probe(mut self) -> Result<Self::ValueProbe, Self::Error> {
-        let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
-        let (handle, bignum_tag, value_tok) =
-            strip_tags_bignum_dispatch(handle, &mut self.offset, raw).await?;
-        Ok(ChunkedCborValueProbe {
-            handle,
-            value_tok,
-            offset: self.offset,
-            remaining_after: self.remaining_after,
-            bignum_tag,
-        })
-    }
-}
-
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueClaimOwned for ChunkedCborClaim<'s, B, F> {
-    type Error = CborError;
-    type KeyProbe = ChunkedCborKeyProbe<'s, B, F>;
-    type MapClaim = ChunkedCborClaim<'s, B, F>;
-
-    async fn next_key(
-        mut self,
-        _unsatisfied: usize,
-        _open: usize,
-    ) -> Result<NextKey<Self::KeyProbe, Self::MapClaim>, Self::Error> {
-        match self.remaining_after {
-            0 => Ok(NextKey::Done(ChunkedCborClaim {
-                offset: self.offset,
-                handle: self.handle,
-                remaining_after: 0,
-            })),
-            usize::MAX => {
-                // Indefinite: check for break
-                let (handle, tok) = next_dispatch(self.handle, &mut self.offset).await?;
-                self.handle = handle;
-                if matches!(tok, CborToken::Break) {
-                    return Ok(NextKey::Done(ChunkedCborClaim {
-                        offset: self.offset,
-                        handle: self.handle,
-                        remaining_after: 0,
-                    }));
-                }
-                let (handle, key_tok) =
-                    strip_tags_dispatch(self.handle, &mut self.offset, tok).await?;
-                Ok(NextKey::Entry(ChunkedCborKeyProbe {
-                    handle,
-                    key_tok,
-                    offset: self.offset,
-                    remaining_after: usize::MAX,
-                }))
-            }
-            n => {
-                let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
-                let (handle, key_tok) = strip_tags_dispatch(handle, &mut self.offset, raw).await?;
-                Ok(NextKey::Entry(ChunkedCborKeyProbe {
-                    handle,
-                    key_tok,
-                    offset: self.offset,
-                    remaining_after: n - 1,
-                }))
-            }
-        }
-    }
-}
-
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyProbeOwned for ChunkedCborKeyProbe<'s, B, F> {
-    type Error = CborError;
-    type KeyClaim = ChunkedCborClaim<'s, B, F>;
-    type KeySubDeserializer = ChunkedCborSubDeserializer<'s, B, F>;
-
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            key_tok: self.key_tok,
-            offset: self.offset,
-            remaining_after: self.remaining_after,
-        }
-    }
-
-    async fn deserialize_key<K>(
-        self,
-        extra: K::Extra,
-    ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error>
-    where
-        K: DeserializeOwned<Self::KeySubDeserializer>,
-    {
-        let sub = ChunkedCborSubDeserializer::new(self.handle, self.offset, self.key_tok);
-        match K::deserialize_owned(sub, extra).await? {
-            Probe::Hit((claim, k)) => Ok(Probe::Hit((
-                ChunkedCborClaim {
-                    handle: claim.handle,
-                    offset: claim.offset,
-                    remaining_after: self.remaining_after,
-                },
-                k,
-            ))),
-            Probe::Miss => Ok(Probe::Miss),
-        }
-    }
-}
-
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapValueProbeOwned for ChunkedCborValueProbe<'s, B, F> {
-    type Error = CborError;
-    type MapClaim = ChunkedCborClaim<'s, B, F>;
-    type ValueClaim = ChunkedCborClaim<'s, B, F>;
-    type ValueSubDeserializer = ChunkedCborSubDeserializer<'s, B, F>;
-    fn fork(&mut self) -> Self {
-        Self {
-            handle: self.handle.fork(),
-            value_tok: self.value_tok,
-            offset: self.offset,
-            remaining_after: self.remaining_after,
-            bignum_tag: self.bignum_tag,
-        }
-    }
-
-    async fn deserialize_value<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeOwned<Self::ValueSubDeserializer>,
-    {
-        let sub = ChunkedCborSubDeserializer::new_bignum(
-            self.handle,
-            self.offset,
-            self.value_tok,
-            self.bignum_tag,
-        );
-        match V::deserialize_owned(sub, extra).await? {
-            Probe::Hit((claim, v)) => Ok(Probe::Hit((
-                ChunkedCborClaim {
-                    handle: claim.handle,
-                    offset: claim.offset,
-                    remaining_after: self.remaining_after,
-                },
-                v,
-            ))),
-            Probe::Miss => Ok(Probe::Miss),
-        }
-    }
-
-    async fn skip(self) -> Result<Self::ValueClaim, Self::Error> {
-        let mut offset = self.offset;
-        let handle = skip_value_chunked(self.handle, &mut offset, self.value_tok).await?;
-        Ok(ChunkedCborClaim {
-            handle,
-            offset,
-            remaining_after: self.remaining_after,
-        })
-    }
-}
-
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedCborMapAccess<'s, B, F> {
-    type Error = CborError;
-    type MapClaim = ChunkedCborClaim<'s, B, F>;
-    type KeyProbe = ChunkedCborKeyProbe<'s, B, F>;
-
-    async fn iterate<S: MapArmStackOwned<Self::KeyProbe>>(
-        mut self,
-        mut arms: S,
-    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        // Build first key probe or return early for empty map
-        let mut key_probe_opt: Option<ChunkedCborKeyProbe<'s, B, F>> = match self.remaining {
-            Some(0) => {
-                return Ok(Probe::Hit((
-                    ChunkedCborClaim {
-                        offset: self.offset,
-                        handle: self.handle,
-                        remaining_after: 0,
-                    },
-                    arms.take_outputs(),
-                )));
-            }
-            Some(n) => {
-                let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
-                let (handle, key_tok) = strip_tags_dispatch(handle, &mut self.offset, raw).await?;
-                self.remaining = Some(n - 1);
-                Some(ChunkedCborKeyProbe {
-                    handle,
-                    key_tok,
-                    offset: self.offset,
-                    remaining_after: n - 1,
-                })
-            }
-            None => {
-                // Indefinite: check for immediate break
-                let (handle, tok) = next_dispatch(self.handle, &mut self.offset).await?;
-                self.handle = handle;
-                if matches!(tok, CborToken::Break) {
-                    return Ok(Probe::Hit((
-                        ChunkedCborClaim {
-                            offset: self.offset,
-                            handle: self.handle,
-                            remaining_after: 0,
-                        },
-                        arms.take_outputs(),
-                    )));
-                }
-                let (handle, key_tok) =
-                    strip_tags_dispatch(self.handle, &mut self.offset, tok).await?;
-                Some(ChunkedCborKeyProbe {
-                    handle,
-                    key_tok,
-                    offset: self.offset,
-                    remaining_after: usize::MAX,
-                })
-            }
-        };
-
-        loop {
-            let key_probe = key_probe_opt.take().unwrap();
-
-            let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
-
-            let value_probe = key_claim.into_value_probe().await?;
-
-            let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
-
-            match value_claim
-                .next_key(arms.unsatisfied_count(), arms.open_count())
-                .await?
-            {
-                NextKey::Done(map_claim) => {
-                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                }
-                NextKey::Entry(next_kp) => {
-                    key_probe_opt = Some(next_kp);
-                }
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SeqAccess / SeqEntry
@@ -571,7 +309,7 @@ where
         Some(0) => Ok(Probe::Hit(Chunk::Done(ChunkedCborClaim {
             offset: seq.offset,
             handle: seq.handle,
-            remaining_after: 0,
+            remaining_after: None,
         }))),
         Some(n) => {
             let (handle, raw) = next_dispatch(seq.handle, &mut seq.offset).await?;
@@ -601,7 +339,7 @@ where
                 return Ok(Probe::Hit(Chunk::Done(ChunkedCborClaim {
                     offset: seq.offset,
                     handle: seq.handle,
-                    remaining_after: 0,
+                    remaining_after: None,
                 })));
             }
             let (handle, bignum_tag, elem_tok) =
@@ -675,7 +413,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedCborSeqEntry
         Ok(ChunkedCborClaim {
             offset,
             handle,
-            remaining_after: 0,
+            remaining_after: None,
         })
     }
 }

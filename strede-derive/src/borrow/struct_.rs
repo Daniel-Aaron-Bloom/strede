@@ -199,6 +199,7 @@ pub(super) fn expand(
         // Build generics with Deserialize bound only for the transparent field.
         let mut impl_gen = input.generics.clone();
         insert_de_and_d_borrow(&mut impl_gen, krate);
+        let d_ident = format_ident!("__D");
         {
             let wc = impl_gen.make_where_clause();
             if let Some(preds) = &container_attrs.bound {
@@ -224,20 +225,29 @@ pub(super) fn expand(
                         krate,
                         transparent_ty,
                         FieldContext::Direct,
+                        &d_ident,
                     ));
                 }
                 if let Some(ft) = &transparent_cf.from {
                     for lt in borrow_lifetimes(ft, &None) {
                         wc.predicates.push(syn::parse_quote!('de: #lt));
                     }
-                    wc.predicates
-                        .push(field_bound_borrow(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_borrow(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 } else if let Some(ft) = &transparent_cf.try_from {
                     for lt in borrow_lifetimes(ft, &None) {
                         wc.predicates.push(syn::parse_quote!('de: #lt));
                     }
-                    wc.predicates
-                        .push(field_bound_borrow(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_borrow(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 }
             }
         }
@@ -1170,7 +1180,7 @@ pub(super) fn expand(
                 fn wire_names() -> Self::WireNames {
                     #wire_names_body_tokens
                 }
-                fn make_arms() -> impl #krate::MapArmStack<'de, __KP, Outputs = Self::Outputs> {
+                fn make_arms() -> impl #krate::MapArmStack<'de, __KP, Outputs = Self::Outputs, Dynamic = #krate::False> {
                     #make_arms_body_tokens
                 }
                 fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {

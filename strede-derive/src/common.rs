@@ -61,27 +61,31 @@ pub enum FieldContext {
 
 /// Auto-generated bound for one field in the borrow family.
 ///
-/// Borrow family always assumes `'de` and `__D` are in scope.
+/// Borrow family always assumes `'de` is in scope. `d_ident` names the
+/// in-scope `Deserializer<'de>` type param (usually `__D`, but helper impls
+/// with their own generic — e.g. tuple-variant seq helpers — may use a
+/// different name like `__D2` to avoid colliding with an outer `__D`).
 pub fn field_bound_borrow(
     krate: &syn::Path,
     ty: &syn::Type,
     ctx: FieldContext,
+    d_ident: &syn::Ident,
 ) -> syn::WherePredicate {
     match ctx {
         FieldContext::Direct => syn::parse_quote!(
-            #ty: #krate::Deserialize<'de, __D, Extra = ()>
+            #ty: #krate::Deserialize<'de, #d_ident, Extra = ()>
         ),
         FieldContext::MapValue => syn::parse_quote!(
             #ty: #krate::Deserialize<
                 'de,
-                <#krate::borrow::VP2<'de, __D> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                <#krate::borrow::VP2<'de, #d_ident> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
                 Extra = ()
             >
         ),
         FieldContext::SeqElem => syn::parse_quote!(
             #ty: #krate::Deserialize<
                 'de,
-                <#krate::borrow::SE<'de, __D> as #krate::SeqEntry<'de>>::SubDeserializer,
+                <#krate::borrow::SE<'de, #d_ident> as #krate::SeqEntry<'de>>::SubDeserializer,
                 Extra = ()
             >
         ),
@@ -89,24 +93,28 @@ pub fn field_bound_borrow(
 }
 
 /// Auto-generated bound for one field in the owned family.
+///
+/// `d_ident` names the in-scope `DeserializerOwned` type param — see
+/// `field_bound_borrow` for why this isn't always `__D`.
 pub fn field_bound_owned(
     krate: &syn::Path,
     ty: &syn::Type,
     ctx: FieldContext,
+    d_ident: &syn::Ident,
 ) -> syn::WherePredicate {
     match ctx {
         FieldContext::Direct => syn::parse_quote!(
-            #ty: #krate::DeserializeOwned<__D, Extra = ()>
+            #ty: #krate::DeserializeOwned<#d_ident, Extra = ()>
         ),
         FieldContext::MapValue => syn::parse_quote!(
             #ty: #krate::DeserializeOwned<
-                <#krate::owned::VP2<__D> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                <#krate::owned::VP2<#d_ident> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
                 Extra = ()
             >
         ),
         FieldContext::SeqElem => syn::parse_quote!(
             #ty: #krate::DeserializeOwned<
-                <#krate::owned::SE<__D> as #krate::SeqEntryOwned>::SubDeserializer,
+                <#krate::owned::SE<#d_ident> as #krate::SeqEntryOwned>::SubDeserializer,
                 Extra = ()
             >
         ),

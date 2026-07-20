@@ -127,4 +127,3 @@ fn three_missing_c_field_misses() {
     let v: Option<Three> = parse(r#"{"id": 1, "a1": 2, "a2": 3, "b1": 4, "b2": 5, "c1": 6}"#);
     assert!(v.is_none());
 }
-

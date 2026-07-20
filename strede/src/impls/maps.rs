@@ -219,6 +219,7 @@ mod collect_map {
     {
         const SIZE: usize = 1;
         const FIELD_COUNT: usize = 1;
+        type Dynamic = crate::True;
         type Outputs = C;
 
         fn unsatisfied_count(&self) -> usize {
@@ -289,6 +290,7 @@ mod collect_map {
     {
         const SIZE: usize = 1;
         const FIELD_COUNT: usize = 1;
+        type Dynamic = crate::True;
         type Outputs = C;
 
         fn unsatisfied_count(&self) -> usize {
@@ -380,7 +382,7 @@ mod btreemap_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let (claim, out) = hit!(map
-                    .iterate(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
+                    .iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
                         |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
                         |vp: VP<'de, KP<'de, D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
@@ -409,7 +411,7 @@ mod btreemap_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let (claim, out) = hit!(map
-                    .iterate(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
+                    .iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
                         |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
                         |vp: owned_::VP<owned_::KP<D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
@@ -461,7 +463,7 @@ mod hashmap_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let (claim, out) = hit!(map
-                    .iterate(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
+                    .iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
                         |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
                         |vp: VP<'de, KP<'de, D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
@@ -492,7 +494,7 @@ mod hashmap_impls {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
                 let (claim, out) = hit!(map
-                    .iterate(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
+                    .iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
                         |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
                         |vp: owned_::VP<owned_::KP<D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);

@@ -49,7 +49,13 @@ fn outer_then_inner() {
         (tstr("a").as_slice(), &[uint_small(1)]),
         (tstr("b").as_slice(), &[uint_small(2)]),
     ]);
-    assert_eq!(parse::<Outer>(&msg), Some(Outer { id: 7, inner: Inner { a: 1, b: 2 } }));
+    assert_eq!(
+        parse::<Outer>(&msg),
+        Some(Outer {
+            id: 7,
+            inner: Inner { a: 1, b: 2 }
+        })
+    );
 }
 
 #[test]
@@ -59,7 +65,13 @@ fn interleaved_order() {
         (tstr("id").as_slice(), &[uint_small(7)]),
         (tstr("b").as_slice(), &[uint_small(2)]),
     ]);
-    assert_eq!(parse::<Outer>(&msg), Some(Outer { id: 7, inner: Inner { a: 1, b: 2 } }));
+    assert_eq!(
+        parse::<Outer>(&msg),
+        Some(Outer {
+            id: 7,
+            inner: Inner { a: 1, b: 2 }
+        })
+    );
 }
 
 #[test]
@@ -69,7 +81,13 @@ fn inner_then_outer() {
         (tstr("b").as_slice(), &[uint_small(2)]),
         (tstr("id").as_slice(), &[uint_small(7)]),
     ]);
-    assert_eq!(parse::<Outer>(&msg), Some(Outer { id: 7, inner: Inner { a: 1, b: 2 } }));
+    assert_eq!(
+        parse::<Outer>(&msg),
+        Some(Outer {
+            id: 7,
+            inner: Inner { a: 1, b: 2 }
+        })
+    );
 }
 
 #[test]
@@ -100,7 +118,11 @@ fn suffix_outer_then_inner_then_suffix() {
     ]);
     assert_eq!(
         parse::<OuterWithSuffix>(&msg),
-        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+        Some(OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        })
     );
 }
 
@@ -114,7 +136,11 @@ fn suffix_interleaved() {
     ]);
     assert_eq!(
         parse::<OuterWithSuffix>(&msg),
-        Some(OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 })
+        Some(OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        })
     );
 }
 

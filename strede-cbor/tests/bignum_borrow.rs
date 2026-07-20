@@ -31,7 +31,11 @@ fn collect_bignum_bytes(input: &[u8]) -> Option<Vec<u8>> {
                 Probe::Miss => return Ok(Probe::Miss),
             };
             let claim = loop {
-                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| acc.extend_from_slice(b)).await? {
+                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| {
+                    acc.extend_from_slice(b)
+                })
+                .await?
+                {
                     Chunk::Data((next, ())) => chunks = next,
                     Chunk::Done(claim) => break claim,
                 }
@@ -90,17 +94,19 @@ fn ascii_encoding_misses() {
     let de = CborDeserializer::new(&input);
     let result = block_on(async {
         de.entry(|[e1, e2]| async {
-            let ascii_missed = matches!(
-                e1.deserialize_number_chunks::<Ascii>().await?,
-                Probe::Miss
-            );
+            let ascii_missed =
+                matches!(e1.deserialize_number_chunks::<Ascii>().await?, Probe::Miss);
             let mut acc = Vec::<u8>::new();
             let mut chunks = match e2.deserialize_number_chunks::<BigEndian>().await? {
                 Probe::Hit(c) => c,
                 Probe::Miss => return Ok(Probe::Miss),
             };
             let claim = loop {
-                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| acc.extend_from_slice(b)).await? {
+                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| {
+                    acc.extend_from_slice(b)
+                })
+                .await?
+                {
                     Chunk::Data((next, ())) => chunks = next,
                     Chunk::Done(claim) => break claim,
                 }
@@ -134,7 +140,11 @@ fn little_endian_encoding_misses() {
                 Probe::Miss => return Ok(Probe::Miss),
             };
             let claim = loop {
-                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| acc.extend_from_slice(b)).await? {
+                match NumberAccess::<BigEndian>::next_number_chunk(chunks, |b| {
+                    acc.extend_from_slice(b)
+                })
+                .await?
+                {
                     Chunk::Data((next, ())) => chunks = next,
                     Chunk::Done(claim) => break claim,
                 }

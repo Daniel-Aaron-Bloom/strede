@@ -36,6 +36,7 @@ pub(super) fn expand_owned(input: DeriveInput, krate: &syn::Path) -> syn::Result
     let classified = classify_variants(data, &container_attrs)?;
 
     let field_types = all_field_types(data);
+    let d_ident = format_ident!("__D");
 
     let (_, ty_generics, _) = input.generics.split_for_impl();
 
@@ -52,8 +53,12 @@ pub(super) fn expand_owned(input: DeriveInput, krate: &syn::Path) -> syn::Result
             }
             for ty in &field_types {
                 if !has_universal_blanket(ty) {
-                    wc.predicates
-                        .push(field_bound_owned(krate, ty, FieldContext::MapValue));
+                    wc.predicates.push(field_bound_owned(
+                        krate,
+                        ty,
+                        FieldContext::MapValue,
+                        &d_ident,
+                    ));
                 }
                 // Untagged variants dispatch via `__e.deserialize_value::<T>(())` on Entry.
                 if classified.iter().any(|cv| cv.untagged) && !has_universal_blanket(ty) {
@@ -112,6 +117,7 @@ pub(super) fn expand_owned(input: DeriveInput, krate: &syn::Path) -> syn::Result
                         krate,
                         &helper_ty,
                         FieldContext::MapValue,
+                        &d_ident,
                     ));
                 }
             }
@@ -331,18 +337,21 @@ fn gen_tuple_variant_helpers_owned(
                 })
                 .collect();
 
+            let helper_d_ident = format_ident!("__D2");
+            let helper_bounds: Vec<syn::WherePredicate> = field_types
+                .iter()
+                .map(|fty| {
+                    field_bound_owned(krate, fty, FieldContext::SeqElem, &helper_d_ident)
+                })
+                .collect();
+
             tokens.extend(quote! {
                 #[allow(non_camel_case_types)]
                 struct #helper_name( #( #field_types, )* );
 
                 impl<__D2: #krate::DeserializerOwned> #krate::DeserializeOwned<__D2> for #helper_name
                 where
-                    #(
-                        #field_types: #krate::DeserializeOwned<
-                            <#krate::owned::SE<__D2> as #krate::SeqEntryOwned>::SubDeserializer,
-                            Extra = ()
-                        >,
-                    )*
+                    #( #helper_bounds, )*
                 {
                     type Extra = ();
                     async fn deserialize_owned(

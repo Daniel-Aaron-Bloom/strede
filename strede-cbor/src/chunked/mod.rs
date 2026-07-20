@@ -12,10 +12,10 @@ use crate::token::CborToken;
 use core::future::Future;
 use strede::utils::repeat;
 use strede::{
-    BigEndian, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned,
-    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned,
-    EnumArmStackOwned, EnumVariantProbeOwned, Handle, NumberEncoding, Probe,
-    SharedBuf, hit, match_str_chunks_against_owned,
+    BigEndian, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
+    EnumVariantProbeOwned, Handle, NumberEncoding, PairStep, Probe, RawSlot, SharedBuf, hit,
+    match_str_chunks_against_owned,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,100 @@ use strede::{
 pub struct ChunkedCborClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) offset: usize,
     pub(crate) handle: Handle<'s, B, F>,
-    pub(crate) remaining_after: usize,
+    /// `Some(n)` = definite map context with `n` pairs remaining, `None` =
+    /// indefinite map context (or not currently in a map).
+    pub(crate) remaining_after: Option<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// RawSlot — drives `strede::PairSeqMapAccess`. CBOR maps (major type 5) are
+// wire-identical to "N pairs in a flat stream", definite or `Break`-terminated
+// indefinite, so the key/value probe quintet is generic infrastructure rather
+// than hand-rolled here; see `access::ChunkedCborMapAccess` (removed) for the
+// shape this replaces.
+//
+// `Token = (CborToken, Option<u64>)`: the second element is the bignum tag (2
+// or 3) stripped from a tag-wrapped value, needed by `deserialize_number_chunks`.
+// Key reads never have a meaningful bignum tag (`None`); using the same
+// bignum-aware read uniformly for keys and values is a strict superset of the
+// old key-only `strip_tags_dispatch` path (identical token, tag info just also
+// available).
+// ---------------------------------------------------------------------------
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> RawSlot for ChunkedCborClaim<'s, B, F> {
+    type Error = CborError;
+    type Token = (CborToken, Option<u64>);
+    type SubDeserializer = ChunkedCborSubDeserializer<'s, B, F>;
+
+    #[inline(always)]
+    fn fork(&mut self) -> Self {
+        Self {
+            offset: self.offset,
+            handle: self.handle.fork(),
+            remaining_after: self.remaining_after,
+        }
+    }
+
+    async fn next_token(mut self) -> Result<(Self, Self::Token), Self::Error> {
+        let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
+        let (handle, bignum_tag, tok) =
+            strip_tags_bignum_dispatch(handle, &mut self.offset, raw).await?;
+        Ok((
+            Self {
+                handle,
+                offset: self.offset,
+                remaining_after: self.remaining_after,
+            },
+            (tok, bignum_tag),
+        ))
+    }
+
+    async fn next_token_or_done(mut self) -> Result<PairStep<Self, Self::Token>, Self::Error> {
+        let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
+        if matches!(raw, CborToken::Break) {
+            return Ok(PairStep::Done(Self {
+                handle,
+                offset: self.offset,
+                remaining_after: self.remaining_after,
+            }));
+        }
+        let (handle, bignum_tag, tok) =
+            strip_tags_bignum_dispatch(handle, &mut self.offset, raw).await?;
+        Ok(PairStep::More(
+            Self {
+                handle,
+                offset: self.offset,
+                remaining_after: self.remaining_after,
+            },
+            (tok, bignum_tag),
+        ))
+    }
+
+    #[inline(always)]
+    fn into_sub_deserializer(self, (tok, bignum_tag): Self::Token) -> Self::SubDeserializer {
+        ChunkedCborSubDeserializer::new_bignum(self.handle, self.offset, tok, bignum_tag)
+    }
+
+    #[inline(always)]
+    async fn skip_token(mut self, (tok, _bignum_tag): Self::Token) -> Result<Self, Self::Error> {
+        let handle = skip_value_chunked(self.handle, &mut self.offset, tok).await?;
+        Ok(Self {
+            handle,
+            offset: self.offset,
+            remaining_after: self.remaining_after,
+        })
+    }
+
+    #[inline(always)]
+    fn remaining_after(&self) -> Option<usize> {
+        self.remaining_after
+    }
+
+    #[inline(always)]
+    fn with_remaining_after(mut self, remaining: Option<usize>) -> Self {
+        self.remaining_after = remaining;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,19 +590,17 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                 CborToken::Bstr(len) | CborToken::Tstr(len) => {
                     handle = skip_n_bytes(handle, offset, len).await?;
                 }
-                CborToken::BstrIndef | CborToken::TstrIndef => {
-                    loop {
-                        let (h, chunk_tok) = next_dispatch(handle, offset).await?;
-                        handle = h;
-                        match chunk_tok {
-                            CborToken::Break => break,
-                            CborToken::Bstr(len) | CborToken::Tstr(len) => {
-                                handle = skip_n_bytes(handle, offset, len).await?;
-                            }
-                            _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                CborToken::BstrIndef | CborToken::TstrIndef => loop {
+                    let (h, chunk_tok) = next_dispatch(handle, offset).await?;
+                    handle = h;
+                    match chunk_tok {
+                        CborToken::Break => break,
+                        CborToken::Bstr(len) | CborToken::Tstr(len) => {
+                            handle = skip_n_bytes(handle, offset, len).await?;
                         }
+                        _ => return Err(CborError::UnexpectedByte { byte: 0 }),
                     }
-                }
+                },
                 CborToken::Tag(_) => {
                     // A tag wraps one value: push 1 so the drain loop reads it.
                     if !stack.push(1) {
@@ -651,7 +742,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
         ChunkedCborClaim {
             offset: self.offset,
             handle: self.handle,
-            remaining_after: 0,
+            remaining_after: None,
         }
     }
 
@@ -808,7 +899,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
     type StrChunks = access::ChunkedCborStrAccess<'s, B, F>;
     type BytesChunks = access::ChunkedCborBytesAccess<'s, B, F>;
     type NumberChunks<Enc: NumberEncoding> = access::ChunkedCborNumberAccess<'s, B, F>;
-    type Map = access::ChunkedCborMapAccess<'s, B, F>;
+    type Map = strede::PairSeqMapAccess<ChunkedCborClaim<'s, B, F>>;
     type Seq = access::ChunkedCborSeqAccess<'s, B, F>;
     type Enum = ChunkedCborEnumAccess<'s, B, F>;
 
@@ -884,11 +975,14 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
     #[inline(always)]
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
         match self.token {
-            CborToken::Map(count) => Ok(Probe::Hit(access::ChunkedCborMapAccess {
-                handle: self.handle,
-                offset: self.offset,
-                remaining: count,
-            })),
+            CborToken::Map(count) => Ok(Probe::Hit(strede::PairSeqMapAccess::new(
+                ChunkedCborClaim {
+                    handle: self.handle,
+                    offset: self.offset,
+                    remaining_after: None,
+                },
+                count,
+            ))),
             _ => Ok(Probe::Miss),
         }
     }
@@ -994,7 +1088,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
         Ok(ChunkedCborClaim {
             offset,
             handle,
-            remaining_after: 0,
+            remaining_after: None,
         })
     }
 }
@@ -1060,7 +1154,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         let str_access = match self.token {
@@ -1086,7 +1182,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: DeserializeOwned<Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Expect a single-key map `{"VariantName": <payload>}`.
@@ -1124,7 +1222,8 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         // Read value token (already stripped of tags by sub-deserializer entry).
         let mut val_offset = key_claim.offset;
         let (val_handle, raw_val) = next_dispatch(key_claim.handle, &mut val_offset).await?;
-        let (val_handle, val_tok) = strip_tags_dispatch(val_handle, &mut val_offset, raw_val).await?;
+        let (val_handle, val_tok) =
+            strip_tags_dispatch(val_handle, &mut val_offset, raw_val).await?;
 
         let sub = ChunkedCborSubDeserializer::new(val_handle, val_offset, val_tok);
         let (val_claim, t) = hit!(T::deserialize_owned(sub, extra).await);
@@ -1134,7 +1233,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
             Some(0) => ChunkedCborClaim {
                 offset: val_claim.offset,
                 handle: val_claim.handle,
-                remaining_after: 0,
+                remaining_after: None,
             },
             None => {
                 // Indefinite map: expect break.
@@ -1144,7 +1243,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
                     CborToken::Break => ChunkedCborClaim {
                         offset: off,
                         handle: h,
-                        remaining_after: 0,
+                        remaining_after: None,
                     },
                     _ => return Ok(Probe::Miss),
                 }

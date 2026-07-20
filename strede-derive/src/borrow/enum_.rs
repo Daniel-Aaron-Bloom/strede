@@ -40,6 +40,7 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
     let classified = classify_variants(data, &container_attrs)?;
 
     let field_types = all_field_types(data);
+    let d_ident = format_ident!("__D");
 
     // ty_generics: original type params.
     let (_, ty_generics, _) = input.generics.split_for_impl();
@@ -63,8 +64,12 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
                 }
                 // Skip for universal-blanket types to avoid impl/where-clause ambiguity.
                 if !has_universal_blanket(ty) {
-                    wc.predicates
-                        .push(field_bound_borrow(krate, ty, FieldContext::MapValue));
+                    wc.predicates.push(field_bound_borrow(
+                        krate,
+                        ty,
+                        FieldContext::MapValue,
+                        &d_ident,
+                    ));
                 }
                 // Untagged variants dispatch via `__e.deserialize_value::<T>(())` on Entry.
                 if has_untagged_any && !has_universal_blanket(ty) {
@@ -127,6 +132,7 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
                         krate,
                         &helper_ty,
                         FieldContext::MapValue,
+                        &d_ident,
                     ));
                 }
             }
@@ -310,18 +316,18 @@ fn gen_tuple_variant_helpers_borrow(
                 .collect();
 
             // Collect 'de: 'a bounds for all field types and D3 SeqElem bounds.
+            let helper_d_ident = format_ident!("__D2");
             let mut helper_bounds: Vec<syn::WherePredicate> = Vec::new();
             for fty in &field_types {
                 for lt in borrow_lifetimes(fty, &None) {
                     helper_bounds.push(syn::parse_quote!('de: #lt));
                 }
                 // D3: tuple variant helper reads via `__se.get::<T>(())` — SeqElem context on __D2.
-                helper_bounds.push(syn::parse_quote!(
-                    #fty: #krate::Deserialize<
-                        'de,
-                        <#krate::borrow::SE<'de, __D2> as #krate::SeqEntry<'de>>::SubDeserializer,
-                        Extra = ()
-                    >
+                helper_bounds.push(field_bound_borrow(
+                    krate,
+                    fty,
+                    FieldContext::SeqElem,
+                    &helper_d_ident,
                 ));
             }
 

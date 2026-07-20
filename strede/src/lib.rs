@@ -135,8 +135,8 @@ pub use impls::string_enum::{
     match_entry_str_against, match_str_chunks_against, match_str_chunks_against_owned,
 };
 pub use impls::{
-    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
-    UnwrapOrElse,
+    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, PairSeqKeyProbe, PairSeqMapAccess,
+    PairSeqValueProbe, PairStep, RawSlot, Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse,
 };
 
 // -- enum arm building blocks --
@@ -146,10 +146,10 @@ pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
 pub use owned::{
     ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
     DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates,
-    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, MapAccessOwned, MapArm,
+    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, False, MapAccessOwned, MapArm,
     MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
     MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
-    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStack, VirtualArmSlot,
+    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStack, True, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]

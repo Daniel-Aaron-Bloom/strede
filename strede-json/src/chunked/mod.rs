@@ -1132,7 +1132,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         use access::ChunkedJsonStrAccess;
@@ -1195,7 +1197,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: DeserializeOwned<Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         use access::ChunkedJsonKeyProbe;

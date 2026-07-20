@@ -65,43 +65,73 @@ macro_rules! impl_value_borrow {
                             MsgpackValue::Bool(b),
                         ))),
                         MsgpackToken::IFixInt(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::Int(b[0] as i8 as i64),
                         ))),
                         MsgpackToken::Int8(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::Int(b[0] as i8 as i64),
                         ))),
                         MsgpackToken::Int16(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::Int(i16::from_be_bytes(b) as i64),
                         ))),
                         MsgpackToken::Int32(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::Int(i32::from_be_bytes(b) as i64),
                         ))),
                         MsgpackToken::Int64(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::Int(i64::from_be_bytes(b)),
                         ))),
                         MsgpackToken::UFixInt(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::UInt(b[0] as u64),
                         ))),
                         MsgpackToken::UInt8(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::UInt(b[0] as u64),
                         ))),
                         MsgpackToken::UInt16(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::UInt(u16::from_be_bytes(b) as u64),
                         ))),
                         MsgpackToken::UInt32(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::UInt(u32::from_be_bytes(b) as u64),
                         ))),
                         MsgpackToken::UInt64(b) => Ok(Probe::Hit((
-                            MsgpackClaim { src: e.src, remaining_after: 0 },
+                            MsgpackClaim {
+                                src: e.src,
+                                remaining_after: 0,
+                            },
                             MsgpackValue::UInt(u64::from_be_bytes(b)),
                         ))),
                         MsgpackToken::Float32(f) => Ok(Probe::Hit((
@@ -348,16 +378,46 @@ macro_rules! impl_value_owned {
                         MsgpackToken::Bool(b) => {
                             Ok(Probe::Hit((e.into_claim(), MsgpackValue::Bool(b))))
                         }
-                        MsgpackToken::IFixInt(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::Int(b[0] as i8 as i64)))),
-                        MsgpackToken::Int8(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::Int(b[0] as i8 as i64)))),
-                        MsgpackToken::Int16(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::Int(i16::from_be_bytes(b) as i64)))),
-                        MsgpackToken::Int32(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::Int(i32::from_be_bytes(b) as i64)))),
-                        MsgpackToken::Int64(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::Int(i64::from_be_bytes(b))))),
-                        MsgpackToken::UFixInt(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::UInt(b[0] as u64)))),
-                        MsgpackToken::UInt8(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::UInt(b[0] as u64)))),
-                        MsgpackToken::UInt16(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::UInt(u16::from_be_bytes(b) as u64)))),
-                        MsgpackToken::UInt32(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::UInt(u32::from_be_bytes(b) as u64)))),
-                        MsgpackToken::UInt64(b) => Ok(Probe::Hit((e.into_claim(), MsgpackValue::UInt(u64::from_be_bytes(b))))),
+                        MsgpackToken::IFixInt(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::Int(b[0] as i8 as i64),
+                        ))),
+                        MsgpackToken::Int8(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::Int(b[0] as i8 as i64),
+                        ))),
+                        MsgpackToken::Int16(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::Int(i16::from_be_bytes(b) as i64),
+                        ))),
+                        MsgpackToken::Int32(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::Int(i32::from_be_bytes(b) as i64),
+                        ))),
+                        MsgpackToken::Int64(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::Int(i64::from_be_bytes(b)),
+                        ))),
+                        MsgpackToken::UFixInt(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::UInt(b[0] as u64),
+                        ))),
+                        MsgpackToken::UInt8(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::UInt(b[0] as u64),
+                        ))),
+                        MsgpackToken::UInt16(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::UInt(u16::from_be_bytes(b) as u64),
+                        ))),
+                        MsgpackToken::UInt32(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::UInt(u32::from_be_bytes(b) as u64),
+                        ))),
+                        MsgpackToken::UInt64(b) => Ok(Probe::Hit((
+                            e.into_claim(),
+                            MsgpackValue::UInt(u64::from_be_bytes(b)),
+                        ))),
                         MsgpackToken::Float32(f) => {
                             Ok(Probe::Hit((e.into_claim(), MsgpackValue::Float32(f))))
                         }

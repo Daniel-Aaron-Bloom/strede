@@ -77,6 +77,17 @@ pub fn pseq(elements: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Encode a postcard map (HashMap/BTreeMap): varint count + key/value byte
+/// pairs concatenated. Same shape as `pseq`, just alternating key then value.
+pub fn pmap(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = varint(pairs.len() as u64);
+    for (k, v) in pairs {
+        out.extend_from_slice(k);
+        out.extend_from_slice(v);
+    }
+    out
+}
+
 /// Encode a postcard u128: two consecutive varints (lo, hi).
 pub fn pu128(v: u128) -> Vec<u8> {
     let lo = v as u64;

@@ -27,10 +27,10 @@ use crate::{
     token::{MsgpackToken, next_token, skip_value},
 };
 use strede::{
-    BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
-    Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess, MapArmStack,
-    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
-    BigEndian, NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
+    BigEndian, BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess,
+    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
+    NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,9 @@ impl<'de> Entry<'de> for MsgpackEntry<'de> {
 
     // ---- Numbers ------------------------------------------------------------
 
-    async fn deserialize_number_chunks<Enc: NumberEncoding>(self) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
         if Enc::NAME != BigEndian::NAME {
             return Ok(Probe::Miss);
         }
@@ -546,11 +548,16 @@ impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for MsgpackNumberAccess<'de> {
         f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         if self.done {
-            return Ok(Chunk::Done(MsgpackClaim { src: self.src, remaining_after: 0 }));
+            return Ok(Chunk::Done(MsgpackClaim {
+                src: self.src,
+                remaining_after: 0,
+            }));
         }
         let bytes: &[u8] = match &self.token {
-            MsgpackToken::UFixInt(b) | MsgpackToken::UInt8(b)
-            | MsgpackToken::IFixInt(b) | MsgpackToken::Int8(b) => b.as_slice(),
+            MsgpackToken::UFixInt(b)
+            | MsgpackToken::UInt8(b)
+            | MsgpackToken::IFixInt(b)
+            | MsgpackToken::Int8(b) => b.as_slice(),
             MsgpackToken::UInt16(b) | MsgpackToken::Int16(b) => b.as_slice(),
             MsgpackToken::UInt32(b) | MsgpackToken::Int32(b) => b.as_slice(),
             MsgpackToken::UInt64(b) | MsgpackToken::Int64(b) => b.as_slice(),
@@ -743,55 +750,73 @@ impl<'de> MapAccess<'de> for MsgpackMapAccess<'de> {
 
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        mut arms: S,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        let mut src = self.src;
-        let mut remaining = self.remaining;
+        msgpack_map_iterate(self, arms).await
+    }
 
-        // Build the first key probe, or return early for empty maps.
-        let mut key_probe_opt: Option<MsgpackMapKeyProbe<'de>> = if remaining == 0 {
-            return Ok(Probe::Hit((
-                MsgpackClaim {
-                    src,
-                    remaining_after: 0,
-                },
-                arms.take_outputs(),
-            )));
-        } else {
-            let key_tok = next_token(&mut src)?;
-            remaining -= 1;
-            Some(MsgpackMapKeyProbe {
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        msgpack_map_iterate(self, arms).await
+    }
+}
+
+/// Shared body for [`MapAccess::iterate`] / [`MapAccess::iterate_dyn`] —
+/// msgpack maps are wire-identical for structs and dynamic collections (both
+/// are just a count + N pairs), so both trait methods delegate here rather
+/// than one calling the other.
+async fn msgpack_map_iterate<'de, S: MapArmStack<'de, MsgpackMapKeyProbe<'de>>>(
+    map: MsgpackMapAccess<'de>,
+    mut arms: S,
+) -> Result<Probe<(MsgpackClaim<'de>, S::Outputs)>, MsgpackError> {
+    let mut src = map.src;
+    let mut remaining = map.remaining;
+
+    // Build the first key probe, or return early for empty maps.
+    let mut key_probe_opt: Option<MsgpackMapKeyProbe<'de>> = if remaining == 0 {
+        return Ok(Probe::Hit((
+            MsgpackClaim {
                 src,
-                key_tok,
-                remaining_after: remaining,
-            })
+                remaining_after: 0,
+            },
+            arms.take_outputs(),
+        )));
+    } else {
+        let key_tok = next_token(&mut src)?;
+        remaining -= 1;
+        Some(MsgpackMapKeyProbe {
+            src,
+            key_tok,
+            remaining_after: remaining,
+        })
+    };
+
+    loop {
+        let key_probe = key_probe_opt.take().unwrap();
+
+        let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit(x) => x,
         };
 
-        loop {
-            let key_probe = key_probe_opt.take().unwrap();
+        let value_probe = key_claim.into_value_probe().await?;
 
-            let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
+        let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit(x) => x,
+        };
 
-            let value_probe = key_claim.into_value_probe().await?;
-
-            let (value_claim, ()) = match arms.dispatch_value(arm_index, value_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit(x) => x,
-            };
-
-            match value_claim
-                .next_key(arms.unsatisfied_count(), arms.open_count())
-                .await?
-            {
-                NextKey::Done(map_claim) => {
-                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                }
-                NextKey::Entry(next_kp) => {
-                    key_probe_opt = Some(next_kp);
-                }
+        match value_claim
+            .next_key(arms.unsatisfied_count(), arms.open_count())
+            .await?
+        {
+            NextKey::Done(map_claim) => {
+                return Ok(Probe::Hit((map_claim, arms.take_outputs())));
+            }
+            NextKey::Entry(next_kp) => {
+                key_probe_opt = Some(next_kp);
             }
         }
     }
@@ -953,7 +978,9 @@ impl<'de> EnumVariantProbe<'de> for MsgpackEnumVariantProbe<'de> {
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Msgpack strings are always valid UTF-8 with no escape sequences —
@@ -981,7 +1008,9 @@ impl<'de> EnumVariantProbe<'de> for MsgpackEnumVariantProbe<'de> {
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         // Expect a single-key map {"VariantName": <payload>}.

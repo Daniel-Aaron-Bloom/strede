@@ -3,8 +3,8 @@
 mod helpers;
 use helpers::*;
 
-use strede::{Ascii, BigEndian, Chunk, Entry, LittleEndian, NumberAccess, Probe};
 use strede::Deserializer;
+use strede::{Ascii, BigEndian, Chunk, Entry, LittleEndian, NumberAccess, Probe};
 use strede_msgpack::MsgpackDeserializer;
 use strede_test_util::block_on;
 
@@ -20,8 +20,13 @@ fn collect_be(input: &[u8]) -> Option<Vec<u8>> {
             };
             let mut bytes = Vec::<u8>::new();
             loop {
-                match <_ as NumberAccess<BigEndian>>::next_number_chunk(acc, |b: &[u8]| b.to_vec()).await? {
-                    Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
+                match <_ as NumberAccess<BigEndian>>::next_number_chunk(acc, |b: &[u8]| b.to_vec())
+                    .await?
+                {
+                    Chunk::Data((next, chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        acc = next;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
                 }
             }
@@ -51,7 +56,10 @@ fn uint16_be() {
 
 #[test]
 fn uint32_be() {
-    assert_eq!(collect_be(&uint32(0x01020304)), Some(vec![0x01, 0x02, 0x03, 0x04]));
+    assert_eq!(
+        collect_be(&uint32(0x01020304)),
+        Some(vec![0x01, 0x02, 0x03, 0x04])
+    );
 }
 
 #[test]
@@ -111,8 +119,15 @@ fn collect_ascii(input: &[u8]) -> Option<Vec<u8>> {
             };
             let mut bytes = Vec::<u8>::new();
             loop {
-                match <_ as NumberAccess<Ascii>>::next_number_chunk(acc, |b: &str| b.as_bytes().to_vec()).await? {
-                    Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
+                match <_ as NumberAccess<Ascii>>::next_number_chunk(acc, |b: &str| {
+                    b.as_bytes().to_vec()
+                })
+                .await?
+                {
+                    Chunk::Data((next, chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        acc = next;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
                 }
             }
@@ -140,8 +155,15 @@ fn collect_le(input: &[u8]) -> Option<Vec<u8>> {
             };
             let mut bytes = Vec::<u8>::new();
             loop {
-                match <_ as NumberAccess<LittleEndian>>::next_number_chunk(acc, |b: &[u8]| b.to_vec()).await? {
-                    Chunk::Data((next, chunk)) => { bytes.extend_from_slice(&chunk); acc = next; }
+                match <_ as NumberAccess<LittleEndian>>::next_number_chunk(acc, |b: &[u8]| {
+                    b.to_vec()
+                })
+                .await?
+                {
+                    Chunk::Data((next, chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        acc = next;
+                    }
                     Chunk::Done(claim) => return Ok(Probe::Hit((claim, bytes))),
                 }
             }

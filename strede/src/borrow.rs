@@ -558,11 +558,27 @@ pub trait MapAccess<'de>: Sized {
 
     type KeyProbe: MapKeyProbe<'de, Error = Self::Error>;
 
-    /// Drive the map iteration with the given arm stack.
+    /// Drive the map iteration with the given arm stack, for a fixed
+    /// compile-time field set (structs, enums) whose end is signaled by the
+    /// arm stack becoming satisfied. See [`crate::MapArmStack::Dynamic`].
     ///
     /// Returns `Hit((MapClaim, Outputs))` on success, `Miss` if a value
     /// type mismatched or a required field was missing, `Err` on format errors.
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;
+
+    /// Drive the map iteration for an unbounded/runtime-sized collection
+    /// (e.g. HashMap's `CollectMap`) rather than a fixed schema — see
+    /// [`crate::MapArmStack::Dynamic`]. No default: most formats' maps are
+    /// wire-uniform regardless of consumer shape, in which case both this
+    /// and [`Self::iterate`] should delegate to one shared helper rather than
+    /// one calling the other. Formats with a genuinely different wire shape
+    /// for schema-less collections (e.g. postcard, whose structs have no
+    /// wire framing at all but whose collections carry an explicit length)
+    /// give this a real, different implementation instead.
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
         arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;

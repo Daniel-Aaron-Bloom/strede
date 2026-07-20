@@ -89,13 +89,27 @@ fn missing_inner_field_misses() {
 #[test]
 fn suffix_outer_then_inner_then_suffix() {
     let o: OuterWithSuffix = parse(r#"{"prefix": 1, "a": 2, "b": 3, "suffix": 4}"#).unwrap();
-    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
 }
 
 #[test]
 fn suffix_interleaved() {
     let o: OuterWithSuffix = parse(r#"{"a": 2, "suffix": 4, "prefix": 1, "b": 3}"#).unwrap();
-    assert_eq!(o, OuterWithSuffix { prefix: 1, inner: Inner { a: 2, b: 3 }, suffix: 4 });
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
 }
 
 #[test]

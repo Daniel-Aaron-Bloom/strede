@@ -29,7 +29,14 @@ pub trait MapFieldProvider<'de, KP: MapKeyProbe<'de>>: Sized {
     type WireNames: ConcatableArray<T = (&'static str, usize)> + Copy;
 
     /// Build a fresh arm stack for this type's fields.
-    fn make_arms() -> impl MapArmStack<'de, KP, Outputs = Self::Outputs>;
+    ///
+    /// `Dynamic = crate::False`: every `MapFieldProvider` is a derived
+    /// struct's fixed field set, never an unbounded collection (only
+    /// `CollectMap` is `crate::True`, and it never implements this trait) —
+    /// constraining it here lets `StackConcat`'s `Dynamic` equality bound
+    /// type-check across flatten composition without the derive needing to
+    /// know the flattened type's concrete arm-stack type.
+    fn make_arms() -> impl MapArmStack<'de, KP, Outputs = Self::Outputs, Dynamic = crate::False>;
 
     /// Reconstruct `Self` from the outputs after `iterate` has completed.
     /// Returns `None` if a required field was absent; the caller should
@@ -47,7 +54,8 @@ pub trait MapFieldProviderOwned<KP: MapKeyProbeOwned>: Sized {
     type Outputs;
     const ARMS: usize;
     type WireNames: ConcatableArray<T = (&'static str, usize)> + Copy;
-    fn make_arms() -> impl MapArmStackOwned<KP, Outputs = Self::Outputs>;
+    /// See [`MapFieldProvider::make_arms`] for why `Dynamic = crate::False`.
+    fn make_arms() -> impl MapArmStackOwned<KP, Outputs = Self::Outputs, Dynamic = crate::False>;
     fn from_outputs(outputs: Self::Outputs) -> Option<Self>;
     fn wire_names() -> Self::WireNames;
 }

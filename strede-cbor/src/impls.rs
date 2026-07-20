@@ -193,7 +193,7 @@ macro_rules! impl_deserialize_owned_one {
                 d.entry(|[e]| async move {
                     match e.token {
                         CborToken::Bool(b) => Ok(Probe::Hit((
-                            ChunkedCborClaim { offset: e.offset, handle: e.handle, remaining_after: 0 },
+                            ChunkedCborClaim { offset: e.offset, handle: e.handle, remaining_after: None },
                             b,
                         ))),
                         _ => Ok(Probe::Miss),
@@ -214,7 +214,7 @@ macro_rules! impl_deserialize_owned_one {
                 d.entry(|[e]| async move {
                     match e.token {
                         CborToken::Null | CborToken::Undefined => Ok(Probe::Hit((
-                            ChunkedCborClaim { offset: e.offset, handle: e.handle, remaining_after: 0 },
+                            ChunkedCborClaim { offset: e.offset, handle: e.handle, remaining_after: None },
                             (),
                         ))),
                         _ => Ok(Probe::Miss),

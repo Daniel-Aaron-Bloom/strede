@@ -2,6 +2,12 @@
 //!
 //! Vec uses a varint count prefix (serde postcard compatible).
 
+// `PostcardMapKeyProbe::deserialize_key` now has a reachable `K::deserialize`
+// call (needed for HashMap/BTreeMap's dynamic-mode key matching), same as
+// every other format's key probe — see strede-msgpack/strede-cbor's
+// enum_owned.rs for the same bump for the same underlying reason.
+#![recursion_limit = "256"]
+
 mod helpers;
 use helpers::*;
 
@@ -160,5 +166,57 @@ fn option_vec_some_values() {
     assert_eq!(
         parse::<Option<Vec<u32>>>(&data),
         Ok(Some(Some(vec![10u32, 20])))
+    );
+}
+
+// --- BTreeMap<u32, u32> / HashMap<u32, u32> ---
+//
+// Maps use the same varint-count-prefix framing as Vec, but structs (no
+// framing at all, matched positionally) share the same key-probe type — see
+// `PostcardMapKeyProbe::dynamic` in strede-postcard/src/full.rs.
+
+use std::collections::{BTreeMap, HashMap};
+
+#[test]
+fn btreemap_u32_u32_empty() {
+    assert_eq!(
+        parse::<BTreeMap<u32, u32>>(&pmap(&[])),
+        Ok(Some(BTreeMap::new()))
+    );
+}
+
+#[test]
+fn btreemap_u32_u32_entries() {
+    let k1 = varint(1);
+    let v1 = varint(10);
+    let k2 = varint(2);
+    let v2 = varint(20);
+    let data = pmap(&[(&k1, &v1), (&k2, &v2)]);
+    let expected = BTreeMap::from([(1u32, 10u32), (2u32, 20u32)]);
+    assert_eq!(parse::<BTreeMap<u32, u32>>(&data), Ok(Some(expected)));
+}
+
+#[test]
+fn hashmap_u32_u32_entries() {
+    let k1 = varint(1);
+    let v1 = varint(10);
+    let k2 = varint(2);
+    let v2 = varint(20);
+    let data = pmap(&[(&k1, &v1), (&k2, &v2)]);
+    let expected = HashMap::from([(1u32, 10u32), (2u32, 20u32)]);
+    assert_eq!(parse::<HashMap<u32, u32>>(&data), Ok(Some(expected)));
+}
+
+#[test]
+fn hashmap_u32_u32_truncated_errors() {
+    // Count says 2 but only 1 pair follows.
+    let k1 = varint(1);
+    let v1 = varint(10);
+    let mut data = varint(2);
+    data.extend_from_slice(&k1);
+    data.extend_from_slice(&v1);
+    assert_eq!(
+        parse_err::<HashMap<u32, u32>>(&data),
+        PostcardError::UnexpectedEnd
     );
 }

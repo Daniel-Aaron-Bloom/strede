@@ -20,8 +20,8 @@ use strede::{
     },
     hit,
     owned::{
-        DeserializerOwned as _, EntryOwned as _, MapAccessOwned as _, MapKeyClaimOwned,
-        MapKeyProbeOwned, MapValueProbeOwned, KP as OwnedKP, VP as OwnedVP,
+        DeserializerOwned as _, EntryOwned as _, KP as OwnedKP, MapAccessOwned as _,
+        MapKeyClaimOwned, MapKeyProbeOwned, MapValueProbeOwned, VP as OwnedVP,
     },
     select_probe,
 };
@@ -183,9 +183,7 @@ where
                 self.pending_key = Some(k);
                 core::task::Poll::Ready(Ok(Probe::Hit((0, kc))))
             }
-            core::task::Poll::Ready(Ok(Probe::Miss)) => {
-                core::task::Poll::Ready(Ok(Probe::Miss))
-            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
             core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
             core::task::Poll::Pending => core::task::Poll::Pending,
         }
@@ -197,7 +195,10 @@ where
         _: usize,
         vp: <KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe,
     ) -> ValFut {
-        let k = self.pending_key.take().expect("dispatch without pending key");
+        let k = self
+            .pending_key
+            .take()
+            .expect("dispatch without pending key");
         (self.val_fn)(vp, k)
     }
     #[allow(clippy::type_complexity)]
@@ -219,9 +220,7 @@ where
                 self.out.push((k, v));
                 core::task::Poll::Ready(Ok(Probe::Hit((vc, ()))))
             }
-            core::task::Poll::Ready(Ok(Probe::Miss)) => {
-                core::task::Poll::Ready(Ok(Probe::Miss))
-            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
             core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
             core::task::Poll::Pending => core::task::Poll::Pending,
         }
@@ -380,9 +379,7 @@ where
                 self.pending_key = Some(k);
                 core::task::Poll::Ready(Ok(Probe::Hit((0, kc))))
             }
-            core::task::Poll::Ready(Ok(Probe::Miss)) => {
-                core::task::Poll::Ready(Ok(Probe::Miss))
-            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
             core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
             core::task::Poll::Pending => core::task::Poll::Pending,
         }
@@ -394,7 +391,10 @@ where
         _: usize,
         vp: <KP::KeyClaim as MapKeyClaimOwned>::ValueProbe,
     ) -> ValFut {
-        let k = self.pending_key.take().expect("dispatch without pending key");
+        let k = self
+            .pending_key
+            .take()
+            .expect("dispatch without pending key");
         (self.val_fn)(vp, k)
     }
     #[allow(clippy::type_complexity)]
@@ -416,9 +416,7 @@ where
                 self.out.push((k, v));
                 core::task::Poll::Ready(Ok(Probe::Hit((vc, ()))))
             }
-            core::task::Poll::Ready(Ok(Probe::Miss)) => {
-                core::task::Poll::Ready(Ok(Probe::Miss))
-            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
             core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
             core::task::Poll::Pending => core::task::Poll::Pending,
         }

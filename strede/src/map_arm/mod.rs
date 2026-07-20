@@ -22,6 +22,31 @@ pub use owned::MapArmStackOwned;
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
+// True / False - type-level booleans for MapArmStack::Dynamic / MapArmStackOwned::Dynamic
+// ---------------------------------------------------------------------------
+
+/// Type-level "true", paired with [`False`]. Used as
+/// [`crate::MapArmStack::Dynamic`] / [`crate::MapArmStackOwned::Dynamic`] for
+/// arm stacks representing an unbounded/runtime-sized collection (e.g.
+/// HashMap's `CollectMap`) that requires the format to read an explicit
+/// wire-level length before iterating.
+///
+/// Encoding this as a type (selected via associated-type dispatch) rather
+/// than a `bool` const lets a format provide two genuinely separate
+/// implementations for the two iteration strategies — one per marker type —
+/// instead of one shared function with a runtime `if`. The latter forces the
+/// compiler to lay out the union of both branches' state for every
+/// monomorphization, even though only one branch is ever reachable for a
+/// given concrete arm stack.
+pub struct True;
+
+/// Type-level "false", paired with [`True`]. The default/expected value for
+/// arm stacks with a fixed compile-time field set (structs, enums) whose end
+/// is signaled by the arm stack becoming satisfied rather than by a wire
+/// length.
+pub struct False;
+
+// ---------------------------------------------------------------------------
 // NextKey - shared by both families' value-claim traits
 // ---------------------------------------------------------------------------
 
