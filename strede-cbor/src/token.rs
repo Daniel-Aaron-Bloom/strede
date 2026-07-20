@@ -40,6 +40,11 @@ pub enum CborToken {
     Bool(bool),
     Null,
     Undefined,
+    /// Simple value other than false/true/null/undefined: either encoded
+    /// directly (additional info 0-19) or via a following byte (additional
+    /// info 24, byte 32-255). Most values in this space are unassigned by
+    /// the IANA simple-values registry but are well-formed CBOR.
+    Simple(u8),
     /// Half-precision float, decoded to f32.
     Float16(f32),
     Float32(f32),
@@ -184,14 +189,20 @@ pub fn parse_token(byte: u8, src: &mut &[u8]) -> Result<CborToken, CborError> {
         }
         // Major type 7: float / simple
         7 => match info {
+            0..=19 => Ok(CborToken::Simple(info)),
             20 => Ok(CborToken::Bool(false)),
             21 => Ok(CborToken::Bool(true)),
             22 => Ok(CborToken::Null),
             23 => Ok(CborToken::Undefined),
             24 => {
-                // simple value in next byte (only 32..=255 are valid)
-                let _v = read_be!(src, 1, u8);
-                Err(CborError::UnexpectedByte { byte })
+                // simple value in next byte; only 32..=255 are well-formed here
+                // (0..=31 must use the direct one-byte form above).
+                let v = read_be!(src, 1, u8);
+                if v < 32 {
+                    Err(CborError::UnexpectedByte { byte })
+                } else {
+                    Ok(CborToken::Simple(v))
+                }
             }
             25 => {
                 let bits = read_be!(src, 2, u16);
@@ -248,6 +259,7 @@ pub fn skip_value(src: &mut &[u8], tok: CborToken) -> Result<(), CborError> {
         | CborToken::Bool(_)
         | CborToken::Null
         | CborToken::Undefined
+        | CborToken::Simple(_)
         | CborToken::Float16(_)
         | CborToken::Float32(_)
         | CborToken::Float64(_) => return Ok(()),
@@ -356,6 +368,7 @@ fn skip_token_payload(
         | CborToken::Bool(_)
         | CborToken::Null
         | CborToken::Undefined
+        | CborToken::Simple(_)
         | CborToken::Float16(_)
         | CborToken::Float32(_)
         | CborToken::Float64(_) => {}

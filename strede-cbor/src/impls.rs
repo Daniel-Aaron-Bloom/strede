@@ -9,7 +9,10 @@ use crate::{
     full::{CborClaim, CborDeserializer, CborSubDeserializer, ParseNum},
     token::CborToken,
 };
-use strede::{Buffer, Deserialize, DeserializeOwned, Deserializer, DeserializerOwned, Probe};
+use strede::{
+    Buffer, Chunk, Deserialize, DeserializeOwned, Deserializer, DeserializerOwned, Entry,
+    EntryOwned, Probe, StrAccessOwned, hit,
+};
 
 // ---------------------------------------------------------------------------
 // ParseNum implementations
@@ -150,6 +153,26 @@ macro_rules! impl_deserialize_borrow_one {
             }
         }
     };
+    ($de:ty; char) => {
+        impl<'de> Deserialize<'de, $de> for char {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+                d.entry(|[e]| async move {
+                    let (claim, s) = hit!(Entry::deserialize_str(e).await);
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Ok(Probe::Hit((claim, c))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
+            }
+        }
+    };
     ($de:ty; $($t:ty),+) => {
         $(impl<'de> Deserialize<'de, $de> for $t {
             type Extra = ();
@@ -173,7 +196,7 @@ macro_rules! impl_deserialize_borrow_both {
     };
 }
 
-impl_deserialize_borrow_both!(bool, ());
+impl_deserialize_borrow_both!(bool, (), char);
 impl_deserialize_borrow_one!(CborDeserializer<'de>; u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 impl_deserialize_borrow_one!(CborSubDeserializer<'de>; u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
@@ -224,6 +247,51 @@ macro_rules! impl_deserialize_owned_one {
             }
         }
     };
+    ($de:ty; char) => {
+        impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializeOwned<$de> for char {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize_owned(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(<$de as DeserializerOwned>::Claim, Self)>, CborError> {
+                d.entry(|[e]| async move {
+                    let mut chunks = match EntryOwned::deserialize_str_chunks(e).await? {
+                        Probe::Hit(c) => c,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    };
+                    let mut found: Option<char> = None;
+                    let mut too_many = false;
+                    loop {
+                        match StrAccessOwned::next_str(chunks, |s: &str| {
+                            let mut iter = s.chars();
+                            if let Some(c) = iter.next() {
+                                if found.is_some() || iter.next().is_some() {
+                                    too_many = true;
+                                } else {
+                                    found = Some(c);
+                                }
+                            }
+                        })
+                        .await?
+                        {
+                            Chunk::Data((next, ())) => chunks = next,
+                            Chunk::Done(claim) => {
+                                if too_many {
+                                    return Ok(Probe::Miss);
+                                }
+                                return match found {
+                                    Some(c) => Ok(Probe::Hit((claim, c))),
+                                    None => Ok(Probe::Miss),
+                                };
+                            }
+                        }
+                    }
+                })
+                .await
+            }
+        }
+    };
     ($de:ty; $($t:ty),+) => {
         $(impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> DeserializeOwned<$de> for $t {
             type Extra = ();
@@ -247,6 +315,6 @@ macro_rules! impl_deserialize_owned_both {
     };
 }
 
-impl_deserialize_owned_both!(bool, ());
+impl_deserialize_owned_both!(bool, (), char);
 impl_deserialize_owned_one!(ChunkedCborDeserializer<'s, B, F>; u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 impl_deserialize_owned_one!(ChunkedCborSubDeserializer<'s, B, F>; u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);

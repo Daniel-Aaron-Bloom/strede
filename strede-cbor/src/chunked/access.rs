@@ -1,9 +1,6 @@
 //! Owned-family accessor types for the chunked CBOR deserializer.
 
-use super::{
-    ChunkedCborClaim, ChunkedCborSubDeserializer, next_dispatch, refill, skip_value_chunked,
-    strip_tags_bignum_dispatch,
-};
+use super::{ChunkedCborClaim, ChunkedCborSubDeserializer, next_dispatch, refill, skip_value_chunked};
 use crate::CborError;
 use crate::token::CborToken;
 use core::future::Future;
@@ -290,9 +287,11 @@ pub struct ChunkedCborSeqAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 
 pub struct ChunkedCborSeqEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
+    /// The token as read — *not* stripped of leading tags. See the
+    /// module-level note in `chunked/mod.rs` on `RawSlot`/
+    /// `strip_tags_bignum_dispatch`.
     pub(crate) elem_tok: CborToken,
     pub(crate) offset: usize,
-    pub(crate) bignum_tag: Option<u64>,
 }
 
 async fn seq_next_chunked<'s, B, F, const N: usize, Fn_, Fut, R>(
@@ -312,9 +311,7 @@ where
             remaining_after: None,
         }))),
         Some(n) => {
-            let (handle, raw) = next_dispatch(seq.handle, &mut seq.offset).await?;
-            let (handle, bignum_tag, elem_tok) =
-                strip_tags_bignum_dispatch(handle, &mut seq.offset, raw).await?;
+            let (handle, elem_tok) = next_dispatch(seq.handle, &mut seq.offset).await?;
             seq.remaining = Some(n - 1);
             let snap_offset = seq.offset;
 
@@ -323,7 +320,6 @@ where
                     handle,
                     elem_tok,
                     offset: snap_offset,
-                    bignum_tag,
                 });
 
             let (elem_claim, r) = hit!(f(entries).await);
@@ -342,16 +338,13 @@ where
                     remaining_after: None,
                 })));
             }
-            let (handle, bignum_tag, elem_tok) =
-                strip_tags_bignum_dispatch(seq.handle, &mut seq.offset, tok).await?;
             let snap_offset = seq.offset;
 
             let entries: [ChunkedCborSeqEntry<'s, B, F>; N] =
-                repeat(handle, Handle::fork).map(|handle| ChunkedCborSeqEntry {
+                repeat(seq.handle, Handle::fork).map(|handle| ChunkedCborSeqEntry {
                     handle,
-                    elem_tok,
+                    elem_tok: tok,
                     offset: snap_offset,
-                    bignum_tag,
                 });
 
             let (elem_claim, r) = hit!(f(entries).await);
@@ -390,7 +383,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedCborSeqEntry
             handle: self.handle.fork(),
             elem_tok: self.elem_tok,
             offset: self.offset,
-            bignum_tag: self.bignum_tag,
         }
     }
 
@@ -398,12 +390,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> SeqEntryOwned for ChunkedCborSeqEntry
     where
         T: DeserializeOwned<Self::SubDeserializer>,
     {
-        let sub = ChunkedCborSubDeserializer::new_bignum(
-            self.handle,
-            self.offset,
-            self.elem_tok,
-            self.bignum_tag,
-        );
+        let sub = ChunkedCborSubDeserializer::new(self.handle, self.offset, self.elem_tok);
         T::deserialize_owned(sub, extra).await
     }
 

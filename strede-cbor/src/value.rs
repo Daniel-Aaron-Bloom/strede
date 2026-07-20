@@ -7,7 +7,7 @@ use crate::{
     token::CborToken,
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
-use strede::{Buffer, Deserialize, DeserializeOwned, Deserializer, DeserializerOwned, Probe};
+use strede::{Buffer, Deserialize, DeserializeOwned, DeserializerOwned, Probe};
 
 /// A dynamically-typed CBOR value.
 ///
@@ -19,6 +19,8 @@ pub enum CborValue {
     Null,
     Undefined,
     Bool(bool),
+    /// Simple value other than false/true/null/undefined (see `CborToken::Simple`).
+    Simple(u8),
     UInt(u64),
     /// Signed negative integer: -2^63 .. -1 (i.e. actual = -1 - raw_negint where raw fits i64)
     Int(i64),
@@ -40,275 +42,225 @@ pub enum CborValue {
 // Borrow family
 // ---------------------------------------------------------------------------
 
-macro_rules! impl_value_borrow {
-    ($de:ty) => {
-        impl<'de> Deserialize<'de, $de> for CborValue {
-            type Extra = ();
+type DecodeValueBorrowFuture<'de> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = DecodeValueBorrowResult<'de>> + 'de>>;
+type DecodeValueBorrowResult<'de> = Result<Probe<(&'de [u8], CborValue)>, CborError>;
 
-            async fn deserialize(
-                d: $de,
-                _: (),
-            ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
-                d.entry(|[e]| async move {
-                    let src = e.src;
-                    let claim = || CborClaim {
-                        src,
-                        remaining_after: 0,
-                    };
-                    match e.token {
-                        CborToken::Null => Ok(Probe::Hit((claim(), CborValue::Null))),
-                        CborToken::Undefined => Ok(Probe::Hit((claim(), CborValue::Undefined))),
-                        CborToken::Bool(b) => Ok(Probe::Hit((claim(), CborValue::Bool(b)))),
-                        CborToken::UInt(n) => Ok(Probe::Hit((claim(), CborValue::UInt(n)))),
-                        CborToken::NegInt(n) => {
-                            let v = if n <= i64::MAX as u64 {
-                                CborValue::Int(-1i64 - n as i64)
-                            } else {
-                                CborValue::NegIntOverflow(n)
-                            };
-                            Ok(Probe::Hit((claim(), v)))
-                        }
-                        CborToken::Float16(f) => {
-                            Ok(Probe::Hit((claim(), CborValue::Float(f as f64))))
-                        }
-                        CborToken::Float32(f) => {
-                            Ok(Probe::Hit((claim(), CborValue::Float(f as f64))))
-                        }
-                        CborToken::Float64(f) => Ok(Probe::Hit((claim(), CborValue::Float(f)))),
+/// Recursively decode one CBOR value starting at `raw_start` — a position
+/// that has *not* had any leading tags stripped. Reading fresh from here
+/// (rather than from an already-stripped `Entry`/`SubDeserializer`) is what
+/// lets `CborValue::Tag` actually get constructed: every recursive call
+/// (tag payload, array element, map key/value) is handed the true origin of
+/// its own value, so tags nested at any depth are preserved rather than
+/// silently discarded by the generic entry-construction machinery.
+fn decode_value_borrow<'de>(raw_start: &'de [u8]) -> DecodeValueBorrowFuture<'de> {
+    Box::pin(async move {
+        let mut src = raw_start;
+        let tok = crate::token::next_token(&mut src)?;
+        match tok {
+            CborToken::Null => Ok(Probe::Hit((src, CborValue::Null))),
+            CborToken::Undefined => Ok(Probe::Hit((src, CborValue::Undefined))),
+            CborToken::Bool(b) => Ok(Probe::Hit((src, CborValue::Bool(b)))),
+            CborToken::Simple(v) => Ok(Probe::Hit((src, CborValue::Simple(v)))),
+            CborToken::UInt(n) => Ok(Probe::Hit((src, CborValue::UInt(n)))),
+            CborToken::NegInt(n) => {
+                let v = if n <= i64::MAX as u64 {
+                    CborValue::Int(-1i64 - n as i64)
+                } else {
+                    CborValue::NegIntOverflow(n)
+                };
+                Ok(Probe::Hit((src, v)))
+            }
+            CborToken::Float16(f) => Ok(Probe::Hit((src, CborValue::Float(f as f64)))),
+            CborToken::Float32(f) => Ok(Probe::Hit((src, CborValue::Float(f as f64)))),
+            CborToken::Float64(f) => Ok(Probe::Hit((src, CborValue::Float(f)))),
+            CborToken::Bstr(len) => {
+                if src.len() < len {
+                    return Err(CborError::UnexpectedEnd);
+                }
+                let (payload, rest) = src.split_at(len);
+                Ok(Probe::Hit((rest, CborValue::Bstr(payload.to_vec()))))
+            }
+            CborToken::BstrIndef => {
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk_tok = crate::token::next_token(&mut src)?;
+                    match chunk_tok {
+                        CborToken::Break => break,
                         CborToken::Bstr(len) => {
                             if src.len() < len {
                                 return Err(CborError::UnexpectedEnd);
                             }
-                            let (payload, rest) = src.split_at(len);
-                            Ok(Probe::Hit((
-                                CborClaim {
-                                    src: rest,
-                                    remaining_after: 0,
-                                },
-                                CborValue::Bstr(payload.to_vec()),
-                            )))
+                            bytes.extend_from_slice(&src[..len]);
+                            src = &src[len..];
                         }
-                        CborToken::BstrIndef => {
-                            // Collect all chunks
-                            let mut bytes = Vec::new();
-                            let mut s = src;
-                            loop {
-                                let tok = crate::token::next_token(&mut s)?;
-                                match tok {
-                                    CborToken::Break => break,
-                                    CborToken::Bstr(len) => {
-                                        if s.len() < len {
-                                            return Err(CborError::UnexpectedEnd);
-                                        }
-                                        bytes.extend_from_slice(&s[..len]);
-                                        s = &s[len..];
-                                    }
-                                    _ => return Err(CborError::UnexpectedByte { byte: 0 }),
-                                }
-                            }
-                            Ok(Probe::Hit((
-                                CborClaim {
-                                    src: s,
-                                    remaining_after: 0,
-                                },
-                                CborValue::Bstr(bytes),
-                            )))
-                        }
+                        _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                    }
+                }
+                Ok(Probe::Hit((src, CborValue::Bstr(bytes))))
+            }
+            CborToken::Tstr(len) => {
+                if src.len() < len {
+                    return Err(CborError::UnexpectedEnd);
+                }
+                let (payload, rest) = src.split_at(len);
+                let s = core::str::from_utf8(payload).map_err(|_| CborError::InvalidUtf8)?;
+                Ok(Probe::Hit((rest, CborValue::Tstr(s.into()))))
+            }
+            CborToken::TstrIndef => {
+                let mut out = String::new();
+                loop {
+                    let chunk_tok = crate::token::next_token(&mut src)?;
+                    match chunk_tok {
+                        CborToken::Break => break,
                         CborToken::Tstr(len) => {
                             if src.len() < len {
                                 return Err(CborError::UnexpectedEnd);
                             }
-                            let (payload, rest) = src.split_at(len);
-                            let s = core::str::from_utf8(payload)
-                                .map_err(|_| CborError::InvalidUtf8)?;
-                            Ok(Probe::Hit((
-                                CborClaim {
-                                    src: rest,
-                                    remaining_after: 0,
-                                },
-                                CborValue::Tstr(s.into()),
-                            )))
+                            let chunk =
+                                core::str::from_utf8(&src[..len]).map_err(|_| CborError::InvalidUtf8)?;
+                            out.push_str(chunk);
+                            src = &src[len..];
                         }
-                        CborToken::TstrIndef => {
-                            let mut out = String::new();
-                            let mut s = src;
-                            loop {
-                                let tok = crate::token::next_token(&mut s)?;
-                                match tok {
-                                    CborToken::Break => break,
-                                    CborToken::Tstr(len) => {
-                                        if s.len() < len {
-                                            return Err(CborError::UnexpectedEnd);
-                                        }
-                                        let chunk = core::str::from_utf8(&s[..len])
-                                            .map_err(|_| CborError::InvalidUtf8)?;
-                                        out.push_str(chunk);
-                                        s = &s[len..];
-                                    }
-                                    _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                        _ => return Err(CborError::UnexpectedByte { byte: 0 }),
+                    }
+                }
+                Ok(Probe::Hit((src, CborValue::Tstr(out))))
+            }
+            CborToken::Array(count) => {
+                let mut items = Vec::new();
+                match count {
+                    Some(n) => {
+                        for _ in 0..n {
+                            match decode_value_borrow(src).await? {
+                                Probe::Hit((rest, v)) => {
+                                    items.push(v);
+                                    src = rest;
                                 }
-                            }
-                            Ok(Probe::Hit((
-                                CborClaim {
-                                    src: s,
-                                    remaining_after: 0,
-                                },
-                                CborValue::Tstr(out),
-                            )))
-                        }
-                        CborToken::Array(count) => {
-                            let sub_de = CborSubDeserializer::new(src, CborToken::Array(count));
-                            let fut: core::pin::Pin<
-                                Box<dyn core::future::Future<Output = _> + 'de>,
-                            > = Box::pin(deserialize_array_borrow(sub_de));
-                            fut.await
-                        }
-                        CborToken::Map(count) => {
-                            let sub_de = CborSubDeserializer::new(src, CborToken::Map(count));
-                            let fut: core::pin::Pin<
-                                Box<dyn core::future::Future<Output = _> + 'de>,
-                            > = Box::pin(deserialize_map_borrow(sub_de));
-                            fut.await
-                        }
-                        CborToken::Tag(number) => {
-                            // Read the tagged value
-                            let mut s = src;
-                            let raw = crate::token::next_token(&mut s)?;
-                            let inner_sub = CborSubDeserializer::new(s, raw);
-                            let fut: core::pin::Pin<
-                                Box<dyn core::future::Future<Output = _> + 'de>,
-                            > = Box::pin(CborValue::deserialize(inner_sub, ()));
-                            match fut.await? {
-                                Probe::Hit((claim, inner)) => Ok(Probe::Hit((
-                                    claim,
-                                    CborValue::Tag {
-                                        number,
-                                        value: Box::new(inner),
-                                    },
-                                ))),
-                                Probe::Miss => Ok(Probe::Miss),
+                                Probe::Miss => return Ok(Probe::Miss),
                             }
                         }
-                        CborToken::Break => Err(CborError::InvalidBreak),
                     }
-                })
-                .await
+                    None => loop {
+                        let mut peek = src;
+                        let peeked = crate::token::next_token(&mut peek)?;
+                        if matches!(peeked, CborToken::Break) {
+                            src = peek;
+                            break;
+                        }
+                        match decode_value_borrow(src).await? {
+                            Probe::Hit((rest, v)) => {
+                                items.push(v);
+                                src = rest;
+                            }
+                            Probe::Miss => return Ok(Probe::Miss),
+                        }
+                    },
+                }
+                Ok(Probe::Hit((src, CborValue::Array(items))))
             }
-        }
-    };
-}
-
-async fn deserialize_array_borrow<'de>(
-    d: CborSubDeserializer<'de>,
-) -> Result<Probe<(CborClaim<'de>, CborValue)>, CborError> {
-    use strede::SeqAccess;
-    d.entry(|[e]| async move {
-        let seq = match e.token {
-            CborToken::Array(count) => crate::full::CborSeqAccess {
-                src: e.src,
-                remaining: count,
+            CborToken::Map(count) => {
+                let mut pairs = Vec::new();
+                let read_pair = async |src: &mut &'de [u8]| -> Result<Option<(CborValue, CborValue)>, CborError> {
+                    let key = match decode_value_borrow(src).await? {
+                        Probe::Hit((rest, k)) => {
+                            *src = rest;
+                            k
+                        }
+                        Probe::Miss => return Ok(None),
+                    };
+                    let val = match decode_value_borrow(src).await? {
+                        Probe::Hit((rest, v)) => {
+                            *src = rest;
+                            v
+                        }
+                        Probe::Miss => return Ok(None),
+                    };
+                    Ok(Some((key, val)))
+                };
+                match count {
+                    Some(n) => {
+                        for _ in 0..n {
+                            match read_pair(&mut src).await? {
+                                Some(pair) => pairs.push(pair),
+                                None => return Ok(Probe::Miss),
+                            }
+                        }
+                    }
+                    None => loop {
+                        let mut peek = src;
+                        let peeked = crate::token::next_token(&mut peek)?;
+                        if matches!(peeked, CborToken::Break) {
+                            src = peek;
+                            break;
+                        }
+                        match read_pair(&mut src).await? {
+                            Some(pair) => pairs.push(pair),
+                            None => return Ok(Probe::Miss),
+                        }
+                    },
+                }
+                Ok(Probe::Hit((src, CborValue::Map(pairs))))
+            }
+            CborToken::Tag(number) => match decode_value_borrow(src).await? {
+                Probe::Hit((rest, inner)) => Ok(Probe::Hit((
+                    rest,
+                    CborValue::Tag {
+                        number,
+                        value: Box::new(inner),
+                    },
+                ))),
+                Probe::Miss => Ok(Probe::Miss),
             },
-            _ => return Ok(Probe::Miss),
-        };
-        let mut items = alloc::vec::Vec::new();
-        let mut seq = seq;
-        loop {
-            match seq
-                .next(|[elem]| async move {
-                    let sub = CborSubDeserializer::new(elem.src, elem.elem_tok);
-                    let fut: core::pin::Pin<Box<dyn core::future::Future<Output = _> + '_>> =
-                        Box::pin(CborValue::deserialize(sub, ()));
-                    match fut.await? {
-                        Probe::Hit((claim, v)) => Ok(Probe::Hit((claim, v))),
-                        Probe::Miss => Ok(Probe::Miss),
-                    }
-                })
-                .await?
-            {
-                Probe::Hit(strede::Chunk::Done(claim)) => {
-                    return Ok(Probe::Hit((claim, CborValue::Array(items))));
-                }
-                Probe::Hit(strede::Chunk::Data((new_seq, v))) => {
-                    items.push(v);
-                    seq = new_seq;
-                }
-                Probe::Miss => return Ok(Probe::Miss),
-            }
+            CborToken::Break => Err(CborError::InvalidBreak),
         }
     })
-    .await
 }
 
-async fn deserialize_map_borrow<'de>(
-    d: CborSubDeserializer<'de>,
-) -> Result<Probe<(CborClaim<'de>, CborValue)>, CborError> {
-    d.entry(|[e]| async move {
-        // Use seq-like iteration manually: for each pair, read key then value
-        let (mut src, remaining) = match e.token {
-            CborToken::Map(count) => (e.src, count),
-            _ => return Ok(Probe::Miss),
-        };
-        let mut pairs = alloc::vec::Vec::new();
+impl<'de> Deserialize<'de, CborDeserializer<'de>> for CborValue {
+    type Extra = ();
 
-        match remaining {
-            Some(0) => {}
-            None => {
-                // Indefinite
-                loop {
-                    let raw = crate::token::next_token(&mut src)?;
-                    if matches!(raw, CborToken::Break) {
-                        break;
-                    }
-                    let key_sub = CborSubDeserializer::new(src, raw);
-                    let (key_claim, key) = match CborValue::deserialize(key_sub, ()).await? {
-                        Probe::Hit(x) => x,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-                    src = key_claim.src;
-                    let val_raw = crate::token::next_token(&mut src)?;
-                    let val_sub = CborSubDeserializer::new(src, val_raw);
-                    let (val_claim, val) = match CborValue::deserialize(val_sub, ()).await? {
-                        Probe::Hit(x) => x,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-                    src = val_claim.src;
-                    pairs.push((key, val));
+    async fn deserialize(
+        d: CborDeserializer<'de>,
+        _: (),
+    ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+        match decode_value_borrow(d.src).await? {
+            Probe::Hit((rest, v)) => {
+                if !rest.is_empty() {
+                    return Err(CborError::ExpectedEnd);
                 }
+                Ok(Probe::Hit((
+                    CborClaim {
+                        src: rest,
+                        remaining_after: 0,
+                    },
+                    v,
+                )))
             }
-            Some(n) => {
-                for _ in 0..n {
-                    let raw = crate::token::next_token(&mut src)?;
-                    let key_sub = CborSubDeserializer::new(src, raw);
-                    let (key_claim, key) = match CborValue::deserialize(key_sub, ()).await? {
-                        Probe::Hit(x) => x,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-                    src = key_claim.src;
-                    let val_raw = crate::token::next_token(&mut src)?;
-                    let val_sub = CborSubDeserializer::new(src, val_raw);
-                    let (val_claim, val) = match CborValue::deserialize(val_sub, ()).await? {
-                        Probe::Hit(x) => x,
-                        Probe::Miss => return Ok(Probe::Miss),
-                    };
-                    src = val_claim.src;
-                    pairs.push((key, val));
-                }
-            }
+            Probe::Miss => Ok(Probe::Miss),
         }
-
-        Ok(Probe::Hit((
-            CborClaim {
-                src,
-                remaining_after: 0,
-            },
-            CborValue::Map(pairs),
-        )))
-    })
-    .await
+    }
 }
 
-impl_value_borrow!(CborDeserializer<'de>);
-impl_value_borrow!(CborSubDeserializer<'de>);
+impl<'de> Deserialize<'de, CborSubDeserializer<'de>> for CborValue {
+    type Extra = ();
+
+    async fn deserialize(
+        d: CborSubDeserializer<'de>,
+        _: (),
+    ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+        match decode_value_borrow(d.raw_start).await? {
+            Probe::Hit((rest, v)) => Ok(Probe::Hit((
+                CborClaim {
+                    src: rest,
+                    remaining_after: 0,
+                },
+                v,
+            ))),
+            Probe::Miss => Ok(Probe::Miss),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Owned family
@@ -324,12 +276,20 @@ macro_rules! impl_value_owned {
                 _: (),
             ) -> Result<Probe<(<$de as DeserializerOwned>::Claim, Self)>, CborError> {
                 d.entry(|[e]| async move {
+                    // `e.token` is exactly what was read — not resolved past
+                    // any leading tags — so the `Tag` arm below is real and
+                    // reachable: this is the one place that's allowed to see
+                    // tags at all, recursing for as many layers as actually
+                    // exist (no fixed capacity, unlike a captured chain).
                     match e.token {
                         CborToken::Null => Ok(Probe::Hit((e.into_claim(), CborValue::Null))),
                         CborToken::Undefined => {
                             Ok(Probe::Hit((e.into_claim(), CborValue::Undefined)))
                         }
                         CborToken::Bool(b) => Ok(Probe::Hit((e.into_claim(), CborValue::Bool(b)))),
+                        CborToken::Simple(v) => {
+                            Ok(Probe::Hit((e.into_claim(), CborValue::Simple(v))))
+                        }
                         CborToken::UInt(n) => Ok(Probe::Hit((e.into_claim(), CborValue::UInt(n)))),
                         CborToken::NegInt(n) => {
                             let v = if n <= i64::MAX as u64 {
@@ -434,10 +394,10 @@ macro_rules! impl_value_owned {
                             fut.await
                         }
                         CborToken::Tag(number) => {
-                            // Read the tagged value
+                            let mut offset = e.offset;
                             let (handle, raw) =
-                                crate::chunked::next_dispatch(e.handle, &mut { e.offset }).await?;
-                            let inner_sub = ChunkedCborSubDeserializer::new(handle, e.offset, raw);
+                                crate::chunked::next_dispatch(e.handle, &mut offset).await?;
+                            let inner_sub = ChunkedCborSubDeserializer::new(handle, offset, raw);
                             let fut: core::pin::Pin<Box<dyn core::future::Future<Output = _>>> =
                                 Box::pin(CborValue::deserialize_owned(inner_sub, ()));
                             match fut.await? {
@@ -560,12 +520,12 @@ async fn deserialize_map_owned<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
         match remaining {
             Some(0) => {}
             None => loop {
-                let (h, tok) = crate::chunked::next_dispatch(handle, &mut offset).await?;
-                handle = h;
-                if matches!(tok, CborToken::Break) {
+                let (h, raw) = crate::chunked::next_dispatch(handle, &mut offset).await?;
+                if matches!(raw, CborToken::Break) {
+                    handle = h;
                     break;
                 }
-                let key_sub = ChunkedCborSubDeserializer::new(handle, offset, tok);
+                let key_sub = ChunkedCborSubDeserializer::new(h, offset, raw);
                 let (key_claim, key) = match CborValue::deserialize_owned(key_sub, ()).await? {
                     Probe::Hit(x) => x,
                     Probe::Miss => return Ok(Probe::Miss),
@@ -573,9 +533,8 @@ async fn deserialize_map_owned<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                 handle = key_claim.handle;
                 offset = key_claim.offset;
 
-                let (h, val_tok) = crate::chunked::next_dispatch(handle, &mut offset).await?;
-                handle = h;
-                let val_sub = ChunkedCborSubDeserializer::new(handle, offset, val_tok);
+                let (h, raw) = crate::chunked::next_dispatch(handle, &mut offset).await?;
+                let val_sub = ChunkedCborSubDeserializer::new(h, offset, raw);
                 let (val_claim, val) = match CborValue::deserialize_owned(val_sub, ()).await? {
                     Probe::Hit(x) => x,
                     Probe::Miss => return Ok(Probe::Miss),
@@ -586,9 +545,8 @@ async fn deserialize_map_owned<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             },
             Some(n) => {
                 for _ in 0..n {
-                    let (h, key_tok) = crate::chunked::next_dispatch(handle, &mut offset).await?;
-                    handle = h;
-                    let key_sub = ChunkedCborSubDeserializer::new(handle, offset, key_tok);
+                    let (h, raw) = crate::chunked::next_dispatch(handle, &mut offset).await?;
+                    let key_sub = ChunkedCborSubDeserializer::new(h, offset, raw);
                     let (key_claim, key) = match CborValue::deserialize_owned(key_sub, ()).await? {
                         Probe::Hit(x) => x,
                         Probe::Miss => return Ok(Probe::Miss),
@@ -596,9 +554,8 @@ async fn deserialize_map_owned<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                     handle = key_claim.handle;
                     offset = key_claim.offset;
 
-                    let (h, val_tok) = crate::chunked::next_dispatch(handle, &mut offset).await?;
-                    handle = h;
-                    let val_sub = ChunkedCborSubDeserializer::new(handle, offset, val_tok);
+                    let (h, raw) = crate::chunked::next_dispatch(handle, &mut offset).await?;
+                    let val_sub = ChunkedCborSubDeserializer::new(h, offset, raw);
                     let (val_claim, val) = match CborValue::deserialize_owned(val_sub, ()).await? {
                         Probe::Hit(x) => x,
                         Probe::Miss => return Ok(Probe::Miss),

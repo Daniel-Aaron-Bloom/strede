@@ -37,17 +37,15 @@ pub struct ChunkedCborClaim<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
 // than hand-rolled here; see `access::ChunkedCborMapAccess` (removed) for the
 // shape this replaces.
 //
-// `Token = (CborToken, Option<u64>)`: the second element is the bignum tag (2
-// or 3) stripped from a tag-wrapped value, needed by `deserialize_number_chunks`.
-// Key reads never have a meaningful bignum tag (`None`); using the same
-// bignum-aware read uniformly for keys and values is a strict superset of the
-// old key-only `strip_tags_dispatch` path (identical token, tag info just also
-// available).
+// `Token = CborToken`: the raw token as read, *not* stripped of any leading
+// tags. Every consumer of a slot (an ordinary type or `CborTag`/`CborValue`)
+// resolves tags for itself, lazily, only when it actually runs — see the
+// module-level note below `next_dispatch` for why.
 // ---------------------------------------------------------------------------
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> RawSlot for ChunkedCborClaim<'s, B, F> {
     type Error = CborError;
-    type Token = (CborToken, Option<u64>);
+    type Token = CborToken;
     type SubDeserializer = ChunkedCborSubDeserializer<'s, B, F>;
 
     #[inline(always)]
@@ -60,47 +58,45 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> RawSlot for ChunkedCborClaim<'s, B, F
     }
 
     async fn next_token(mut self) -> Result<(Self, Self::Token), Self::Error> {
-        let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
-        let (handle, bignum_tag, tok) =
-            strip_tags_bignum_dispatch(handle, &mut self.offset, raw).await?;
+        let (handle, tok) = next_dispatch(self.handle, &mut self.offset).await?;
         Ok((
             Self {
                 handle,
                 offset: self.offset,
                 remaining_after: self.remaining_after,
             },
-            (tok, bignum_tag),
+            tok,
         ))
     }
 
     async fn next_token_or_done(mut self) -> Result<PairStep<Self, Self::Token>, Self::Error> {
-        let (handle, raw) = next_dispatch(self.handle, &mut self.offset).await?;
-        if matches!(raw, CborToken::Break) {
+        let (handle, tok) = next_dispatch(self.handle, &mut self.offset).await?;
+        if matches!(tok, CborToken::Break) {
             return Ok(PairStep::Done(Self {
                 handle,
                 offset: self.offset,
                 remaining_after: self.remaining_after,
             }));
         }
-        let (handle, bignum_tag, tok) =
-            strip_tags_bignum_dispatch(handle, &mut self.offset, raw).await?;
         Ok(PairStep::More(
             Self {
                 handle,
                 offset: self.offset,
                 remaining_after: self.remaining_after,
             },
-            (tok, bignum_tag),
+            tok,
         ))
     }
 
     #[inline(always)]
-    fn into_sub_deserializer(self, (tok, bignum_tag): Self::Token) -> Self::SubDeserializer {
-        ChunkedCborSubDeserializer::new_bignum(self.handle, self.offset, tok, bignum_tag)
+    fn into_sub_deserializer(self, tok: Self::Token) -> Self::SubDeserializer {
+        ChunkedCborSubDeserializer::new(self.handle, self.offset, tok)
     }
 
     #[inline(always)]
-    async fn skip_token(mut self, (tok, _bignum_tag): Self::Token) -> Result<Self, Self::Error> {
+    async fn skip_token(mut self, tok: Self::Token) -> Result<Self, Self::Error> {
+        // `skip_value_chunked` already handles `Tag` natively (it just pushes
+        // one more value to skip), so no resolution is needed here at all.
         let handle = skip_value_chunked(self.handle, &mut self.offset, tok).await?;
         Ok(Self {
             handle,
@@ -270,13 +266,18 @@ async fn decode_header<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             Ok((h, CborToken::Tag(v)))
         }
         7 => match info {
+            0..=19 => Ok((handle, CborToken::Simple(info))),
             20 => Ok((handle, CborToken::Bool(false))),
             21 => Ok((handle, CborToken::Bool(true))),
             22 => Ok((handle, CborToken::Null)),
             23 => Ok((handle, CborToken::Undefined)),
             24 => {
-                let (_h, [_v]) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
-                Err(CborError::UnexpectedByte { byte })
+                let (h, [v]) = read_bytes_exact::<_, _, 1>(handle, offset).await?;
+                if v < 32 {
+                    Err(CborError::UnexpectedByte { byte })
+                } else {
+                    Ok((h, CborToken::Simple(v)))
+                }
             }
             25 => {
                 let (h, b) = read_bytes_exact::<_, _, 2>(handle, offset).await?;
@@ -318,6 +319,18 @@ async fn strip_tags_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     }
 }
 
+/// Strip leading `Tag` tokens, tracking the bignum tag (2 or 3) immediately
+/// preceding the final value, needed by `deserialize_number_chunks`.
+///
+/// Deliberately **not** called when a slot/entry is first constructed —
+/// tags are resolved lazily, only by whichever probe method actually runs
+/// and needs a concrete (non-`Tag`) token to match against. Doing it eagerly
+/// at construction would mean discarding the tag before `CborTag`/`CborValue`
+/// (which specifically want to see it) ever got a chance to run; doing it
+/// lazily means every *other* probe method just resolves it for itself when
+/// it's the one that ends up executing — a few extra lines duplicated across
+/// a handful of methods, not a shared, premature decision baked into every
+/// value regardless of who's actually looking at it.
 async fn strip_tags_bignum_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
     mut handle: Handle<'s, B, F>,
     offset: &mut usize,
@@ -339,35 +352,6 @@ async fn strip_tags_bignum_dispatch<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                 tok = next;
             }
             other => return Ok((handle, bignum_tag, other)),
-        }
-    }
-}
-
-/// Strip leading `Tag` tokens using a `TagHandler`.
-/// Returns `None` if the handler vetoes any tag.
-pub(crate) async fn strip_tags_with_dispatch<
-    's,
-    B: Buffer,
-    F: AsyncFnMut(&mut B),
-    H: TagHandler,
->(
-    mut handle: Handle<'s, B, F>,
-    offset: &mut usize,
-    mut tok: CborToken,
-    mut handler: H,
-) -> Result<Option<(Handle<'s, B, F>, CborToken, H)>, CborError> {
-    loop {
-        match tok {
-            CborToken::Tag(n) => {
-                handler = match handler.handle(n) {
-                    Some(h) => h,
-                    None => return Ok(None),
-                };
-                let (h, next) = next_dispatch(handle, offset).await?;
-                handle = h;
-                tok = next;
-            }
-            other => return Ok(Some((handle, other, handler))),
         }
     }
 }
@@ -583,6 +567,7 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
                 | CborToken::Bool(_)
                 | CborToken::Null
                 | CborToken::Undefined
+                | CborToken::Simple(_)
                 | CborToken::Float16(_)
                 | CborToken::Float32(_)
                 | CborToken::Float64(_) => { /* leaf, nothing to push */ }
@@ -685,8 +670,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborDeserializer<'s, B, F> {
 pub struct ChunkedCborSubDeserializer<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
     pub(crate) offset: usize,
+    /// The token as read — *not* stripped of leading tags. See the
+    /// module-level note on `RawSlot`/`strip_tags_bignum_dispatch`.
     pub(crate) pending_tok: Option<CborToken>,
-    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborSubDeserializer<'s, B, F> {
@@ -696,22 +682,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborSubDeserializer<'s, B, F> 
             handle,
             offset,
             pending_tok: Some(tok),
-            bignum_tag: None,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn new_bignum(
-        handle: Handle<'s, B, F>,
-        offset: usize,
-        tok: CborToken,
-        bignum_tag: Option<u64>,
-    ) -> Self {
-        Self {
-            handle,
-            offset,
-            pending_tok: Some(tok),
-            bignum_tag,
         }
     }
 }
@@ -722,9 +692,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborSubDeserializer<'s, B, F> 
 
 pub struct ChunkedCborEntry<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     pub(crate) handle: Handle<'s, B, F>,
+    /// The token as read — *not* stripped of leading tags. See the
+    /// module-level note on `RawSlot`/`strip_tags_bignum_dispatch`.
     pub(crate) token: CborToken,
     pub(crate) offset: usize,
-    pub(crate) bignum_tag: Option<u64>,
 }
 
 impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
@@ -734,7 +705,6 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
             handle: self.handle.fork(),
             token: self.token,
             offset: self.offset,
-            bignum_tag: self.bignum_tag,
         }
     }
 
@@ -746,10 +716,26 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
         }
     }
 
+    /// Resolve past any leading tags, returning the final token and the
+    /// bignum tag (2 or 3) that immediately preceded it, if any. Called by
+    /// probe methods that fully commit to a Hit-or-Miss answer (never a
+    /// partial "delegate to an arbitrary nested type" outcome) — since this
+    /// consumes `self`'s own already-forked handle, a Miss here is exactly
+    /// as safe as any other Miss: sibling arms hold their own independent
+    /// forks and are unaffected.
+    async fn resolve(mut self) -> Result<(Self, Option<u64>), CborError> {
+        let (handle, bignum_tag, token) =
+            strip_tags_bignum_dispatch(self.handle, &mut self.offset, self.token).await?;
+        self.handle = handle;
+        self.token = token;
+        Ok((self, bignum_tag))
+    }
+
     pub(crate) async fn parse_num<T: crate::full::ParseNum>(
         self,
     ) -> Result<Probe<(ChunkedCborClaim<'s, B, F>, T)>, CborError> {
-        let v = match self.token {
+        let (this, _bignum_tag) = self.resolve().await?;
+        let v = match this.token {
             CborToken::UInt(n) => T::from_uint(n),
             CborToken::NegInt(n) => T::from_negint(n),
             CborToken::Float16(f) => T::from_f32(f),
@@ -758,7 +744,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedCborEntry<'s, B, F> {
             _ => return Ok(Probe::Miss),
         };
         match v {
-            Some(value) => Ok(Probe::Hit((self.into_claim(), value))),
+            Some(value) => Ok(Probe::Hit((this.into_claim(), value))),
             None => Ok(Probe::Miss),
         }
     }
@@ -781,21 +767,17 @@ where
     let main = de.shared.fork();
     let mut offset = de.offset;
 
-    let (main, raw_token) = if let Some(tok) = de.pending_tok {
+    let (main, token) = if let Some(tok) = de.pending_tok {
         (main, tok)
     } else {
         next_dispatch(main, &mut offset).await?
     };
-
-    let (main, bignum_tag, token) =
-        strip_tags_bignum_dispatch(main, &mut offset, raw_token).await?;
 
     let snap_offset = offset;
     let entry = ChunkedCborEntry {
         handle: main,
         token,
         offset: snap_offset,
-        bignum_tag,
     };
     let (claim, r) = hit!(f(repeat(entry, ChunkedCborEntry::clone)).await);
 
@@ -830,12 +812,10 @@ where
     let main = de.handle;
     let mut offset = de.offset;
 
-    // pending_tok is already tag-stripped by the parent; bignum_tag carried through
-    let (main, bignum_tag, token) = if let Some(tok) = de.pending_tok {
-        (main, de.bignum_tag, tok)
+    let (main, token) = if let Some(tok) = de.pending_tok {
+        (main, tok)
     } else {
-        let (h, raw) = next_dispatch(main, &mut offset).await?;
-        strip_tags_bignum_dispatch(h, &mut offset, raw).await?
+        next_dispatch(main, &mut offset).await?
     };
 
     let snap_offset = offset;
@@ -843,7 +823,6 @@ where
         handle: main,
         token,
         offset: snap_offset,
-        bignum_tag,
     };
     f(repeat(entry, ChunkedCborEntry::clone)).await
 }
@@ -908,21 +887,21 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
             handle: self.handle.fork(),
             token: self.token,
             offset: self.offset,
-            bignum_tag: self.bignum_tag,
         }
     }
 
     #[inline(always)]
     async fn deserialize_str_chunks(self) -> Result<Probe<Self::StrChunks>, Self::Error> {
-        match self.token {
+        let (this, _bignum_tag) = self.resolve().await?;
+        match this.token {
             CborToken::Tstr(len) => Ok(Probe::Hit(access::ChunkedCborStrAccess {
-                handle: self.handle,
-                offset: self.offset,
+                handle: this.handle,
+                offset: this.offset,
                 state: access::ChunkedStrState::Definite { remaining: len },
             })),
             CborToken::TstrIndef => Ok(Probe::Hit(access::ChunkedCborStrAccess {
-                handle: self.handle,
-                offset: self.offset,
+                handle: this.handle,
+                offset: this.offset,
                 state: access::ChunkedStrState::Indefinite,
             })),
             _ => Ok(Probe::Miss),
@@ -931,15 +910,16 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
 
     #[inline(always)]
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error> {
-        match self.token {
+        let (this, _bignum_tag) = self.resolve().await?;
+        match this.token {
             CborToken::Bstr(len) => Ok(Probe::Hit(access::ChunkedCborBytesAccess {
-                handle: self.handle,
-                offset: self.offset,
+                handle: this.handle,
+                offset: this.offset,
                 state: access::ChunkedBytesState::Definite { remaining: len },
             })),
             CborToken::BstrIndef => Ok(Probe::Hit(access::ChunkedCborBytesAccess {
-                handle: self.handle,
-                offset: self.offset,
+                handle: this.handle,
+                offset: this.offset,
                 state: access::ChunkedBytesState::Indefinite,
             })),
             _ => Ok(Probe::Miss),
@@ -953,18 +933,19 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
         if Enc::NAME != BigEndian::NAME {
             return Ok(Probe::Miss);
         }
-        match (self.bignum_tag, self.token) {
+        let (this, bignum_tag) = self.resolve().await?;
+        match (bignum_tag, this.token) {
             (Some(2 | 3), CborToken::Bstr(len)) => {
                 Ok(Probe::Hit(access::ChunkedCborNumberAccess {
-                    handle: self.handle,
-                    offset: self.offset,
+                    handle: this.handle,
+                    offset: this.offset,
                     state: access::ChunkedBytesState::Definite { remaining: len },
                 }))
             }
             (Some(2 | 3), CborToken::BstrIndef) => {
                 Ok(Probe::Hit(access::ChunkedCborNumberAccess {
-                    handle: self.handle,
-                    offset: self.offset,
+                    handle: this.handle,
+                    offset: this.offset,
                     state: access::ChunkedBytesState::Indefinite,
                 }))
             }
@@ -974,11 +955,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
 
     #[inline(always)]
     async fn deserialize_map(self) -> Result<Probe<Self::Map>, Self::Error> {
-        match self.token {
+        let (this, _bignum_tag) = self.resolve().await?;
+        match this.token {
             CborToken::Map(count) => Ok(Probe::Hit(strede::PairSeqMapAccess::new(
                 ChunkedCborClaim {
-                    handle: self.handle,
-                    offset: self.offset,
+                    handle: this.handle,
+                    offset: this.offset,
                     remaining_after: None,
                 },
                 count,
@@ -989,10 +971,11 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
 
     #[inline(always)]
     async fn deserialize_seq(self) -> Result<Probe<Self::Seq>, Self::Error> {
-        match self.token {
+        let (this, _bignum_tag) = self.resolve().await?;
+        match this.token {
             CborToken::Array(count) => Ok(Probe::Hit(access::ChunkedCborSeqAccess {
-                handle: self.handle,
-                offset: self.offset,
+                handle: this.handle,
+                offset: this.offset,
                 remaining: count,
             })),
             _ => Ok(Probe::Miss),
@@ -1001,16 +984,28 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedCborEntry<'s, B
 
     #[inline(always)]
     async fn deserialize_option<T>(
-        self,
+        mut self,
         extra: T::Extra,
     ) -> Result<Probe<(Self::Claim, Option<T>)>, Self::Error>
     where
         T: DeserializeOwned<Self::SubDeserializer>,
     {
-        match self.token {
-            CborToken::Null | CborToken::Undefined => Ok(Probe::Hit((self.into_claim(), None))),
-            other => {
-                let sub = ChunkedCborSubDeserializer::new(self.handle, self.offset, other);
+        // Peek on a *forked* handle to check null-ness without disturbing the
+        // original (still possibly tag-wrapped) position — if it turns out
+        // not to be null, `T` gets that original position untouched, so a
+        // `T` that itself cares about tags (`CborTag`/`CborValue`) still
+        // sees the full chain.
+        let peek_handle = self.handle.fork();
+        let peek = ChunkedCborEntry {
+            handle: peek_handle,
+            token: self.token,
+            offset: self.offset,
+        };
+        let (resolved, _bignum_tag) = peek.resolve().await?;
+        match resolved.token {
+            CborToken::Null | CborToken::Undefined => Ok(Probe::Hit((resolved.into_claim(), None))),
+            _ => {
+                let sub = ChunkedCborSubDeserializer::new(self.handle, self.offset, self.token);
                 let (claim, v) = hit!(T::deserialize_owned(sub, extra).await);
                 Ok(Probe::Hit((claim, Some(v))))
             }
@@ -1219,11 +1214,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
                 Probe::Miss => return Ok(Probe::Miss),
             };
 
-        // Read value token (already stripped of tags by sub-deserializer entry).
+        // Read value token — handed to `T` as-is (not tag-resolved), so a
+        // `T` that cares about tags sees them.
         let mut val_offset = key_claim.offset;
-        let (val_handle, raw_val) = next_dispatch(key_claim.handle, &mut val_offset).await?;
-        let (val_handle, val_tok) =
-            strip_tags_dispatch(val_handle, &mut val_offset, raw_val).await?;
+        let (val_handle, val_tok) = next_dispatch(key_claim.handle, &mut val_offset).await?;
 
         let sub = ChunkedCborSubDeserializer::new(val_handle, val_offset, val_tok);
         let (val_claim, t) = hit!(T::deserialize_owned(sub, extra).await);
@@ -1289,14 +1283,32 @@ macro_rules! impl_cbor_tag_owned {
                     let handler = handler_slot.take().unwrap();
                     let extra = extra_slot.take().unwrap();
                     async move {
+                        // `e.token` is exactly what was read — not resolved
+                        // past any leading tags — so this is the one place
+                        // that's allowed to actually see them: loop while
+                        // it's a `Tag`, handing each number to the handler in
+                        // order, same as the borrow family's `CborTag`.
+                        let mut handle = e.handle;
                         let mut offset = e.offset;
-                        let (handle, tok, h) =
-                            match strip_tags_with_dispatch(e.handle, &mut offset, e.token, handler)
-                                .await?
-                            {
-                                Some(x) => x,
-                                None => return Ok(Probe::Miss),
-                            };
+                        let mut tok = e.token;
+                        let mut h = handler;
+                        loop {
+                            match tok {
+                                CborToken::Tag(n) => {
+                                    h = match h.handle(n) {
+                                        Some(h2) => h2,
+                                        None => return Ok(Probe::Miss),
+                                    };
+                                    let (nh, next) = next_dispatch(handle, &mut offset).await?;
+                                    handle = nh;
+                                    tok = next;
+                                }
+                                other => {
+                                    tok = other;
+                                    break;
+                                }
+                            }
+                        }
                         let sub = ChunkedCborSubDeserializer::new(handle, offset, tok);
                         match T::deserialize_owned(sub, extra).await? {
                             Probe::Hit((claim, v)) => {

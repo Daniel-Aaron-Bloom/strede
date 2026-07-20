@@ -45,7 +45,7 @@ pub struct CborClaim<'de> {
 // ---------------------------------------------------------------------------
 
 pub struct CborDeserializer<'de> {
-    src: &'de [u8],
+    pub(crate) src: &'de [u8],
 }
 
 impl<'de> CborDeserializer<'de> {
@@ -62,6 +62,14 @@ pub struct CborSubDeserializer<'de> {
     src: &'de [u8],
     pending_tok: CborToken,
     bignum_tag: Option<u64>,
+    /// See `CborEntry::raw_start`. Defaults to `src` (i.e. "no leading tags
+    /// known to exist beyond `pending_tok`") for call sites that construct a
+    /// sub-deserializer without threading the true origin through; call sites
+    /// that dispatch to an arbitrary nested type (`deserialize_value`,
+    /// `deserialize_option`, `SeqEntry::get`, `MapValueProbe::deserialize_value`)
+    /// set this explicitly via `new_with_raw` so `CborTag`/`CborValue` nested
+    /// at that position can still see the real tag chain.
+    pub(crate) raw_start: &'de [u8],
 }
 
 impl<'de> CborSubDeserializer<'de> {
@@ -71,15 +79,22 @@ impl<'de> CborSubDeserializer<'de> {
             src,
             pending_tok: tok,
             bignum_tag: None,
+            raw_start: src,
         }
     }
 
     #[inline(always)]
-    pub(crate) fn new_bignum(src: &'de [u8], tok: CborToken, bignum_tag: Option<u64>) -> Self {
+    pub(crate) fn new_with_raw(
+        src: &'de [u8],
+        tok: CborToken,
+        bignum_tag: Option<u64>,
+        raw_start: &'de [u8],
+    ) -> Self {
         Self {
             src,
             pending_tok: tok,
             bignum_tag,
+            raw_start,
         }
     }
 }
@@ -128,23 +143,33 @@ fn strip_tags_bignum(
     }
 }
 
-/// Like `strip_tags` but uses a user-supplied `TagHandler`.
-pub(crate) fn strip_tags_with<H: TagHandler>(
-    src: &mut &[u8],
-    tok: CborToken,
+/// `(handler, final_token, raw_start, rest)` — `raw_start` is the position
+/// the final (non-tag) token began at, `rest` is the position right after
+/// that token's header.
+pub(crate) type StripTagsWithRaw<'de, H> = (H, CborToken, &'de [u8], &'de [u8]);
+
+/// Like `strip_tags` but uses a user-supplied `TagHandler`, and reads from a
+/// truly untouched position (i.e. before any generic entry-construction has
+/// already stripped tags). `raw_start` in the result lets a nested
+/// `CborTag`/`CborValue` re-read from there to see further tags of its own,
+/// exactly matching `strip_tags`/`strip_tags_bignum`'s `rest` semantics
+/// otherwise.
+pub(crate) fn strip_tags_with_raw<H: TagHandler>(
+    start: &[u8],
     mut handler: H,
-) -> Result<Option<(H, CborToken)>, CborError> {
-    let mut cur = tok;
+) -> Result<Option<StripTagsWithRaw<'_, H>>, CborError> {
+    let mut cur = start;
     loop {
-        match cur {
+        let raw_start = cur;
+        let tok = next_token(&mut cur)?;
+        match tok {
             CborToken::Tag(n) => {
                 handler = match handler.handle(n) {
                     Some(h) => h,
                     None => return Ok(None),
                 };
-                cur = next_token(src)?;
             }
-            other => return Ok(Some((handler, other))),
+            other => return Ok(Some((handler, other, raw_start, cur))),
         }
     }
 }
@@ -158,6 +183,7 @@ where
     F: FnMut([CborEntry<'de>; N]) -> Fut,
     Fut: core::future::Future<Output = Result<Probe<(CborClaim<'de>, R)>, CborError>>,
 {
+    let raw_start = de.src;
     let raw_tok = next_token(&mut de.src)?;
     let (bignum_tag, tok) = match strip_tags_bignum(&mut de.src, raw_tok)? {
         Some(t) => t,
@@ -167,6 +193,7 @@ where
         token: tok,
         src: de.src,
         bignum_tag,
+        raw_start,
     };
     match f(repeat(entry, |e| e.clone())).await? {
         Probe::Hit((claim, r)) => {
@@ -218,6 +245,7 @@ impl<'de> Deserializer<'de> for CborSubDeserializer<'de> {
             token: self.pending_tok,
             src: self.src,
             bignum_tag: self.bignum_tag,
+            raw_start: self.raw_start,
         };
         f(repeat(entry, |e| e.clone())).await
     }
@@ -233,6 +261,11 @@ pub struct CborEntry<'de> {
     /// Set to `Some(2)` or `Some(3)` when this entry is the payload of a CBOR
     /// bignum tag (unsigned or negative). Used by `deserialize_number_chunks`.
     pub(crate) bignum_tag: Option<u64>,
+    /// The position of this value before any leading tags were stripped.
+    /// Re-reading from here (via `next_token`) recovers the true, untouched
+    /// token chain. Used by `CborTag`/`CborValue`, which need to observe
+    /// tags that ordinary probe methods strip transparently.
+    pub(crate) raw_start: &'de [u8],
 }
 
 impl<'de> CborEntry<'de> {
@@ -241,6 +274,7 @@ impl<'de> CborEntry<'de> {
             token: self.token,
             src: self.src,
             bignum_tag: self.bignum_tag,
+            raw_start: self.raw_start,
         }
     }
 
@@ -497,7 +531,8 @@ impl<'de> Entry<'de> for CborEntry<'de> {
         match self.token {
             CborToken::Null | CborToken::Undefined => Ok(Probe::Hit((self.into_claim(), None))),
             other => {
-                let sub = CborSubDeserializer::new(self.src, other);
+                let sub =
+                    CborSubDeserializer::new_with_raw(self.src, other, None, self.raw_start);
                 let (claim, v) = hit!(T::deserialize(sub, extra).await);
                 Ok(Probe::Hit((claim, Some(v))))
             }
@@ -514,7 +549,9 @@ impl<'de> Entry<'de> for CborEntry<'de> {
     where
         T: Deserialize<'de, Self::SubDeserializer>,
     {
-        let sub = CborSubDeserializer::new(self.src, self.token);
+        // bignum_tag intentionally not forwarded here, matching prior behavior:
+        // only the map-value path (`MapValueProbe::deserialize_value`) threads it.
+        let sub = CborSubDeserializer::new_with_raw(self.src, self.token, None, self.raw_start);
         T::deserialize(sub, extra).await
     }
 
@@ -615,57 +652,84 @@ pub(crate) trait ParseNum: Sized {
 // CborTag impl for borrow family (concrete types)
 // ---------------------------------------------------------------------------
 
-macro_rules! impl_cbor_tag_borrow {
-    ($de:ty) => {
-        impl<'de, T, H> Deserialize<'de, $de> for CborTag<T, H>
-        where
-            T: Deserialize<'de, CborSubDeserializer<'de>>,
-            H: TagHandler,
-        {
-            type Extra = (H, T::Extra);
+impl<'de, T, H> Deserialize<'de, CborDeserializer<'de>> for CborTag<T, H>
+where
+    T: Deserialize<'de, CborSubDeserializer<'de>>,
+    H: TagHandler,
+{
+    type Extra = (H, T::Extra);
 
-            async fn deserialize(
-                d: $de,
-                (handler, extra): (H, T::Extra),
-            ) -> Result<Probe<(<$de as Deserializer<'de>>::Claim, Self)>, CborError> {
-                let mut handler_slot = Some(handler);
-                let mut extra_slot = Some(extra);
-                d.entry(|[e]| {
-                    let handler = handler_slot.take().unwrap();
-                    let extra = extra_slot.take().unwrap();
-                    async move {
-                        let mut src = e.src;
-                        let (h, tok) = match strip_tags_with(&mut src, e.token, handler)? {
-                            Some(x) => x,
-                            None => return Ok(Probe::Miss),
-                        };
-                        let sub = CborSubDeserializer::new(src, tok);
-                        match T::deserialize(sub, extra).await? {
-                            Probe::Hit((claim, v)) => {
-                                if h.finish() {
-                                    Ok(Probe::Hit((
-                                        claim,
-                                        CborTag {
-                                            handler: h,
-                                            value: v,
-                                        },
-                                    )))
-                                } else {
-                                    Ok(Probe::Miss)
-                                }
-                            }
-                            Probe::Miss => Ok(Probe::Miss),
-                        }
+    /// Reads directly from `d.src` — nothing has stripped tags yet at the
+    /// document root — instead of going through `Deserializer::entry`, which
+    /// would strip them first and leave nothing for this impl to observe.
+    async fn deserialize(
+        d: CborDeserializer<'de>,
+        (handler, extra): (H, T::Extra),
+    ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+        let (h, tok, raw_start, src) = match strip_tags_with_raw(d.src, handler)? {
+            Some(x) => x,
+            None => return Ok(Probe::Miss),
+        };
+        let sub = CborSubDeserializer::new_with_raw(src, tok, None, raw_start);
+        match T::deserialize(sub, extra).await? {
+            Probe::Hit((claim, v)) => {
+                if h.finish() {
+                    if !claim.src.is_empty() {
+                        return Err(CborError::ExpectedEnd);
                     }
-                })
-                .await
+                    Ok(Probe::Hit((
+                        claim,
+                        CborTag {
+                            handler: h,
+                            value: v,
+                        },
+                    )))
+                } else {
+                    Ok(Probe::Miss)
+                }
             }
+            Probe::Miss => Ok(Probe::Miss),
         }
-    };
+    }
 }
 
-impl_cbor_tag_borrow!(CborDeserializer<'de>);
-impl_cbor_tag_borrow!(CborSubDeserializer<'de>);
+impl<'de, T, H> Deserialize<'de, CborSubDeserializer<'de>> for CborTag<T, H>
+where
+    T: Deserialize<'de, CborSubDeserializer<'de>>,
+    H: TagHandler,
+{
+    type Extra = (H, T::Extra);
+
+    /// Reads from `d.raw_start` (the true origin of this value, threaded
+    /// through by whichever entry/probe constructed `d`) rather than `d.src`/
+    /// `d.pending_tok`, which have already been stripped of any leading tags.
+    async fn deserialize(
+        d: CborSubDeserializer<'de>,
+        (handler, extra): (H, T::Extra),
+    ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+        let (h, tok, raw_start, src) = match strip_tags_with_raw(d.raw_start, handler)? {
+            Some(x) => x,
+            None => return Ok(Probe::Miss),
+        };
+        let sub = CborSubDeserializer::new_with_raw(src, tok, None, raw_start);
+        match T::deserialize(sub, extra).await? {
+            Probe::Hit((claim, v)) => {
+                if h.finish() {
+                    Ok(Probe::Hit((
+                        claim,
+                        CborTag {
+                            handler: h,
+                            value: v,
+                        },
+                    )))
+                } else {
+                    Ok(Probe::Miss)
+                }
+            }
+            Probe::Miss => Ok(Probe::Miss),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CborStrAccess — borrow family string chunk accessor
@@ -906,6 +970,7 @@ impl<'de> MapKeyClaim<'de> for CborClaim<'de> {
     type ValueProbe = CborMapValueProbe<'de>;
 
     async fn into_value_probe(mut self) -> Result<Self::ValueProbe, Self::Error> {
+        let raw_start = self.src;
         let raw = next_token(&mut self.src)?;
         let (bignum_tag, value_tok) = match strip_tags_bignum(&mut self.src, raw)? {
             Some(t) => t,
@@ -916,6 +981,7 @@ impl<'de> MapKeyClaim<'de> for CborClaim<'de> {
             value_tok,
             remaining_after: self.remaining_after,
             bignum_tag,
+            raw_start,
         })
     }
 }
@@ -1028,6 +1094,8 @@ pub struct CborMapValueProbe<'de> {
     value_tok: CborToken,
     remaining_after: usize,
     bignum_tag: Option<u64>,
+    /// See `CborEntry::raw_start`.
+    raw_start: &'de [u8],
 }
 
 impl<'de> CborMapValueProbe<'de> {
@@ -1037,6 +1105,7 @@ impl<'de> CborMapValueProbe<'de> {
             value_tok: self.value_tok,
             remaining_after: self.remaining_after,
             bignum_tag: self.bignum_tag,
+            raw_start: self.raw_start,
         }
     }
 }
@@ -1059,7 +1128,12 @@ impl<'de> MapValueProbe<'de> for CborMapValueProbe<'de> {
         V: Deserialize<'de, Self::ValueSubDeserializer>,
     {
         let remaining_after = self.remaining_after;
-        let sub = CborSubDeserializer::new_bignum(self.src, self.value_tok, self.bignum_tag);
+        let sub = CborSubDeserializer::new_with_raw(
+            self.src,
+            self.value_tok,
+            self.bignum_tag,
+            self.raw_start,
+        );
         match V::deserialize(sub, extra).await? {
             Probe::Hit((claim, v)) => Ok(Probe::Hit((
                 CborClaim {
@@ -1204,6 +1278,8 @@ pub struct CborSeqEntry<'de> {
     pub(crate) src: &'de [u8],
     pub(crate) elem_tok: CborToken,
     pub(crate) bignum_tag: Option<u64>,
+    /// See `CborEntry::raw_start`.
+    pub(crate) raw_start: &'de [u8],
 }
 
 impl<'de> CborSeqEntry<'de> {
@@ -1212,6 +1288,7 @@ impl<'de> CborSeqEntry<'de> {
             src: self.src,
             elem_tok: self.elem_tok,
             bignum_tag: self.bignum_tag,
+            raw_start: self.raw_start,
         }
     }
 }
@@ -1233,6 +1310,7 @@ where
             remaining_after: 0,
         }))),
         Some(n) => {
+            let raw_start = src;
             let raw = next_token(&mut src)?;
             let (bignum_tag, elem_tok) = match strip_tags_bignum(&mut src, raw)? {
                 Some(t) => t,
@@ -1246,6 +1324,7 @@ where
                 src,
                 elem_tok,
                 bignum_tag,
+                raw_start,
             };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
@@ -1256,6 +1335,7 @@ where
         }
         None => {
             // Indefinite: check for break
+            let raw_start = src;
             let raw = next_token(&mut src)?;
             if matches!(raw, CborToken::Break) {
                 return Ok(Probe::Hit(Chunk::Done(CborClaim {
@@ -1271,6 +1351,7 @@ where
                 src,
                 elem_tok,
                 bignum_tag,
+                raw_start,
             };
             let (claim, r) = hit!(f(repeat(entry, |e| e.clone())).await);
             let updated_seq = CborSeqAccess {
@@ -1315,7 +1396,12 @@ impl<'de> SeqEntry<'de> for CborSeqEntry<'de> {
     where
         T: Deserialize<'de, Self::SubDeserializer>,
     {
-        let sub = CborSubDeserializer::new_bignum(self.src, self.elem_tok, self.bignum_tag);
+        let sub = CborSubDeserializer::new_with_raw(
+            self.src,
+            self.elem_tok,
+            self.bignum_tag,
+            self.raw_start,
+        );
         T::deserialize(sub, extra).await
     }
 
@@ -1394,6 +1480,7 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
             token: self.token,
             src: self.src,
             bignum_tag: None,
+            raw_start: self.src,
         };
         match_entry_str_against(entry, candidates.as_ref()).await
     }
@@ -1429,6 +1516,7 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
             token: key_tok,
             src,
             bignum_tag: None,
+            raw_start: src,
         };
         let (key_claim, MatchVals(idx, _)) = hit!(
             key_entry
@@ -1437,6 +1525,7 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
         );
 
         // Read value token.
+        let val_raw_start = key_claim.src;
         let mut val_src = key_claim.src;
         let raw_val = next_token(&mut val_src)?;
         let val_tok = match strip_tags(&mut val_src, raw_val)? {
@@ -1444,7 +1533,7 @@ impl<'de> EnumVariantProbe<'de> for CborEnumVariantProbe<'de> {
             None => return Ok(Probe::Miss),
         };
 
-        let sub = CborSubDeserializer::new(val_src, val_tok);
+        let sub = CborSubDeserializer::new_with_raw(val_src, val_tok, None, val_raw_start);
         let (val_claim, t) = hit!(T::deserialize(sub, extra).await);
 
         // Verify no additional keys follow (externally-tagged = exactly one KV pair).

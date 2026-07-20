@@ -804,7 +804,3 @@ conversion failures are type mismatches, not format violations.
 
 Both attributes are mutually exclusive with each other and with
 `deserialize_with` / `deserialize_owned_with` / `with` on the same item.
-
-## What's not here yet
-
-- Format implementations beyond JSON (CBOR, MessagePack, …)

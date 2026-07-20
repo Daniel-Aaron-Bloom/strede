@@ -125,6 +125,25 @@ pub fn cbor_undefined() -> u8 {
     0xf7
 }
 
+/// Encode a simple value directly in the initial byte (v in 0..=19).
+pub fn simple_direct(v: u8) -> u8 {
+    assert!(v <= 19);
+    0xe0 | v
+}
+
+/// Encode a simple value via the 1-byte form (v in 32..=255).
+pub fn simple_ext(v: u8) -> Vec<u8> {
+    assert!(v >= 32);
+    vec![0xf8, v]
+}
+
+/// Encode the *not well-formed* 1-byte simple form with v in 0..=31 — must
+/// use `simple_direct` instead. Used only to assert this is rejected.
+pub fn simple_ext_reserved(v: u8) -> Vec<u8> {
+    assert!(v < 32);
+    vec![0xf8, v]
+}
+
 /// Encode float16 (raw bits)
 pub fn float16(bits: u16) -> Vec<u8> {
     let mut out = vec![0xf9];

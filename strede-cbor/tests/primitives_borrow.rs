@@ -97,6 +97,32 @@ fn tstr_zero_copy() {
     }
 }
 
+// --- char ---
+
+#[test]
+fn char_from_single_char_tstr() {
+    let enc = helpers::tstr("x");
+    assert_eq!(parse::<char>(&enc), Some('x'));
+}
+
+#[test]
+fn char_misses_multi_char_tstr() {
+    let enc = helpers::tstr("xy");
+    assert_eq!(parse::<char>(&enc), None);
+}
+
+#[test]
+fn char_misses_empty_tstr() {
+    let enc = helpers::tstr("");
+    assert_eq!(parse::<char>(&enc), None);
+}
+
+#[test]
+fn char_misses_non_string() {
+    assert_eq!(parse::<char>(&[0x00]), None);
+    assert_eq!(parse::<char>(&[helpers::cbor_null()]), None);
+}
+
 #[test]
 fn type_mismatch_returns_miss() {
     // uint where bool expected

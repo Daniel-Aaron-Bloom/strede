@@ -74,16 +74,17 @@ let result = SharedBuf::with_async(
 | negative int | 1 | `NegInt(u64)` | `i8`, `i16`, `i32`, `i64`, `f32`, `f64` |
 | byte string (definite) | 2 | `Bstr(len)` | `&'de [u8]` / `Vec<u8>` |
 | byte string (indefinite) | 2 | `BstrIndef` | single-chunk: `&'de [u8]`; multi-chunk: chunks accessor |
-| text string (definite) | 3 | `Tstr(len)` | `&'de str` / `String` |
+| text string (definite) | 3 | `Tstr(len)` | `&'de str` / `String`; a single-character string also decodes as `char` |
 | text string (indefinite) | 3 | `TstrIndef` | single-chunk: `&'de str`; multi-chunk: chunks accessor |
 | array (definite) | 4 | `Array(Some(n))` | tuple structs, sequences |
 | array (indefinite) | 4 | `Array(None)` | same |
 | map (definite) | 5 | `Map(Some(n))` | named structs, maps |
 | map (indefinite) | 5 | `Map(None)` | same |
-| semantic tag | 6 | `Tag(u64)` | stripped by default; use `CborTag<T, H>` to inspect |
+| semantic tag | 6 | `Tag(u64)` | transparent to ordinary types; use `CborTag<T, H>` or `CborValue` to inspect |
 | bignum (tag 2/3) | 6 | `Tag(2\|3)` + `Bstr` | `deserialize_number_chunks::<BigEndian>()` streams magnitude bytes |
 | false / true | 7 | `Bool(bool)` | `bool` |
 | null / undefined | 7 | `Null` / `Undefined` | `()`, `Option<T>` (None) |
+| simple value (0–19, or 32–255 via 1-byte form) | 7 | `Simple(u8)` | `CborValue::Simple`; no other built-in type matches it |
 | float16 | 7 | `Float16(f32)` | `f32`, `f64` |
 | float32 | 7 | `Float32(f32)` | `f32`, `f64` |
 | float64 | 7 | `Float64(f64)` | `f32`, `f64` |
@@ -192,12 +193,16 @@ enum Event {
 
 ## Semantic tags
 
-CBOR semantic tags (major type 6) are stripped automatically before dispatching
-to type probes. If you need to inspect or require a tag, use
-`CborTag<T, H: TagHandler>`:
+CBOR semantic tags (major type 6) are transparent to ordinary types — `u64`,
+`String`, a derived struct field, and so on all see straight through a tag (or
+a stack of them) to the value underneath, with no wrapper to unwrap and no
+special handling required. If you need to inspect or require a tag, use
+`CborTag<T, H: TagHandler>`, which works anywhere an ordinary type would —
+top-level, a struct field, a seq element, a map value — and handles values
+wrapped in any number of stacked tags, not just one:
 
 ```rust
-use strede_cbor::tag::{CborTag, Required};
+use strede_cbor::{CborTag, Required};
 
 // Only accept values wrapped in tag number 1 (epoch-based date/time).
 type EpochTimestamp = CborTag<u64, Required<1>>;
@@ -248,6 +253,7 @@ Variants:
 | `Null` | — |
 | `Undefined` | — |
 | `Bool(bool)` | — |
+| `Simple(u8)` | major type 7, simple value other than false/true/null/undefined |
 | `UInt(u64)` | major type 0 |
 | `Int(i64)` | major type 1, values −2⁶³ … −1 |
 | `NegIntOverflow(u64)` | major type 1, values below −2⁶³ (raw additional value N; actual = −1−N) |
@@ -256,7 +262,7 @@ Variants:
 | `Tstr(String)` | major type 3 (definite and indefinite) |
 | `Array(Vec<CborValue>)` | major type 4 (definite and indefinite) |
 | `Map(Vec<(CborValue, CborValue)>)` | major type 5; key order preserved |
-| `Tag { number: u64, value: Box<CborValue> }` | major type 6 |
+| `Tag { number: u64, value: Box<CborValue> }` | major type 6; nests one layer per stacked tag, to any depth |
 
 `Map` uses `Vec` pairs rather than a hash map so key order is preserved and
 any key type (including non-string and non-integer keys) is supported.
