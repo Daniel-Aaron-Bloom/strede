@@ -247,7 +247,12 @@ impl<'de> Entry<'de> for PostcardEntry<'de> {
     {
         match self.src.first() {
             None => Err(PostcardError::UnexpectedEnd),
-            Some(&0x00) => Ok(Probe::Hit((PostcardClaim { src: &self.src[1..] }, None))),
+            Some(&0x00) => Ok(Probe::Hit((
+                PostcardClaim {
+                    src: &self.src[1..],
+                },
+                None,
+            ))),
             Some(&0x01) => {
                 let sub = PostcardSubDeserializer::new(&self.src[1..]);
                 let (claim, v) = hit!(T::deserialize(sub, extra).await);
@@ -440,9 +445,7 @@ impl<'de> MapKeyClaim<'de> for PostcardClaim<'de> {
     type ValueProbe = PostcardMapValueProbe<'de>;
 
     async fn into_value_probe(self) -> Result<Self::ValueProbe, Self::Error> {
-        Ok(PostcardMapValueProbe {
-            src: self.src,
-        })
+        Ok(PostcardMapValueProbe { src: self.src })
     }
 }
 
@@ -827,7 +830,9 @@ impl<'de> EnumVariantProbe<'de> for PostcardEnumVariantProbe<'de> {
         candidates: W,
     ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
     where
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         for &(_name, local_idx) in candidates.as_ref() {
@@ -845,7 +850,9 @@ impl<'de> EnumVariantProbe<'de> for PostcardEnumVariantProbe<'de> {
     ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
     where
         T: Deserialize<'de, Self::PayloadDeserializer>,
-        W: strede::ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
         W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
     {
         for &(_name, local_idx) in candidates.as_ref() {

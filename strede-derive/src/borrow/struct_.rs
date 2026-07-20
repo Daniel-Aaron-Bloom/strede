@@ -5,8 +5,7 @@ use syn::{Data, DeriveInput, Fields};
 use super::gen_container_from_borrow;
 use crate::common::{
     DefaultAttr, FieldContext, apply_borrow_field_bound, borrow_lifetimes, classify_fields,
-    field_bound_borrow, has_universal_blanket, insert_de_and_d_borrow,
-    type_param_bound_borrow,
+    field_bound_borrow, has_universal_blanket, insert_de_and_d_borrow, type_param_bound_borrow,
 };
 
 /// Generate wrapper newtypes for fields with `deserialize_with`, `from`, or `try_from` (borrow family).
@@ -385,7 +384,9 @@ pub(super) fn expand(
             if !has_de {
                 dfs_gen.params.insert(0, syn::parse_quote!('de));
             }
-            dfs_gen.params.push(syn::parse_quote!(__S: #krate::SeqAccess<'de>));
+            dfs_gen
+                .params
+                .push(syn::parse_quote!(__S: #krate::SeqAccess<'de>));
         }
         {
             let wc = dfs_gen.make_where_clause();
@@ -550,7 +551,9 @@ pub(super) fn expand(
     // order ensures positional arm indices match (postcard).
     enum FieldKind<'a> {
         Skip,
-        Regular { reg_idx: usize },
+        Regular {
+            reg_idx: usize,
+        },
         Flatten {
             ty: &'a syn::Type,
             borrow: &'a Option<crate::common::BorrowAttr>,
@@ -570,7 +573,10 @@ pub(super) fn expand(
                     reg_idx += 1;
                     FieldKind::Regular { reg_idx: r }
                 } else {
-                    FieldKind::Flatten { ty, borrow: &cf.borrow }
+                    FieldKind::Flatten {
+                        ty,
+                        borrow: &cf.borrow,
+                    }
                 }
             })
             .collect()
@@ -785,8 +791,11 @@ pub(super) fn expand(
                             let (i, kind) = field_iter.next().expect("regular field present");
                             if matches!(kind, FieldKind::Regular { .. }) {
                                 let offset = &arm_offset_tokens[i];
-                                let reg_idx =
-                                    if let FieldKind::Regular { reg_idx } = kind { *reg_idx } else { unreachable!() };
+                                let reg_idx = if let FieldKind::Regular { reg_idx } = kind {
+                                    *reg_idx
+                                } else {
+                                    unreachable!()
+                                };
                                 let cf = de_classified[reg_idx];
                                 let primary = &cf.wire_name;
                                 entries.push(quote! { (#primary, #offset) });
@@ -1117,7 +1126,6 @@ pub(super) fn expand(
         }
     }
     let (de_impl_generics, _, de_where_clause) = de_impl_gen.split_for_impl();
-
 
     // DFM body: build arms (DetectDuplicates + optional SkipUnknown), iterate, reconstruct.
     let dfm_arms_expr: TokenStream2 = {

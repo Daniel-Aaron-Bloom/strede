@@ -285,7 +285,9 @@ pub(super) fn expand_owned(
 
         // Build DeserializeFromSeqOwned<__S> where-clause: bounds on __S::Elem::SubDeserializer.
         let mut dfs_gen = input.generics.clone();
-        dfs_gen.params.push(syn::parse_quote!(__S: #krate::SeqAccessOwned));
+        dfs_gen
+            .params
+            .push(syn::parse_quote!(__S: #krate::SeqAccessOwned));
         {
             let wc = dfs_gen.make_where_clause();
             if let Some(preds) = &container_attrs.bound {

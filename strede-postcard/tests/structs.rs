@@ -112,7 +112,10 @@ fn named_with_str() {
     data.extend_from_slice(&pstr("hello"));
     assert_eq!(
         parse::<Named<'_>>(&data),
-        Ok(Some(Named { id: 42, label: "hello" }))
+        Ok(Some(Named {
+            id: 42,
+            label: "hello"
+        }))
     );
 }
 
@@ -127,14 +130,20 @@ fn named_truncated_errors() {
 fn named_with_default_absent_errors() {
     // Postcard is positional: missing y causes UnexpectedEnd, not a graceful default.
     let data = varint(5);
-    assert_eq!(parse_err::<WithDefault>(&data), PostcardError::UnexpectedEnd);
+    assert_eq!(
+        parse_err::<WithDefault>(&data),
+        PostcardError::UnexpectedEnd
+    );
 }
 
 #[test]
 fn named_with_default_present() {
     let mut data = varint(5);
     data.extend_from_slice(&varint(10));
-    assert_eq!(parse::<WithDefault>(&data), Ok(Some(WithDefault { x: 5, y: 10 })));
+    assert_eq!(
+        parse::<WithDefault>(&data),
+        Ok(Some(WithDefault { x: 5, y: 10 }))
+    );
 }
 
 // --- Tuple structs ---
@@ -182,7 +191,11 @@ fn flatten_positional_order() {
     data.extend_from_slice(&varint(4));
     assert_eq!(
         parse::<OuterFlat>(&data),
-        Ok(Some(OuterFlat { a: 1, inner: Inner { x: 2, y: 3 }, b: 4 }))
+        Ok(Some(OuterFlat {
+            a: 1,
+            inner: Inner { x: 2, y: 3 },
+            b: 4
+        }))
     );
 }
 
@@ -210,7 +223,10 @@ fn tuple_three() {
     let mut data = varint(1);
     data.extend_from_slice(&pstr("hi"));
     data.push(0x01); // bool true
-    assert_eq!(parse::<(u32, &str, bool)>(&data), Ok(Some((1u32, "hi", true))));
+    assert_eq!(
+        parse::<(u32, &str, bool)>(&data),
+        Ok(Some((1u32, "hi", true)))
+    );
 }
 
 // --- Nested structs ---
@@ -218,12 +234,16 @@ fn tuple_three() {
 #[test]
 fn nested_struct() {
     // Nested { a: 5, inner: Point { x: 1, y: 2 }, b: true }
-    let mut data = varint(5);     // a
-    data.extend_from_slice(&varint(1));  // inner.x
-    data.extend_from_slice(&varint(2));  // inner.y
-    data.push(0x01);              // b = true
+    let mut data = varint(5); // a
+    data.extend_from_slice(&varint(1)); // inner.x
+    data.extend_from_slice(&varint(2)); // inner.y
+    data.push(0x01); // b = true
     assert_eq!(
         parse::<Nested>(&data),
-        Ok(Some(Nested { a: 5, inner: Point { x: 1, y: 2 }, b: true }))
+        Ok(Some(Nested {
+            a: 5,
+            inner: Point { x: 1, y: 2 },
+            b: true
+        }))
     );
 }

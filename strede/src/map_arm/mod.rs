@@ -169,12 +169,7 @@ pub struct DetectDuplicates<S, W, KeyFn, SkipFn> {
 }
 
 impl<S, W, KeyFn, SkipFn> DetectDuplicates<S, W, KeyFn, SkipFn> {
-    pub fn new(
-        inner: S,
-        wire_names: W,
-        key_fn: KeyFn,
-        skip_fn: SkipFn,
-    ) -> Self {
+    pub fn new(inner: S, wire_names: W, key_fn: KeyFn, skip_fn: SkipFn) -> Self {
         Self {
             inner,
             key_fn,
@@ -198,9 +193,7 @@ pub struct TagInjectingStack<'v, S, W, TagKeyFn, TagValFn> {
     pub tag_value: &'v core::cell::Cell<Option<usize>>,
 }
 
-impl<'v, S, W, TagKeyFn, TagValFn>
-    TagInjectingStack<'v, S, W, TagKeyFn, TagValFn>
-{
+impl<'v, S, W, TagKeyFn, TagValFn> TagInjectingStack<'v, S, W, TagKeyFn, TagValFn> {
     pub fn new(
         inner: S,
         tag_field: &'static str,

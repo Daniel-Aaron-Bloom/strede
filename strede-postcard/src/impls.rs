@@ -55,7 +55,12 @@ impl ParseNum for u128 {
         let (lo, c1) = decode_varint(src)?;
         let (hi, c2) = decode_varint(&src[c1..])?;
         let v = (lo as u128) | ((hi as u128) << 64);
-        Ok(Probe::Hit((PostcardClaim { src: &src[c1 + c2..] }, v)))
+        Ok(Probe::Hit((
+            PostcardClaim {
+                src: &src[c1 + c2..],
+            },
+            v,
+        )))
     }
 }
 
@@ -67,7 +72,12 @@ impl ParseNum for i128 {
         let (hi, c2) = decode_varint(&src[c1..])?;
         let raw = (lo as u128) | ((hi as u128) << 64);
         let v = ((raw >> 1) as i128) ^ (-((raw & 1) as i128));
-        Ok(Probe::Hit((PostcardClaim { src: &src[c1 + c2..] }, v)))
+        Ok(Probe::Hit((
+            PostcardClaim {
+                src: &src[c1 + c2..],
+            },
+            v,
+        )))
     }
 }
 
@@ -78,7 +88,10 @@ impl ParseNum for f32 {
             return Err(PostcardError::UnexpectedEnd);
         }
         let bytes: [u8; 4] = src[..4].try_into().unwrap();
-        Ok(Probe::Hit((PostcardClaim { src: &src[4..] }, f32::from_le_bytes(bytes))))
+        Ok(Probe::Hit((
+            PostcardClaim { src: &src[4..] },
+            f32::from_le_bytes(bytes),
+        )))
     }
 }
 
@@ -89,7 +102,10 @@ impl ParseNum for f64 {
             return Err(PostcardError::UnexpectedEnd);
         }
         let bytes: [u8; 8] = src[..8].try_into().unwrap();
-        Ok(Probe::Hit((PostcardClaim { src: &src[8..] }, f64::from_le_bytes(bytes))))
+        Ok(Probe::Hit((
+            PostcardClaim { src: &src[8..] },
+            f64::from_le_bytes(bytes),
+        )))
     }
 }
 
@@ -117,7 +133,12 @@ impl ParseNum for char {
     fn parse(src: &[u8]) -> Result<Probe<(PostcardClaim<'_>, Self)>, PostcardError> {
         let (cp, consumed) = decode_varint(src)?;
         match char::from_u32(cp as u32) {
-            Some(c) => Ok(Probe::Hit((PostcardClaim { src: &src[consumed..] }, c))),
+            Some(c) => Ok(Probe::Hit((
+                PostcardClaim {
+                    src: &src[consumed..],
+                },
+                c,
+            ))),
             None => Ok(Probe::Miss),
         }
     }
@@ -152,10 +173,19 @@ macro_rules! impl_deserialize_borrow_both {
 }
 
 impl_deserialize_borrow_both!(
-    bool, (),
-    u8, u16, u32, u64, u128,
-    i8, i16, i32, i64, i128,
-    f32, f64,
+    bool,
+    (),
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    f32,
+    f64,
     char
 );
-

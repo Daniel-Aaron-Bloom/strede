@@ -5,9 +5,9 @@
 extern crate alloc;
 
 mod error;
-mod varint;
-mod impls;
 pub mod full;
+mod impls;
+mod varint;
 
 pub use error::PostcardError;
 pub use full::{

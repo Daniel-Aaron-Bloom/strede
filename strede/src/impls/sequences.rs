@@ -1,7 +1,9 @@
 use super::*;
-use crate::{hit, or_miss, select_probe};
 use crate::borrow::{DeserializeFromMap, MapAccess, MapKeyProbe, MapValueProbe};
-use crate::owned::{BytesAccessOwned, DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned};
+use crate::owned::{
+    BytesAccessOwned, DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned,
+};
+use crate::{hit, or_miss, select_probe};
 
 /// Reinterpret a `Vec<u8>` as `Vec<T>` via raw-parts cast.
 /// # Safety

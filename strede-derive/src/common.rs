@@ -160,7 +160,6 @@ pub fn has_universal_blanket(ty: &syn::Type) -> bool {
     }
 }
 
-
 /// Whether a field is flattened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FlattenMode {

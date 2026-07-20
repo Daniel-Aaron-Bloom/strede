@@ -19,8 +19,8 @@ pub struct Never<'a, Claim, Error>(
 use crate::borrow::{
     BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap, DeserializeFromSeq,
     Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess, MapArmStack,
-    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, NumberEncoding, SeqAccess,
-    SeqEntry, StrAccess,
+    MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess, NumberEncoding,
+    SeqAccess, SeqEntry, StrAccess,
 };
 use crate::owned::{
     BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
@@ -482,7 +482,9 @@ impl<C, E: DeserializeError> BytesAccessOwned for crate::Never<'_, C, E> {
     }
 }
 
-impl<C, E: DeserializeError, Enc: NumberEncoding> NumberAccessOwned<Enc> for crate::Never<'_, C, E> {
+impl<C, E: DeserializeError, Enc: NumberEncoding> NumberAccessOwned<Enc>
+    for crate::Never<'_, C, E>
+{
     type Claim = C;
     type Error = E;
     async fn next_number_chunk<R>(

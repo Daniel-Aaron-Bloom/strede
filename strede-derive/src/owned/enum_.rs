@@ -340,9 +340,7 @@ fn gen_tuple_variant_helpers_owned(
             let helper_d_ident = format_ident!("__D2");
             let helper_bounds: Vec<syn::WherePredicate> = field_types
                 .iter()
-                .map(|fty| {
-                    field_bound_owned(krate, fty, FieldContext::SeqElem, &helper_d_ident)
-                })
+                .map(|fty| field_bound_owned(krate, fty, FieldContext::SeqElem, &helper_d_ident))
                 .collect();
 
             tokens.extend(quote! {

@@ -276,10 +276,7 @@ where
                         let cands = candidates.as_ref();
                         for i in 0..cands.len() {
                             if viable_slice[i] && cands[i].0.len() == consumed {
-                                return Ok(Probe::Hit((
-                                    claim,
-                                    MatchVals(cands[i].1, PhantomData),
-                                )));
+                                return Ok(Probe::Hit((claim, MatchVals(cands[i].1, PhantomData))));
                             }
                         }
                         return Ok(Probe::Miss);

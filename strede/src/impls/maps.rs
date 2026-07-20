@@ -253,7 +253,10 @@ mod collect_map {
 
         type DispatchState = ValFut;
         fn init_dispatch(&mut self, _: usize, vp: VP<'de, KP>) -> ValFut {
-            let k = self.pending_key.take().expect("dispatch without pending key");
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch without pending key");
             (self.val_fn)(vp, k)
         }
         #[allow(clippy::type_complexity)]
@@ -324,7 +327,10 @@ mod collect_map {
 
         type DispatchState = ValFut;
         fn init_dispatch(&mut self, _: usize, vp: owned_::VP<KP>) -> ValFut {
-            let k = self.pending_key.take().expect("dispatch without pending key");
+            let k = self
+                .pending_key
+                .take()
+                .expect("dispatch without pending key");
             (self.val_fn)(vp, k)
         }
         #[allow(clippy::type_complexity)]
@@ -352,8 +358,8 @@ mod collect_map {
 
 #[cfg(feature = "alloc")]
 mod btreemap_impls {
-    use super::*;
     use super::collect_map::{CollectMap, MapCollect};
+    use super::*;
     use crate::borrow::{KP, MapKeyProbe, VP};
     use crate::owned::{self as owned_, MapKeyProbeOwned, MapValueProbeOwned};
     use alloc::collections::BTreeMap;
@@ -381,15 +387,16 @@ mod btreemap_impls {
         async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map
-                    .iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
+                let (claim, out) = hit!(
+                    map.iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
                         |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
                         |vp: VP<'de, KP<'de, D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
                             Ok(Probe::Hit((vc, (k, v))))
                         },
                     ))
-                    .await);
+                    .await
+                );
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -410,15 +417,16 @@ mod btreemap_impls {
         async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map
-                    .iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
+                let (claim, out) = hit!(
+                    map.iterate_dyn(CollectMap::<K, V, BTreeMap<K, V>, _, _>::new(
                         |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
                         |vp: owned_::VP<owned_::KP<D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
                             Ok(Probe::Hit((vc, (k, v))))
                         },
                     ))
-                    .await);
+                    .await
+                );
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -429,8 +437,8 @@ mod btreemap_impls {
 #[cfg(feature = "std")]
 mod hashmap_impls {
     extern crate std;
-    use super::*;
     use super::collect_map::{CollectMap, MapCollect};
+    use super::*;
     use crate::borrow::{KP, MapKeyProbe, VP};
     use crate::owned::{self as owned_, MapKeyProbeOwned, MapValueProbeOwned};
     use core::hash::{BuildHasher, Hash};
@@ -462,15 +470,16 @@ mod hashmap_impls {
         async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map
-                    .iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
+                let (claim, out) = hit!(
+                    map.iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
                         |kp: KP<'de, D>| kp.deserialize_key::<K>(()),
                         |vp: VP<'de, KP<'de, D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
                             Ok(Probe::Hit((vc, (k, v))))
                         },
                     ))
-                    .await);
+                    .await
+                );
                 Ok(Probe::Hit((claim, out)))
             })
             .await
@@ -493,15 +502,16 @@ mod hashmap_impls {
         async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
             d.entry(|[e]| async move {
                 let map = hit!(e.deserialize_map().await);
-                let (claim, out) = hit!(map
-                    .iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
+                let (claim, out) = hit!(
+                    map.iterate_dyn(CollectMap::<K, V, HashMap<K, V, S>, _, _>::new(
                         |kp: owned_::KP<D>| kp.deserialize_key::<K>(()),
                         |vp: owned_::VP<owned_::KP<D>>, k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<V>(()).await);
                             Ok(Probe::Hit((vc, (k, v))))
                         },
                     ))
-                    .await);
+                    .await
+                );
                 Ok(Probe::Hit((claim, out)))
             })
             .await

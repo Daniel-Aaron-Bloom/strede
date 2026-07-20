@@ -603,7 +603,9 @@ where
         let b_kp = kp.fork();
         ConcatRaceState {
             a: self.0.init_race(kp, arm_base, field_base),
-            b: self.1.init_race(b_kp, arm_base + A::SIZE, field_base + A::FIELD_COUNT),
+            b: self
+                .1
+                .init_race(b_kp, arm_base + A::SIZE, field_base + A::FIELD_COUNT),
         }
     }
 

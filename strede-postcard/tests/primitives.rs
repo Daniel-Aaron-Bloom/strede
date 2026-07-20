@@ -196,7 +196,10 @@ fn f32_value() {
 
 #[test]
 fn f32_truncated_errors() {
-    assert_eq!(parse_err::<f32>(&[0x00, 0x00]), PostcardError::UnexpectedEnd);
+    assert_eq!(
+        parse_err::<f32>(&[0x00, 0x00]),
+        PostcardError::UnexpectedEnd
+    );
 }
 
 #[test]
@@ -212,7 +215,10 @@ fn f32_pos_infinity() {
 
 #[test]
 fn f32_neg_infinity() {
-    assert_eq!(parse::<f32>(&pf32(f32::NEG_INFINITY)), Ok(Some(f32::NEG_INFINITY)));
+    assert_eq!(
+        parse::<f32>(&pf32(f32::NEG_INFINITY)),
+        Ok(Some(f32::NEG_INFINITY))
+    );
 }
 
 // --- f64 ---
@@ -241,7 +247,10 @@ fn f64_pos_infinity() {
 
 #[test]
 fn f64_neg_infinity() {
-    assert_eq!(parse::<f64>(&pf64(f64::NEG_INFINITY)), Ok(Some(f64::NEG_INFINITY)));
+    assert_eq!(
+        parse::<f64>(&pf64(f64::NEG_INFINITY)),
+        Ok(Some(f64::NEG_INFINITY))
+    );
 }
 
 // --- char ---

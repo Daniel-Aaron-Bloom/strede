@@ -107,7 +107,10 @@ fn vec_struct_empty() {
 fn vec_struct_single() {
     let p = encode_point(3, 7);
     let data = pseq(&[p.as_slice()]);
-    assert_eq!(parse::<Vec<Point>>(&data), Ok(Some(vec![Point { x: 3, y: 7 }])));
+    assert_eq!(
+        parse::<Vec<Point>>(&data),
+        Ok(Some(vec![Point { x: 3, y: 7 }]))
+    );
 }
 
 #[test]

@@ -1,11 +1,11 @@
 use const_array_concat::ConcatableArray;
 use core::future::Future;
 
+use crate::borrow::{Ascii, NumberEncoding};
 pub use crate::map_arm::{
     ArmState, DetectDuplicates, False, MapArm, MapArmBase, MapArmSlot, NextKey, StackConcat,
     TagInjectingStack, True, VirtualArmSlot,
 };
-use crate::borrow::{Ascii, NumberEncoding};
 use crate::{Chunk, DeserializeError, Probe};
 
 // ===========================================================================

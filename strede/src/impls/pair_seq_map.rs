@@ -126,7 +126,10 @@ async fn next_pair<C: RawSlot>(
         Some(0) => Ok(PairStep::Done(cursor.with_remaining_after(Some(0)))),
         Some(n) => {
             let (cursor, token) = cursor.next_token().await?;
-            Ok(PairStep::More(cursor.with_remaining_after(Some(n - 1)), token))
+            Ok(PairStep::More(
+                cursor.with_remaining_after(Some(n - 1)),
+                token,
+            ))
         }
         None => match cursor.next_token_or_done().await? {
             PairStep::Done(cursor) => Ok(PairStep::Done(cursor.with_remaining_after(None))),
@@ -230,9 +233,10 @@ impl<C: RawSlot> MapKeyProbeOwned for PairSeqKeyProbe<C> {
     {
         let sub = self.cursor.into_sub_deserializer(self.token);
         match K::deserialize_owned(sub, extra).await? {
-            Probe::Hit((claim, k)) => {
-                Ok(Probe::Hit((claim.with_remaining_after(self.remaining_after), k)))
-            }
+            Probe::Hit((claim, k)) => Ok(Probe::Hit((
+                claim.with_remaining_after(self.remaining_after),
+                k,
+            ))),
             Probe::Miss => Ok(Probe::Miss),
         }
     }
@@ -261,9 +265,10 @@ impl<C: RawSlot> MapValueProbeOwned for PairSeqValueProbe<C> {
     {
         let sub = self.cursor.into_sub_deserializer(self.token);
         match V::deserialize_owned(sub, extra).await? {
-            Probe::Hit((claim, v)) => {
-                Ok(Probe::Hit((claim.with_remaining_after(self.remaining_after), v)))
-            }
+            Probe::Hit((claim, v)) => Ok(Probe::Hit((
+                claim.with_remaining_after(self.remaining_after),
+                v,
+            ))),
             Probe::Miss => Ok(Probe::Miss),
         }
     }

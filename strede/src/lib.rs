@@ -66,9 +66,9 @@ pub mod shared_buf;
 pub use strede_derive::{Deserialize, DeserializeOwned};
 
 // -- shared types --
+pub use const_array_concat::{ArrayConcat, ConcatableArray};
 pub use error::DeserializeError;
 pub use never::Never;
-pub use const_array_concat::{ArrayConcat, ConcatableArray};
 pub use probe::{Chunk, Probe};
 pub use shared_buf::{Buffer, Handle, SharedBuf};
 
@@ -76,8 +76,8 @@ pub use shared_buf::{Buffer, Handle, SharedBuf};
 pub use borrow::{
     Ascii, BigEndian, BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap,
     DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
-    LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim,
-    MapValueProbe, NumberAccess, NumberEncoding, SeqAccess, SeqEntry, StrAccess,
+    LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
+    NumberAccess, NumberEncoding, SeqAccess, SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -145,11 +145,11 @@ pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
 // -- owned family --
 pub use owned::{
     ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
-    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates,
-    EntryOwned, EnumAccessOwned, EnumVariantProbeOwned, False, MapAccessOwned, MapArm,
-    MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
-    MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
-    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStack, True, VirtualArmSlot,
+    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates, EntryOwned,
+    EnumAccessOwned, EnumVariantProbeOwned, False, MapAccessOwned, MapArm, MapArmBase, MapArmSlot,
+    MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned,
+    NextKey, NumberAccessOwned, SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned,
+    TagInjectingStack, True, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]
