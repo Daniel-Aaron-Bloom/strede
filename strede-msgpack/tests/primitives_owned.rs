@@ -173,3 +173,28 @@ fn str_misses_non_string() {
     assert_eq!(parse!(String, &[42]), None);
     assert_eq!(parse!(String, &[0xc0]), None);
 }
+
+// --- char ---
+
+#[test]
+fn char_from_single_char_str() {
+    let bytes = fixstr("x");
+    assert_eq!(parse!(char, &bytes), Some('x'));
+}
+
+#[test]
+fn char_misses_multi_char_str() {
+    let bytes = fixstr("xy");
+    assert_eq!(parse!(char, &bytes), None);
+}
+
+#[test]
+fn char_misses_empty_str() {
+    assert_eq!(parse!(char, &[0xa0]), None);
+}
+
+#[test]
+fn char_misses_non_string() {
+    assert_eq!(parse!(char, &[42]), None);
+    assert_eq!(parse!(char, &[0xc0]), None);
+}

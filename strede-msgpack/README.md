@@ -76,8 +76,8 @@ let result = SharedBuf::with_async(
 | positive fixint, uint8/16/32/64 | `UInt(u64)` | `u8`, `u16`, `u32`, `u64`, `f32`, `f64` |
 | negative fixint, int8/16/32/64 | `Int(i64)` | `i8`, `i16`, `i32`, `i64`, `f32`, `f64` |
 | float32 / float64 | `Float32` / `Float64` | `f32`, `f64` (cross-width allowed) |
-| fixstr, str8/16/32 | `Str(len)` | `&'de str` / `String`, also `&'de [u8]` / `Vec<u8>` |
-| bin8/16/32 | `Bin(len)` | `&'de [u8]` / `Vec<u8>`, also `&'de str` / `String` |
+| fixstr, str8/16/32 | `Str(len)` | `&'de str` / `String`, also `&'de [u8]` / `Vec<u8>`; a single-character string also decodes as `char` |
+| bin8/16/32 | `Bin(len)` | `&'de [u8]` / `Vec<u8>` |
 | fixarray, array16/32 | `Array(count)` | tuple structs, sequences |
 | fixmap, map16/32 | `Map(count)` | named structs, maps |
 | fixext1/2/4/8/16 | `FixExt { type_id, data, len }` | `FixExtWrapper<T>` via `DeserializeFromFixExt`; fixext4/8 with type_id = -1 also decode as `MsgpackTimestamp` |
