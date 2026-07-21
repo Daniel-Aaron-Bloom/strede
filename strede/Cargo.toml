@@ -18,7 +18,7 @@ alloc = ["strede-derive/alloc"]
 rc = []
 
 [dependencies]
-strede-derive = { path = "../strede-derive", version = "=0.1.1" }
+strede-derive = { path = "../strede-derive", version = "=0.2.0" }
 arrayvec = { workspace = true }
 const-array-concat = { workspace = true }
 pin-list = { version = "0.1.2", default-features = false }
