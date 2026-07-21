@@ -3,7 +3,7 @@
 //! Postcard enums use a varint discriminant (declaration order, 0-indexed).
 //! No variant names appear on the wire.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod helpers;
 use helpers::*;

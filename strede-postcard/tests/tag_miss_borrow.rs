@@ -4,6 +4,7 @@
 //! Named tag fields cannot be represented on the wire. Both representations return
 //! Probe::Miss regardless of input, matching serde-postcard's "WontImplement" stance
 //! (postcard issue #125).
+#![recursion_limit = "256"]
 
 mod helpers;
 use helpers::*;
