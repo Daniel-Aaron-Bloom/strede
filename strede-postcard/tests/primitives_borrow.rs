@@ -1,4 +1,5 @@
 //! Primitive deserialization: bool, integers, floats, str, bytes, char, unit, option.
+#![allow(clippy::approx_constant)]
 
 mod helpers;
 use helpers::*;

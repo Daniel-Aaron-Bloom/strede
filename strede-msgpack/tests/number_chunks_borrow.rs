@@ -1,4 +1,5 @@
 //! `deserialize_number_chunks` tests — borrow family.
+#![allow(clippy::approx_constant)]
 
 mod helpers;
 use helpers::*;

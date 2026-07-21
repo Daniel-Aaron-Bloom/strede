@@ -1,4 +1,5 @@
 //! `deserialize_number_chunks` tests — owned/chunked family.
+#![allow(clippy::approx_constant)]
 
 mod helpers;
 use helpers::*;

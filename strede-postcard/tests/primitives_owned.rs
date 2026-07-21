@@ -7,6 +7,7 @@
 //! `deserialize_str_chunks`/`deserialize_bytes_chunks`-only surface.
 
 #![recursion_limit = "256"]
+#![allow(clippy::approx_constant)]
 
 #[macro_use]
 mod helpers;
@@ -320,11 +321,13 @@ fn string_invalid_utf8_errors() {
 
 // --- Vec<u8> (owned-family stand-in for &[u8]) ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn bytes_empty() {
     assert_eq!(parse_owned!(Vec<u8>, &pbytes(&[])), Ok(Some(vec![])));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn bytes_values() {
     let data = &[0x00u8, 0x01, 0xff];

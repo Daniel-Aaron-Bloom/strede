@@ -111,6 +111,7 @@ fn string_length_varint_split_from_payload() {
 // that would misparse if `Vec<u8>` were read as a seq of varint-encoded `u8`
 // elements. That interpretation is never attempted here - see
 // `strede-postcard/src/vec.rs`, which always treats `Vec<u8>` as raw bytes.
+#[cfg(feature = "alloc")]
 #[test]
 fn bytes_length_varint_split_from_payload() {
     let data: Vec<u8> = (0u8..=255).collect();
@@ -126,6 +127,7 @@ fn bytes_length_varint_split_from_payload() {
 
 // --- seq count varint split across chunks ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn seq_count_varint_split_across_chunks() {
     // 200 elements forces a 2-byte count varint.

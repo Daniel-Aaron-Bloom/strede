@@ -118,8 +118,8 @@ pub struct ChunkedPostcardMapKeyProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
     /// `deserialize_key`. `false` for a struct field, where fields have no
     /// wire key names at all and `deserialize_key` must stay a no-op `Miss`
     /// - dynamic-only, since the derive races `deserialize_key::<Match>`
-    /// against `deserialize_key_by_index` for every struct field, and a real
-    /// decode attempt there could misparse arbitrary field bytes.
+    ///   against `deserialize_key_by_index` for every struct field, and a real
+    ///   decode attempt there could misparse arbitrary field bytes.
     pub(crate) dynamic: bool,
 }
 
