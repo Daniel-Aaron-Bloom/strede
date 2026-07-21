@@ -16,7 +16,7 @@ arrayvec = { version = "0.7.6", default-features = false }
 const-array-concat = "0.2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Daniel-Aaron-Bloom/strede"

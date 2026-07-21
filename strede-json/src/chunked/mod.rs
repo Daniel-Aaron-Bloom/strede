@@ -35,7 +35,7 @@ use strede::utils::repeat;
 use strede::{
     Ascii, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
     DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
-    EnumVariantProbeOwned, Handle, NumberEncoding, Probe, SharedBuf, hit,
+    EnumVariantProbeOwned, Handle, NumberEncoding, Probe, SharedBuf, hit, or_miss,
 };
 
 // ---------------------------------------------------------------------------
@@ -419,7 +419,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'s, B, F> {
             }
         }
         let s = core::str::from_utf8(&scratch[..len]).map_err(|_| JsonError::InvalidNumber)?;
-        let value = T::parse(s)?;
+        let value = or_miss!(T::parse(s));
         let claim = ChunkedJsonClaim {
             tokenizer: Tokenizer::new(),
             offset: self.offset,
@@ -430,15 +430,15 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'s, B, F> {
 }
 
 trait ParseNum: Sized {
-    fn parse(s: &str) -> Result<Self, JsonError>;
+    fn parse(s: &str) -> Option<Self>;
 }
 
 macro_rules! impl_parse_num {
     ($($t:ty),*) => {
         $(impl ParseNum for $t {
             #[inline(always)]
-            fn parse(s: &str) -> Result<Self, JsonError> {
-                s.parse().map_err(|_| JsonError::InvalidNumber)
+            fn parse(s: &str) -> Option<Self> {
+                s.parse().ok()
             }
         })*
     };
