@@ -1,4 +1,4 @@
-//! Owned-family single-flatten fixtures exercising the v3 `FlattenMapAccessOwned` path.
+//! Owned-family single-flatten fixtures exercising the derive's `MapFieldProviderOwned` codegen.
 
 use strede::{DeserializeOwned, Probe, SharedBuf};
 use strede_derive::DeserializeOwned as DeriveDeserializeOwned;
@@ -19,7 +19,7 @@ struct Outer {
 }
 
 macro_rules! parse {
-    ($input:expr) => {{
+    ($ty:ty, $input:expr) => {{
         let input: &[u8] = $input;
         block_on_loop(SharedBuf::with_async(
             input,
@@ -28,7 +28,7 @@ macro_rules! parse {
             },
             async |shared| {
                 let de = ChunkedJsonDeserializer::new(shared);
-                match <Outer as DeserializeOwned<_>>::deserialize_owned(de, ())
+                match <$ty as DeserializeOwned<_>>::deserialize_owned(de, ())
                     .await
                     .unwrap()
                 {
@@ -40,9 +40,18 @@ macro_rules! parse {
     }};
 }
 
+// Field before AND after the flatten — exercises the before/after arm split.
+#[derive(Debug, PartialEq, DeriveDeserializeOwned)]
+struct OuterWithSuffix {
+    prefix: u32,
+    #[strede(flatten)]
+    inner: Inner,
+    suffix: u32,
+}
+
 #[test]
 fn outer_then_inner() {
-    let o: Outer = parse!(&br#"{"id": 7, "a": 1, "b": 2}"#[..]).unwrap();
+    let o: Outer = parse!(Outer, &br#"{"id": 7, "a": 1, "b": 2}"#[..]).unwrap();
     assert_eq!(
         o,
         Outer {
@@ -54,7 +63,7 @@ fn outer_then_inner() {
 
 #[test]
 fn interleaved_order() {
-    let o: Outer = parse!(&br#"{"a": 1, "id": 7, "b": 2}"#[..]).unwrap();
+    let o: Outer = parse!(Outer, &br#"{"a": 1, "id": 7, "b": 2}"#[..]).unwrap();
     assert_eq!(
         o,
         Outer {
@@ -66,7 +75,7 @@ fn interleaved_order() {
 
 #[test]
 fn inner_then_outer() {
-    let o: Outer = parse!(&br#"{"a": 1, "b": 2, "id": 7}"#[..]).unwrap();
+    let o: Outer = parse!(Outer, &br#"{"a": 1, "b": 2, "id": 7}"#[..]).unwrap();
     assert_eq!(
         o,
         Outer {
@@ -78,12 +87,60 @@ fn inner_then_outer() {
 
 #[test]
 fn missing_outer_field_misses() {
-    let v: Option<Outer> = parse!(&br#"{"a": 1, "b": 2}"#[..]);
+    let v: Option<Outer> = parse!(Outer, &br#"{"a": 1, "b": 2}"#[..]);
     assert!(v.is_none());
 }
 
 #[test]
 fn missing_inner_field_misses() {
-    let v: Option<Outer> = parse!(&br#"{"id": 7, "a": 1}"#[..]);
+    let v: Option<Outer> = parse!(Outer, &br#"{"id": 7, "a": 1}"#[..]);
+    assert!(v.is_none());
+}
+
+#[test]
+fn suffix_outer_then_inner_then_suffix() {
+    let o: OuterWithSuffix = parse!(
+        OuterWithSuffix,
+        &br#"{"prefix": 1, "a": 2, "b": 3, "suffix": 4}"#[..]
+    )
+    .unwrap();
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
+}
+
+#[test]
+fn suffix_interleaved() {
+    let o: OuterWithSuffix = parse!(
+        OuterWithSuffix,
+        &br#"{"a": 2, "suffix": 4, "prefix": 1, "b": 3}"#[..]
+    )
+    .unwrap();
+    assert_eq!(
+        o,
+        OuterWithSuffix {
+            prefix: 1,
+            inner: Inner { a: 2, b: 3 },
+            suffix: 4
+        }
+    );
+}
+
+#[test]
+fn suffix_missing_prefix_misses() {
+    let v: Option<OuterWithSuffix> =
+        parse!(OuterWithSuffix, &br#"{"a": 2, "b": 3, "suffix": 4}"#[..]);
+    assert!(v.is_none());
+}
+
+#[test]
+fn suffix_missing_suffix_misses() {
+    let v: Option<OuterWithSuffix> =
+        parse!(OuterWithSuffix, &br#"{"prefix": 1, "a": 2, "b": 3}"#[..]);
     assert!(v.is_none());
 }

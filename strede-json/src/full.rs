@@ -25,9 +25,11 @@ use crate::{
 };
 
 use strede::{
-    BytesAccess, Chunk, Deserialize, DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry,
-    MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, NumberAccess,
-    Probe, SeqAccess, SeqEntry, StrAccess, hit, utils::repeat,
+    Ascii, BytesAccess, Chunk, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess,
+    MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
+    NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit,
+    match_entry_str_against, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -288,10 +290,10 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     type SubDeserializer = JsonSubDeserializer<'de>;
     type StrChunks = JsonStrAccess<'de>;
     type BytesChunks = JsonBytesAccess<'de>;
-    type NumberChunks = JsonNumberAccess<'de>;
+    type NumberChunks<Enc: NumberEncoding> = JsonNumberAccess<'de>;
     type Map = JsonMapAccess<'de>;
     type Seq = JsonSeqAccess<'de>;
-
+    type Enum = JsonEnumAccess<'de>;
     fn fork(&mut self) -> Self {
         self.clone()
     }
@@ -367,7 +369,12 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
 
     // ---- Number chunks -----------------------------------------------------
 
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != Ascii::NAME {
+            return Ok(Probe::Miss);
+        }
         match self.token {
             Token::Number(access) => Ok(Probe::Hit(JsonNumberAccess {
                 access,
@@ -384,7 +391,6 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
             Token::Simple(SimpleToken::ObjectStart, tok) => Ok(Probe::Hit(JsonMapAccess {
                 tokenizer: tok,
                 src: self.src,
-                first: true,
             })),
             _ => Ok(Probe::Miss),
         }
@@ -473,6 +479,35 @@ impl<'de> Entry<'de> for JsonEntry<'de> {
     }
 
     #[inline(always)]
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
+        match self.token {
+            Token::Str(_) | Token::Simple(SimpleToken::ObjectStart, _) => {
+                Ok(Probe::Hit(JsonEnumAccess {
+                    token: self.token,
+                    src: self.src,
+                    start_src: self.start_src,
+                }))
+            }
+            _ => Ok(Probe::Miss),
+        }
+    }
+
+    #[inline(always)]
+    async fn deserialize_enum_into<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnum<'de, Self::Enum>,
+    {
+        let e = match Entry::deserialize_enum(self).await? {
+            Probe::Hit(e) => e,
+            Probe::Miss => return Ok(Probe::Miss),
+        };
+        T::deserialize_from_enum(e, extra).await
+    }
+
+    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut src = self.src;
         let tok = skip_value(&mut src, self.token)?;
@@ -537,15 +572,6 @@ impl<'de> StrAccess for JsonStrAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-            char_buf: self.char_buf,
-        }
-    }
-
     async fn next_str<R>(
         mut self,
         f: impl FnOnce(&str) -> R,
@@ -575,15 +601,6 @@ impl<'de> BytesAccess for JsonBytesAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-            char_buf: self.char_buf,
-        }
-    }
-
     async fn next_bytes<R>(
         mut self,
         f: impl FnOnce(&[u8]) -> R,
@@ -612,24 +629,16 @@ pub struct JsonNumberAccess<'de> {
     src: &'de [u8],
 }
 
-impl<'de> NumberAccess for JsonNumberAccess<'de> {
+impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for JsonNumberAccess<'de> {
     type Claim = JsonClaim<'de>;
     type Error = JsonError;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            access: self.access,
-            src: self.src,
-        }
-    }
-
     async fn next_number_chunk<R>(
         mut self,
-        f: impl FnOnce(&str) -> R,
+        f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         match self.access.next_chunk(&mut self.src) {
-            Ok(Some(chunk)) => Ok(Chunk::Data((self, f(chunk)))),
+            Ok(Some(chunk)) => Ok(Chunk::Data((self, f(Enc::from_str(chunk))))),
             Ok(None) => Ok(Chunk::Done(JsonClaim {
                 tokenizer: Tokenizer::new(),
                 src: self.src,
@@ -646,7 +655,6 @@ impl<'de> NumberAccess for JsonNumberAccess<'de> {
 pub struct JsonMapAccess<'de> {
     tokenizer: Tokenizer,
     src: &'de [u8],
-    first: bool,
 }
 
 /// Key probe: holds the start-of-key token and remaining source bytes.
@@ -713,9 +721,6 @@ impl<'de> MapValueProbe<'de> for JsonMapValueProbe<'de> {
     type MapClaim = JsonClaim<'de>;
     type ValueClaim = JsonClaim<'de>;
     type ValueSubDeserializer = JsonSubDeserializer<'de>;
-    type ValueMap = JsonMapAccess<'de>;
-    type ValueSeq = JsonSeqAccess<'de>;
-
     #[inline(always)]
     fn fork(&mut self) -> Self {
         self.clone()
@@ -731,48 +736,6 @@ impl<'de> MapValueProbe<'de> for JsonMapValueProbe<'de> {
     {
         let sub = JsonSubDeserializer::new(self.src, self.start_src, self.value_tok);
         V::deserialize(sub, extra).await
-    }
-
-    #[inline(always)]
-    async fn deserialize_map_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromMap<'de, Self::ValueMap>,
-    {
-        match self.value_tok {
-            Token::Simple(SimpleToken::ObjectStart, tok) => {
-                let map = JsonMapAccess {
-                    tokenizer: tok,
-                    src: self.src,
-                    first: true,
-                };
-                V::deserialize_from_map(map, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn deserialize_seq_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromSeq<'de, Self::ValueSeq>,
-    {
-        match self.value_tok {
-            Token::Simple(SimpleToken::ArrayStart, tok) => {
-                let seq = JsonSeqAccess {
-                    tokenizer: tok,
-                    src: self.src,
-                    first: true,
-                };
-                V::deserialize_from_seq(seq, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
     }
 
     #[inline(always)]
@@ -857,67 +820,76 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'de> {
     type MapClaim = JsonClaim<'de>;
     type KeyProbe = JsonMapKeyProbe<'de>;
 
-    #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            tokenizer: self.tokenizer.clone(),
-            src: self.src,
-            first: self.first,
-        }
-    }
-
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
-        mut arms: S,
+        arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
-        // Get the first key probe (or end-of-map for empty maps).
-        let mut key_probe_opt: Option<JsonMapKeyProbe<'de>> = {
-            let mut src = self.src;
-            let tok = self.tokenizer;
-            let start_src = src;
-            match tok.next_token(&mut src) {
-                Ok(Token::Simple(SimpleToken::ObjectEnd, new_tok)) => {
-                    // Empty map.
-                    return Ok(Probe::Hit((
-                        JsonClaim {
-                            tokenizer: new_tok,
-                            src,
-                        },
-                        arms.take_outputs(),
-                    )));
-                }
-                Ok(key_tok) => Some(JsonMapKeyProbe {
-                    src,
-                    start_src,
-                    key_tok,
-                }),
-                Err(e) => return Err(e),
+        json_map_iterate(self, arms).await
+    }
+
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error> {
+        json_map_iterate(self, arms).await
+    }
+}
+
+/// Shared body for [`MapAccess::iterate`] / [`MapAccess::iterate_dyn`] — JSON
+/// objects are wire-identical for structs and dynamic collections (both are
+/// just `{"key": value, ...}`), so both trait methods delegate here rather
+/// than one calling the other.
+async fn json_map_iterate<'de, S: MapArmStack<'de, JsonMapKeyProbe<'de>>>(
+    map: JsonMapAccess<'de>,
+    mut arms: S,
+) -> Result<Probe<(JsonClaim<'de>, S::Outputs)>, JsonError> {
+    // Get the first key probe (or end-of-map for empty maps).
+    let mut key_probe_opt: Option<JsonMapKeyProbe<'de>> = {
+        let mut src = map.src;
+        let tok = map.tokenizer;
+        let start_src = src;
+        match tok.next_token(&mut src) {
+            Ok(Token::Simple(SimpleToken::ObjectEnd, new_tok)) => {
+                // Empty map.
+                return Ok(Probe::Hit((
+                    JsonClaim {
+                        tokenizer: new_tok,
+                        src,
+                    },
+                    arms.take_outputs(),
+                )));
             }
+            Ok(key_tok) => Some(JsonMapKeyProbe {
+                src,
+                start_src,
+                key_tok,
+            }),
+            Err(e) => return Err(e),
+        }
+    };
+
+    loop {
+        let key_probe = match key_probe_opt.take() {
+            Some(kp) => kp,
+            None => unreachable!(),
         };
 
-        loop {
-            let key_probe = match key_probe_opt.take() {
-                Some(kp) => kp,
-                None => unreachable!(),
-            };
-
-            match arms.race_keys(key_probe).await? {
-                Probe::Miss => return Ok(Probe::Miss),
-                Probe::Hit((arm_index, key_claim)) => {
-                    let value_probe = key_claim.into_value_probe().await?;
-                    match arms.dispatch_value(arm_index, value_probe).await? {
-                        Probe::Miss => return Ok(Probe::Miss),
-                        Probe::Hit((value_claim, ())) => {
-                            match value_claim
-                                .next_key(arms.unsatisfied_count(), arms.open_count())
-                                .await?
-                            {
-                                strede::NextKey::Done(map_claim) => {
-                                    return Ok(Probe::Hit((map_claim, arms.take_outputs())));
-                                }
-                                strede::NextKey::Entry(next_kp) => {
-                                    key_probe_opt = Some(next_kp);
-                                }
+        match arms.race_keys(key_probe).await? {
+            Probe::Miss => return Ok(Probe::Miss),
+            Probe::Hit((arm_index, key_claim)) => {
+                let value_probe = key_claim.into_value_probe().await?;
+                match arms.dispatch_value(arm_index, value_probe).await? {
+                    Probe::Miss => return Ok(Probe::Miss),
+                    Probe::Hit((value_claim, ())) => {
+                        match value_claim
+                            .next_key(arms.unsatisfied_count(), arms.open_count())
+                            .await?
+                        {
+                            strede::NextKey::Done(map_claim) => {
+                                return Ok(Probe::Hit((map_claim, arms.take_outputs())));
+                            }
+                            strede::NextKey::Entry(next_kp) => {
+                                key_probe_opt = Some(next_kp);
                             }
                         }
                     }
@@ -1018,15 +990,6 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'de> {
     type Elem = JsonSeqEntry<'de>;
 
     #[inline(always)]
-    fn fork(&mut self) -> Self {
-        Self {
-            tokenizer: self.tokenizer.clone(),
-            src: self.src,
-            first: self.first,
-        }
-    }
-
-    #[inline(always)]
     async fn next<const N: usize, F, Fut, R>(
         self,
         f: F,
@@ -1060,8 +1023,6 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
     type Error = JsonError;
     type Claim = JsonClaim<'de>;
     type SubDeserializer = JsonSubDeserializer<'de>;
-    type Map = JsonMapAccess<'de>;
-    type Seq = JsonSeqAccess<'de>;
 
     #[inline(always)]
     fn fork(&mut self) -> Self {
@@ -1078,42 +1039,6 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
     }
 
     #[inline(always)]
-    async fn get_map_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromMap<'de, Self::Map>,
-    {
-        match self.elem_tok {
-            Token::Simple(SimpleToken::ObjectStart, tok) => {
-                let map = JsonMapAccess {
-                    tokenizer: tok,
-                    src: self.src,
-                    first: true,
-                };
-                T::deserialize_from_map(map, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
-    async fn get_seq_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromSeq<'de, Self::Seq>,
-    {
-        match self.elem_tok {
-            Token::Simple(SimpleToken::ArrayStart, tok) => {
-                let seq = JsonSeqAccess {
-                    tokenizer: tok,
-                    src: self.src,
-                    first: true,
-                };
-                T::deserialize_from_seq(seq, extra).await
-            }
-            _ => Ok(Probe::Miss),
-        }
-    }
-
-    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut src = self.src;
         let tok = skip_value(&mut src, self.elem_tok)?;
@@ -1127,36 +1052,51 @@ impl<'de> SeqEntry<'de> for JsonSeqEntry<'de> {
 // ---------------------------------------------------------------------------
 // Per-format primitive Deserialize impls
 //
-// Each ships an `impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for T`.
-// The orphan rule allows this because `JsonSubDeserializer` is a local type.
+// Both `JsonDeserializer` and `JsonSubDeserializer` are local types, so both
+// are covered here. The orphan rule is satisfied for either.
 // ---------------------------------------------------------------------------
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for bool {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            match e.token {
-                Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
-                    JsonClaim {
-                        tokenizer: tok,
-                        src: e.src,
-                    },
-                    b,
-                ))),
-                _ => Ok(Probe::Miss),
+macro_rules! impl_deserialize_bool {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for bool {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    match e.token {
+                        Token::Simple(SimpleToken::Bool(b), tok) => Ok(Probe::Hit((
+                            JsonClaim {
+                                tokenizer: tok,
+                                src: e.src,
+                            },
+                            b,
+                        ))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
             }
-        })
-        .await
-    }
+        })*
+    };
 }
+impl_deserialize_bool!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
 
 macro_rules! impl_deserialize_num {
     ($($t:ty),*) => {
-        $(impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for $t {
+        $(impl<'de> Deserialize<'de, JsonDeserializer<'de>> for $t {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: JsonDeserializer<'de>,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move { e.parse_num::<$t>().await }).await
+            }
+        }
+        impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for $t {
             type Extra = ();
             #[inline(always)]
             async fn deserialize(
@@ -1208,44 +1148,196 @@ macro_rules! impl_deserialize_number_borrowed {
 #[cfg(feature = "arbitrary_precision")]
 impl_deserialize_number_borrowed!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for char {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            let (claim, s) = hit!(e.deserialize_str().await);
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => Ok(Probe::Hit((claim, c))),
-                _ => Ok(Probe::Miss),
+macro_rules! impl_deserialize_char {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for char {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    let (claim, s) = hit!(e.deserialize_str().await);
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Ok(Probe::Hit((claim, c))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
             }
-        })
-        .await
+        })*
+    };
+}
+impl_deserialize_char!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
+
+macro_rules! impl_deserialize_unit {
+    ($($de:ty),*) => {
+        $(impl<'de> Deserialize<'de, $de> for () {
+            type Extra = ();
+            #[inline(always)]
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+                d.entry(|[e]| async move {
+                    match e.token {
+                        Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
+                            JsonClaim {
+                                tokenizer: tok,
+                                src: e.src,
+                            },
+                            (),
+                        ))),
+                        _ => Ok(Probe::Miss),
+                    }
+                })
+                .await
+            }
+        })*
+    };
+}
+impl_deserialize_unit!(JsonDeserializer<'de>, JsonSubDeserializer<'de>);
+
+// ---------------------------------------------------------------------------
+// JsonEnumAccess / JsonEnumVariantProbe
+// ---------------------------------------------------------------------------
+
+/// [`EnumAccess`] for JSON externally-tagged enums.
+///
+/// - Unit variants: bare string token (`"VariantName"`)
+/// - Non-unit variants: single-key object (`{"VariantName": <payload>}`)
+pub struct JsonEnumAccess<'de> {
+    token: Token,
+    src: &'de [u8],
+    start_src: &'de [u8],
+}
+
+impl<'de> EnumAccess<'de> for JsonEnumAccess<'de> {
+    type Error = JsonError;
+    type Claim = JsonClaim<'de>;
+    type VariantProbe = JsonEnumVariantProbe<'de>;
+
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStack<'de, Self::VariantProbe>,
+    {
+        let vp = JsonEnumVariantProbe {
+            token: self.token,
+            src: self.src,
+            start_src: self.start_src,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
     }
 }
 
-impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for () {
-    type Extra = ();
-    #[inline(always)]
-    async fn deserialize(
-        d: JsonSubDeserializer<'de>,
-        _: (),
-    ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
-        d.entry(|[e]| async move {
-            match e.token {
-                Token::Simple(SimpleToken::Null, tok) => Ok(Probe::Hit((
-                    JsonClaim {
-                        tokenizer: tok,
-                        src: e.src,
-                    },
-                    (),
-                ))),
-                _ => Ok(Probe::Miss),
-            }
-        })
-        .await
+/// [`EnumVariantProbe`] for JSON externally-tagged enums.
+pub struct JsonEnumVariantProbe<'de> {
+    token: Token,
+    src: &'de [u8],
+    start_src: &'de [u8],
+}
+
+impl<'de> EnumVariantProbe<'de> for JsonEnumVariantProbe<'de> {
+    type Error = JsonError;
+    type Claim = JsonClaim<'de>;
+    type PayloadDeserializer = JsonSubDeserializer<'de>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            token: self.token.clone(),
+            src: self.src,
+            start_src: self.start_src,
+        }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        let entry = JsonEntry {
+            token: self.token,
+            src: self.src,
+            start_src: self.start_src,
+        };
+        match_entry_str_against(entry, candidates.as_ref()).await
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        // Expect a single-key object `{"VariantName": <payload>}`.
+        let (mut src, tok) = match self.token {
+            Token::Simple(SimpleToken::ObjectStart, tok) => (self.src, tok),
+            _ => return Ok(Probe::Miss),
+        };
+
+        // Read the key token (or empty-object `}`).
+        let start_src = src;
+        let key_tok = match tok.next_token(&mut src) {
+            Ok(Token::Simple(SimpleToken::ObjectEnd, _)) => return Ok(Probe::Miss),
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+
+        // Build a key probe and match against candidates using MatchVals.
+        let key_probe = JsonMapKeyProbe {
+            src,
+            start_src,
+            key_tok,
+        };
+        let (key_claim, MatchVals(idx, _)) = hit!(
+            key_probe
+                .deserialize_key::<MatchVals<usize, W>>(candidates)
+                .await
+        );
+
+        // Advance past `:` and read the value token.
+        let value_probe = key_claim.into_value_probe().await?;
+
+        // Deserialize value as T.
+        let sub = JsonSubDeserializer::new(
+            value_probe.src,
+            value_probe.start_src,
+            value_probe.value_tok,
+        );
+        let (value_claim, t) = hit!(T::deserialize(sub, extra).await);
+
+        // Expect `}` — no additional keys allowed in an externally-tagged enum.
+        let map_claim = match value_claim.next_key(0, 0).await? {
+            NextKey::Done(c) => c,
+            NextKey::Entry(_) => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_claim, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+    {
+        let sub = JsonSubDeserializer::new(self.src, self.start_src, self.token);
+        T::deserialize(sub, extra).await
     }
 }

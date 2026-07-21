@@ -43,17 +43,6 @@ struct Three {
     c: C,
 }
 
-#[derive(Debug, PartialEq, DeriveDeserializeOwned)]
-struct ThreeBoxed {
-    id: u32,
-    #[strede(flatten(boxed))]
-    a: A,
-    #[strede(flatten)]
-    b: B,
-    #[strede(flatten)]
-    c: C,
-}
-
 macro_rules! parse {
     ($ty:ty, $input:expr) => {{
         let input: &[u8] = $input;
@@ -159,40 +148,4 @@ fn three_missing_c_field_misses() {
         &br#"{"id": 1, "a1": 2, "a2": 3, "b1": 4, "b2": 5, "c1": 6}"#[..]
     );
     assert!(v.is_none());
-}
-
-#[test]
-fn three_boxed_in_order() {
-    let v: ThreeBoxed = parse!(
-        ThreeBoxed,
-        &br#"{"id": 1, "a1": 2, "a2": 3, "b1": 4, "b2": 5, "c1": 6, "c2": 7}"#[..]
-    )
-    .unwrap();
-    assert_eq!(
-        v,
-        ThreeBoxed {
-            id: 1,
-            a: A { a1: 2, a2: 3 },
-            b: B { b1: 4, b2: 5 },
-            c: C { c1: 6, c2: 7 },
-        }
-    );
-}
-
-#[test]
-fn three_boxed_interleaved() {
-    let v: ThreeBoxed = parse!(
-        ThreeBoxed,
-        &br#"{"c2": 7, "a1": 2, "b1": 4, "id": 1, "c1": 6, "a2": 3, "b2": 5}"#[..]
-    )
-    .unwrap();
-    assert_eq!(
-        v,
-        ThreeBoxed {
-            id: 1,
-            a: A { a1: 2, a2: 3 },
-            b: B { b1: 4, b2: 5 },
-            c: C { c1: 6, c2: 7 },
-        }
-    );
 }

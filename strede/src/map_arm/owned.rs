@@ -4,13 +4,13 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::{
-    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicatesOwned,
+    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicates, False,
     MapArmBase, MapArmSlot, SlotDispatchProj, SlotDispatchState, SlotRaceState, StackConcat,
-    TagDispatchProj, TagDispatchState, TagInjectingStackOwned, TagRaceState, VirtualArmSlot,
+    TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
     WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
 };
 use crate::Probe;
-use crate::owned::{MapAccessOwned, MapKeyProbeOwned, VC as OVC, VP as OVP};
+use crate::owned::{MapKeyProbeOwned, VC as OVC, VP as OVP};
 
 // ---------------------------------------------------------------------------
 // MapArmStackOwned<KP> - owned-family arm stack
@@ -31,6 +31,19 @@ use crate::owned::{MapAccessOwned, MapKeyProbeOwned, VC as OVC, VP as OVP};
 pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
     const SIZE: usize;
 
+    /// Number of real (non-virtual) arms. Virtual arms (skip-unknown, dup-detect,
+    /// tag-inject) do not contribute. Used to compute positional field indices
+    /// for formats like postcard that identify fields by position rather than name.
+    const FIELD_COUNT: usize;
+
+    /// [`crate::True`] for arm stacks representing an unbounded/runtime-sized
+    /// collection (e.g. HashMap's `CollectMap`) that requires the format to
+    /// read an explicit wire-level length before iterating; [`crate::False`]
+    /// for a fixed compile-time field set (structs, enums) whose end is
+    /// signaled by the arm stack becoming satisfied. No default: every impl
+    /// must pick one explicitly. See [`crate::MapArmStack::Dynamic`].
+    type Dynamic;
+
     /// Left-nested tuple of `Option<(K, V)>` for each arm.
     type Outputs;
 
@@ -49,8 +62,8 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
     // instead of nested async state machines.
     //
     // The `async fn race_keys` / `dispatch_value` default methods wrap
-    // init/poll for convenience. Wrappers (SkipUnknownOwned, DetectDuplicatesOwned,
-    // TagInjectingStackOwned) override the async methods to add their virtual
+    // init/poll for convenience. Wrappers (SkipUnknownOwned, DetectDuplicates,
+    // TagInjectingStack) override the async methods to add their virtual
     // arms while delegating inner arms via the init/poll path.
 
     /// Pinned state holding per-arm key futures for one round of racing.
@@ -58,7 +71,14 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
 
     /// Fork `kp` for each unsatisfied arm, call each arm's key callback to
     /// create its future, and return the combined pinned state.
-    fn init_race(&mut self, kp: KP) -> Self::RaceState;
+    ///
+    /// - `arm_base`: global arm index of the first arm in this sub-stack, used
+    ///   for arm routing (poll_race_one, dispatch_value) and virtual-arm identity.
+    /// - `field_base`: positional field index of the first *real* arm in this
+    ///   sub-stack, passed to key_fn closures for `deserialize_key_by_index`.
+    ///   Virtual arms (dup-detect, skip-unknown, tag-inject) do not increment
+    ///   this counter.
+    fn init_race(&mut self, kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState;
 
     /// Poll a single arm's key future. **Sync** - recursion through
     /// `(Rest, Slot)` is ordinary function calls, not async nesting.
@@ -97,7 +117,7 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
-        let mut race_state = core::pin::pin!(self.init_race(kp));
+        let mut race_state = core::pin::pin!(self.init_race(kp, 0, 0));
         core::future::poll_fn(|cx| {
             let mut all_miss = true;
             for i in 0..Self::SIZE {
@@ -144,6 +164,8 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
 
 impl<KP: MapKeyProbeOwned> MapArmStackOwned<KP> for MapArmBase {
     const SIZE: usize = 0;
+    const FIELD_COUNT: usize = 0;
+    type Dynamic = False;
     type Outputs = ();
 
     #[inline(always)]
@@ -158,7 +180,7 @@ impl<KP: MapKeyProbeOwned> MapArmStackOwned<KP> for MapArmBase {
     type RaceState = ();
 
     #[inline(always)]
-    fn init_race(&mut self, _kp: KP) {}
+    fn init_race(&mut self, _kp: KP, _arm_base: usize, _field_base: usize) {}
     #[inline(always)]
     fn poll_race_one(
         &mut self,
@@ -202,12 +224,14 @@ impl<KP, Rest, K, V, KeyFn, KeyFut, ValFn, ValFut> MapArmStackOwned<KP>
 where
     KP: MapKeyProbeOwned,
     Rest: MapArmStackOwned<KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
     ValFn: FnMut(OVP<KP>, K) -> ValFut,
     ValFut: Future<Output = Result<Probe<(OVC<KP>, (K, V))>, KP::Error>>,
 {
     const SIZE: usize = Rest::SIZE + 1;
+    const FIELD_COUNT: usize = Rest::FIELD_COUNT + 1;
+    type Dynamic = Rest::Dynamic;
     type Outputs = (Rest::Outputs, Option<(K, V)>);
 
     #[inline(always)]
@@ -222,15 +246,15 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = if self.1.state.is_done() {
             None
         } else {
-            Some((self.1.key_fn)(kp))
+            Some((self.1.key_fn)(kp, field_base + Self::FIELD_COUNT - 1))
         };
         SlotRaceState {
-            rest: self.0.init_race(rest_kp),
+            rest: self.0.init_race(rest_kp, arm_base, field_base),
             this: this_fut,
         }
     }
@@ -312,12 +336,14 @@ impl<KP, Rest, K, KeyFn, KeyFut, ValFn, ValFut> MapArmStackOwned<KP>
 where
     KP: MapKeyProbeOwned,
     Rest: MapArmStackOwned<KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, K)>, KP::Error>>,
     ValFn: FnMut(OVP<KP>, K) -> ValFut,
     ValFut: Future<Output = Result<Probe<(OVC<KP>, ())>, KP::Error>>,
 {
     const SIZE: usize = Rest::SIZE + 1;
+    const FIELD_COUNT: usize = Rest::FIELD_COUNT;
+    type Dynamic = Rest::Dynamic;
     type Outputs = Rest::Outputs;
 
     #[inline(always)]
@@ -332,11 +358,11 @@ where
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
-        let this_fut = (self.1.key_fn)(kp);
+        let this_fut = (self.1.key_fn)(kp, arm_base + Self::SIZE - 1);
         SlotRaceState {
-            rest: self.0.init_race(rest_kp),
+            rest: self.0.init_race(rest_kp, arm_base, field_base),
             this: Some(this_fut),
         }
     }
@@ -399,63 +425,27 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// FlattenContOwned - continuation trait for multi-flatten chains (owned family)
-// ---------------------------------------------------------------------------
-
-/// Owned-family counterpart to [`crate::FlattenCont`]. See its documentation.
-pub trait FlattenContOwned<M: MapAccessOwned>: Sized {
-    async fn finish<Arms: MapArmStackOwned<M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error>;
-}
-
-impl<M: MapAccessOwned> FlattenContOwned<M> for crate::FlattenTerminal {
-    async fn finish<Arms: MapArmStackOwned<M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> {
-        let (claim, out) = crate::hit!(map.iterate(arms).await);
-        Ok(Probe::Hit((claim, out)))
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<M: MapAccessOwned> FlattenContOwned<M> for crate::FlattenTerminalBoxed {
-    async fn finish<Arms: MapArmStackOwned<M::KeyProbe>>(
-        self,
-        map: M,
-        arms: Arms,
-    ) -> Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> {
-        #[allow(clippy::type_complexity)]
-        let r: Result<Probe<(M::MapClaim, Arms::Outputs)>, M::Error> =
-            alloc::boxed::Box::pin(map.iterate(arms)).await;
-        let (claim, out) = crate::hit!(r);
-        Ok(Probe::Hit((claim, out)))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Wrapper impls for MapArmStackOwned (owned family)
 // ---------------------------------------------------------------------------
 
-// --- DetectDuplicatesOwned impl ---
+// --- DetectDuplicates impl ---
 
-impl<KP, S, const M: usize, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStackOwned<KP>
-    for DetectDuplicatesOwned<S, M, KeyFn, SkipFn>
+impl<KP, S, W, KeyFn, KeyFut, SkipFn, SkipFut> MapArmStackOwned<KP>
+    for DetectDuplicates<S, W, KeyFn, SkipFn>
 where
     KP: MapKeyProbeOwned,
     S: MapArmStackOwned<KP>,
-    KeyFn: FnMut(KP) -> KeyFut,
+    W: AsRef<[(&'static str, usize)]>,
+    KeyFn: FnMut(KP, usize) -> KeyFut,
     KeyFut: Future<
-        Output = Result<Probe<(KP::KeyClaim, crate::impls::MatchVals<usize, { M }>)>, KP::Error>,
+        Output = Result<Probe<(KP::KeyClaim, crate::impls::MatchVals<usize, W>)>, KP::Error>,
     >,
     SkipFn: FnMut(OVP<KP>) -> SkipFut,
     SkipFut: Future<Output = Result<OVC<KP>, KP::Error>>,
 {
     const SIZE: usize = S::SIZE + 1;
+    const FIELD_COUNT: usize = S::FIELD_COUNT;
+    type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -470,11 +460,11 @@ where
     type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let dup_kp = kp.fork();
-        let dup_fut = (self.key_fn)(dup_kp);
+        let dup_fut = (self.key_fn)(dup_kp, arm_base + Self::SIZE - 1);
         WrapperRaceState {
-            inner: self.inner.init_race(kp),
+            inner: self.inner.init_race(kp, arm_base, field_base),
             virtual_arm: Some(dup_fut),
         }
     }
@@ -490,7 +480,7 @@ where
         if arm_index == Self::SIZE - 1 {
             match poll_key_slot(projected.virtual_arm, cx) {
                 Poll::Ready(Ok(Probe::Hit((kc, matched)))) => {
-                    self.dup = self.wire_names[matched.0].0;
+                    self.dup = self.wire_names.as_ref()[matched.0].0;
                     Poll::Ready(Ok(Probe::Hit((Self::SIZE - 1, kc))))
                 }
                 Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
@@ -536,20 +526,22 @@ where
     }
 }
 
-// --- TagInjectingStackOwned impl ---
+// --- TagInjectingStack impl ---
 
-impl<'v, KP, S, const N: usize, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStackOwned<KP>
-    for TagInjectingStackOwned<'v, S, N, TagKeyFn, TagValFn>
+impl<'v, KP, S, W, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStackOwned<KP>
+    for TagInjectingStack<'v, S, W, TagKeyFn, TagValFn>
 where
     KP: MapKeyProbeOwned,
     S: MapArmStackOwned<KP>,
-    TagKeyFn: FnMut(KP) -> TagKeyFut,
+    TagKeyFn: FnMut(KP, usize) -> TagKeyFut,
     TagKeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::impls::Match)>, KP::Error>>,
     TagValFn: FnMut(OVP<KP>) -> TagValFut,
     TagValFut:
-        Future<Output = Result<Probe<(OVC<KP>, crate::impls::MatchVals<usize, { N }>)>, KP::Error>>,
+        Future<Output = Result<Probe<(OVC<KP>, crate::impls::MatchVals<usize, W>)>, KP::Error>>,
 {
     const SIZE: usize = S::SIZE + 1;
+    const FIELD_COUNT: usize = S::FIELD_COUNT;
+    type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
     #[inline(always)]
@@ -564,12 +556,13 @@ where
     type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let inner_kp = kp.fork();
-        let tag_fut = (self.tag_key_fn)(kp);
+        // Tag arm is always at global index arm_base (index 0 within this wrapper).
+        let tag_fut = (self.tag_key_fn)(kp, arm_base);
         TagRaceState {
             tag_fut: Some(tag_fut),
-            inner: self.inner.init_race(inner_kp),
+            inner: self.inner.init_race(inner_kp, arm_base + 1, field_base),
         }
     }
 
@@ -641,9 +634,14 @@ impl<KP, A, B> MapArmStackOwned<KP> for StackConcat<A, B>
 where
     KP: MapKeyProbeOwned,
     A: MapArmStackOwned<KP>,
-    B: MapArmStackOwned<KP>,
+    // Enforced at the type level, not via a runtime/const-eval assertion:
+    // a StackConcat mixing a DYNAMIC (unbounded collection) side with a
+    // non-DYNAMIC side simply fails to type-check.
+    B: MapArmStackOwned<KP, Dynamic = A::Dynamic>,
 {
     const SIZE: usize = A::SIZE + B::SIZE;
+    const FIELD_COUNT: usize = A::FIELD_COUNT + B::FIELD_COUNT;
+    type Dynamic = A::Dynamic;
     type Outputs = (A::Outputs, B::Outputs);
 
     #[inline(always)]
@@ -658,11 +656,13 @@ where
     type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
 
     #[inline(always)]
-    fn init_race(&mut self, mut kp: KP) -> Self::RaceState {
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let b_kp = kp.fork();
         ConcatRaceState {
-            a: self.0.init_race(kp),
-            b: self.1.init_race(b_kp),
+            a: self.0.init_race(kp, arm_base, field_base),
+            b: self
+                .1
+                .init_race(b_kp, arm_base + A::SIZE, field_base + A::FIELD_COUNT),
         }
     }
 

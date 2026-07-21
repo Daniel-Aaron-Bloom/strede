@@ -10,8 +10,8 @@ Async, zero-alloc, pull-based deserialization for Rust.
 ## The name
 
 _Strede_ is a **STREaming DEserializer** - a name deliberately close to
-[serde](https://serde.rs), the library it complements. It's also an Old English
-word meaning "stream" or "channel."
+[serde](https://serde.rs), the library it complements. It's also an Old English / Norwegian
+word meaning "stream" or "channel". It's pronounced STREH-duh.
 
 Streaming is the important use case externally - but internally, the architecture
 is built around coroutines. _COroutine DEserializer_ just doesn't abbreviate as well.
@@ -93,6 +93,7 @@ Probe results:
 `Err` short-circuits. This replaces the visitor pattern with no heap allocation.
 
 `select_probe!` also supports two advanced forms:
+
 - `select_probe!(biased; ...)` — when multiple arms are ready simultaneously, the earliest arm in declaration order wins instead of an unspecified one.
 - `kill!(i)` — a macro available inside any arm that schedules arm `i` for cancellation on the next poll. Useful when one arm has gathered enough information to know a sibling can never win (e.g. the zero-copy string borrow succeeded, so the chunked fallback arm can be dropped before the next `.await`).
 
@@ -123,14 +124,10 @@ Chunk<Data, Done>     Data(item) | Done(claim)
 NextKey<KP, MC>       Entry(KP) | Done(MC)
 
 StrAccess             chunks.next_str(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 BytesAccess           chunks.next_bytes(|&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 NumberAccess          chunks.next_number_chunk(|&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                      chunks.fork() → Self
 
 MapAccess             map.iterate(arms: impl MapArmStack) → Result<Probe<(Claim, Outputs)>, Error>
-                      map.fork() → Self
 
 MapKeyProbe           kp.deserialize_key::<K>(extra) → Result<Probe<(KeyClaim, K)>, Error>
                       kp.fork() → Self
@@ -144,11 +141,11 @@ MapKeyProbe           kp.deserialize_key::<K>(extra) → Result<Probe<(KeyClaim,
 
 SeqAccess             seq.next(|[e]| async { Ok(Probe::Hit((claim, r))) })
                         → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                      seq.fork() → Self
 
 SeqEntry              e.get::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
                       e.get_map_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
                       e.get_seq_into::<T, ()>(()) → Result<Probe<(Claim, T)>, Error>
+                      e.fork() → Self
                       e.skip()     → Result<Claim, Error>
 ```
 
@@ -165,16 +162,13 @@ DeserializerOwned      d.entry(self, closure) → Result<Probe<(Claim, R)>, Erro
 EntryOwned             (same probes minus deserialize_str/bytes; includes
                         deserialize_number_chunks, deserialize_map_into, deserialize_seq_into)
 StrAccessOwned         chunks.next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 BytesAccessOwned       chunks.next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 NumberAccessOwned      chunks.next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
-                           chunks.fork() → Self
 SeqAccessOwned         seq.next(self, closure) → Result<Probe<Chunk<(Self, R), Claim>>, Error>
-                           seq.fork() → Self
 SeqEntryOwned          e.get(self, ()) → Result<Probe<(Claim, T)>, Error>
                            e.get_map_into(self, ()) → Result<Probe<(Claim, T)>, Error>
                            e.get_seq_into(self, ()) → Result<Probe<(Claim, T)>, Error>
+                           e.fork() → Self
                            e.skip(self) → Result<Claim, Error>
 ```
 
@@ -190,8 +184,9 @@ them with `select_probe!` without borrow conflicts.
 ### Owned family - parallel scanning
 
 The owned family reads from a streaming source where data arrives
-incrementally. When `entry` passes multiple handles, or when you `fork` an
-accessor, the resulting readers share the same underlying buffer.
+incrementally. When `entry` passes multiple handles, or when you `fork` a
+probe item (`Entry`, `SeqEntry`, `MapKeyProbe`, `MapValueProbe`,
+`EnumVariantProbe`), the resulting readers share the same underlying buffer.
 
 **You must drive all forked readers concurrently** - typically via
 `select_probe!`. Sequentially awaiting one reader to completion before
@@ -200,6 +195,12 @@ data that cannot arrive until all sibling readers have consumed the current
 chunk. This is safe to do: forked readers never interfere with each other,
 and every reader is automatically suspended and resumed as new data becomes
 available, provided all readers are being polled.
+
+Structural accessors (`MapAccess`, `SeqAccess`, `EnumAccess`, `StrAccess`,
+`BytesAccess`, `NumberAccess`) do not have `fork` — once opened they may be
+wrapped by layout adapters (e.g. `TagAwareMap`) that are single-use state
+machines. Concurrency inside a structural access is handled by the internal
+`map_arm` / `enum_arm` infrastructure.
 
 ## Deriving
 
@@ -338,34 +339,6 @@ struct Outer {
     pos: Inner,
 }
 // Deserializes: {"name": "p", "x": 1.0, "y": 2.0}
-```
-
-For structs with 3 or more flatten fields, use `#[strede(flatten(boxed))]`
-instead. Deeply-nested `StackConcat` types produce large async state machines
-that can overflow the stack; `flatten(boxed)` opts each continuation future
-into `Box::pin` to break the chain. Any flatten field annotated `flatten(boxed)`
-enables boxed mode for the entire flatten chain. Requires the `alloc` feature.
-
-```rust
-#[derive(strede::Deserialize)]
-struct Color { r: u8, g: u8, b: u8 }
-
-#[derive(strede::Deserialize)]
-struct Size { w: f64, h: f64 }
-
-#[derive(strede::Deserialize)]
-struct Point { x: f64, y: f64 }
-
-#[derive(strede::Deserialize)]
-struct Shape {
-    #[strede(flatten(boxed))]
-    pos: Point,
-    #[strede(flatten(boxed))]
-    color: Color,
-    #[strede(flatten(boxed))]
-    size: Size,
-}
-// Deserializes: {"x": 0.0, "y": 0.0, "r": 0, "g": 0, "b": 0, "w": 1.0, "h": 1.0}
 ```
 
 `#[strede(untagged)]` on an enum or individual variant enables shape-based
@@ -531,10 +504,10 @@ token unconditionally. Always `Hit`.
 **`Match`** - Checks a string token for an exact content match. `Extra` is the
 expected string:
 
-| impl                        | family | token  |
-| --------------------------- | ------ | ------ |
-| `Deserialize<'de, &'static str>`  | borrow | string |
-| `DeserializeOwned<&'static str>`  | owned  | string |
+| impl                             | family | token  |
+| -------------------------------- | ------ | ------ |
+| `Deserialize<'de, &'static str>` | borrow | string |
+| `DeserializeOwned<&'static str>` | owned  | string |
 
 Returns `Hit(Match)` when content equals `extra`, `Miss` otherwise (stream not
 advanced). Use with `deserialize_value` inside `select_probe!` for string-tag
@@ -575,6 +548,143 @@ e.deserialize_value::<UnwrapOrElse<MyType>, _>((async || MyType::default(), ()))
 
 The derive macro uses `UnwrapOrElse<MatchVals<usize>>` with a sentinel fallback
 so unknown map keys produce a sentinel index while still consuming the key entry.
+
+## Implementing a format backend
+
+This section is for authors writing a new format crate (CBOR, MessagePack, etc.),
+not for users of an existing backend.
+
+### Which traits to implement
+
+You only need to implement the family (or families) your format can support.
+A simple in-memory format usually implements the **borrow family**
+(`Deserializer`, `Entry`, `MapAccess`, `SeqAccess`, `StrAccess`, `BytesAccess`,
+`NumberAccess`). A chunked/streaming format implements the **owned family**
+(`DeserializerOwned`, `EntryOwned`, and the `*Owned` accessor traits). The two
+families are independent; you can implement one, both, or neither for a given
+entry type.
+
+### The `Entry` contract
+
+The single most important invariant: **type mismatches must return
+`Ok(Probe::Miss)`, never `Err`**. `Err` is reserved for fatal format errors
+(malformed data, I/O failure). `Pending` means only "waiting for I/O" — never
+a type mismatch. All probe methods consume `self`.
+
+### Contrast with serde's visitor pattern
+
+In serde, your deserializer _drives_ the process by calling methods on a
+`Visitor` (`visit_u64`, `visit_str`, …). In strede the roles are reversed: the
+caller _probes_ the entry with `deserialize_number_chunks`, `deserialize_str`,
+etc. and gets `Hit`/`Miss` back. Your implementation does not call any visitor
+methods — it inspects the current token and returns the appropriate `Probe`.
+
+### Primitive type impls are format-specific
+
+Unlike serde — where `u32: Deserialize` is provided by the serde crate itself
+— in strede `Deserialize<'de, D>` for numeric types (`u8`, `u32`, `f64`, …) and
+`bool` **must be provided by each format backend**. For most formats the right
+approach is to decode the wire value directly — inspect the current token,
+cast or convert in place, and return `Hit` or `Miss`. `deserialize_number_chunks`
+exists as a common denominator for text-based formats and arbitrary-precision
+integers; for ordinary numeric types, routing through it just to parse a string
+back into a number adds unnecessary overhead. That said, providing it as a
+fallback (e.g. for callers that want arbitrary-precision access) is fine.
+
+String-like types (`String`, `Cow<str>`, `Box<str>`, `&'de str`) are already
+provided by core strede generically via `deserialize_str` / `deserialize_str_chunks`
+— your backend gets them for free once `Entry` is implemented. The dividing line
+is: types whose wire encoding is format-independent ship in core; types whose
+encoding is format-dependent (numbers, booleans, raw bytes, and `Vec<u8>`'s
+bytes-vs-seq disambiguation — see below) are your responsibility.
+
+### `Vec<T>` impls are format-specific too
+
+Unlike `String`/`Cow<str>`/etc., `Vec<T>: Deserialize` / `DeserializeOwned` is
+**not** provided by core strede — each backend implements it. This is
+deliberate: a `Vec<u8>` can in principle be read either as raw bytes or as a
+sequence of `u8` elements, and whether it's safe to try both and take
+whichever hits depends entirely on your wire format. Self-describing formats
+with a dedicated byte-string token (JSON, CBOR, MessagePack) can always tell
+the two apart from the wire alone, so racing them is sound. Schema-driven
+formats may not be able to at all — see `strede-postcard`, where a bare `u8`
+is itself varint-encoded, so "raw bytes" and "sequence of `u8` varints" are
+genuinely different encodings that only coincide for element values `< 0x80`
+and diverge above that, with no wire tag to say which one a writer meant.
+Racing them there would be unsound (the losing arm can run past the real
+payload and surface a spurious fatal error). Only your format knows which
+case it's in, so `strede::utils` gives you the building blocks rather than
+making the choice for you:
+
+- `utils::vec_via_seq` / `vec_via_seq_owned` — always read as a plain
+  sequence, no bytes fast path. Use this for every `T` you don't special-case.
+- `utils::vec_u8_race` / `vec_u8_race_owned` — for `T = u8`, race "raw bytes"
+  against "sequence of `u8` elements"; sound only when your wire format tags
+  the two differently.
+- `utils::vec_u8_bytes_only` / `vec_u8_bytes_only_owned` — for `T = u8`,
+  always read as raw bytes with no seq fallback ever considered; use this
+  when your format has no wire tag to disambiguate and `Vec<u8>` should
+  unconditionally mean "raw bytes" (see `strede-postcard`).
+
+A typical impl special-cases `T == u8` via
+`typeid::of::<T>() == typeid::of::<u8>()` (the `typeid` crate is re-exported
+as `strede::typeid`) and picks the appropriate `u8` helper, falling through to
+`vec_via_seq`/`vec_via_seq_owned` for every other `T`. See any
+`strede-*/src/vec.rs` for a worked example.
+
+### Claim threading
+
+`Claim` is an opaque proof-of-consumption token that carries your parser's
+position forward. Each successful probe returns a new claim; that claim must be
+returned through `entry()`, `iterate()`, or `next()` to advance the stream.
+Store whatever per-step state you need (tokenizer position, buffer offset, …)
+inside your `Claim` type.
+
+### `fork()` and the deadlock rule (owned family)
+
+`fork()` is defined on probe items: `Entry`, `SeqEntry`, `MapKeyProbe`,
+`MapValueProbe`, `EnumVariantProbe` (and their Owned counterparts). It creates
+an independent reader that shares the same underlying buffer. In the owned
+family **all forked readers must be polled concurrently** — race them with
+`select_probe!`. Sequentially awaiting one reader to completion before polling
+another will deadlock (see the "Owned family - parallel scanning" section above
+for the full explanation).
+
+Structural accessors (`MapAccess`, `SeqAccess`, `EnumAccess`, `StrAccess`,
+`BytesAccess`, `NumberAccess` and their Owned counterparts) do not implement
+`fork`. These types may be wrapped by layout-modifier adapters generated by the
+derive macro (e.g. `TagAwareMap` for `#[strede(tag)]`) which are single-use
+state machines. Any concurrency inside them is handled by the `map_arm` /
+`enum_arm` infrastructure.
+
+`strede::shared_buf` provides a reference implementation of the multi-reader
+buffer coordination contract for probe items.
+
+### `Never<Claim, Error>` — stub accessor types
+
+If your format does not produce a particular accessor kind (e.g. no raw byte
+sequences), set the corresponding associated type to `Never`:
+
+```rust
+type BytesChunks = strede::Never<'de, Self::Claim, Self::Error>;
+```
+
+`Never` implements every trait in both families via an uninhabited match, so
+the trait obligation is satisfied without dead code.
+
+### `DeserializeError`
+
+Your error type must implement `strede::DeserializeError`, which requires one
+method: `duplicate_field(field: &'static str) -> Self`. This is called by
+derive-generated code when a map key appears twice.
+
+### Reference implementation
+
+`strede-json` is the canonical example. The borrow family lives in
+`strede_json` (the `JsonDeserializer` type); the owned family lives in
+`strede_json::chunked`. Reading those two modules alongside the trait
+definitions in `strede::borrow` and `strede::owned` is the fastest way to
+understand what a complete implementation looks like.
 
 ## Performance
 
@@ -619,8 +729,9 @@ and chunked/streaming owned-family deserializer (`strede-json::chunked`).
 
 ## Workspace
 
-| crate           | description                                                    |
-| --------------- | -------------------------------------------------------------- |
-| `strede`        | core traits (borrow + owned families), `shared_buf` module     |
-| `strede-json`   | JSON deserializer backend (in-memory + chunked/streaming)      |
-| `strede-derive` | proc-macro: `Deserialize`, `DeserializeOwned`                  |
+| crate              | description                                                |
+| ------------------ | ---------------------------------------------------------- |
+| `strede`           | core traits (borrow + owned families), `shared_buf` module |
+| `strede-json`      | JSON deserializer backend (in-memory + chunked/streaming)  |
+| `strede-msgpack`   | MessagePack deserializer backend (in-memory + chunked/streaming) |
+| `strede-derive`    | proc-macro: `Deserialize`, `DeserializeOwned`              |

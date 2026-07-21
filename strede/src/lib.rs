@@ -53,6 +53,7 @@
 extern crate alloc;
 
 pub mod borrow;
+pub mod enum_arm;
 mod error;
 mod impls;
 pub mod map_arm;
@@ -65,29 +66,18 @@ pub mod shared_buf;
 pub use strede_derive::{Deserialize, DeserializeOwned};
 
 // -- shared types --
+pub use const_array_concat::{ArrayConcat, ConcatableArray};
 pub use error::DeserializeError;
 pub use never::Never;
 pub use probe::{Chunk, Probe};
 pub use shared_buf::{Buffer, Handle, SharedBuf};
 
-/// Terminal flatten continuation: calls `map.iterate(SkipUnknownOwned(arms))` directly.
-/// Used for the last (or only) flatten field in a struct.
-/// Zero-alloc - may stack-overflow with deeply nested `StackConcat` types
-/// (typically 3+ flatten fields). Use [`FlattenTerminalBoxed`] to avoid this.
-pub struct FlattenTerminal;
-
-/// Terminal flatten continuation: calls `map.iterate(SkipUnknownOwned(arms))` via `Box::pin`.
-/// Heap-allocates the future to break the deeply-nested async state-machine chain
-/// produced by `StackConcat`, preventing stack overflow with 3+ flatten fields.
-/// Generated when `#[strede(flatten(boxed))]` is used.
-#[cfg(feature = "alloc")]
-pub struct FlattenTerminalBoxed;
-
 // -- borrow family --
 pub use borrow::{
-    BytesAccess, Deserialize, DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry,
-    FlattenCont, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
-    NumberAccess, SeqAccess, SeqEntry, StrAccess,
+    Ascii, BigEndian, BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap,
+    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
+    LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
+    NumberAccess, NumberEncoding, SeqAccess, SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -141,34 +131,33 @@ macro_rules! __left_nest_pat {
 }
 
 // -- utility types --
-pub use impls::{
-    FlattenMapAccess, FlattenMapAccessOwned, Match, MatchVals, Skip, TagAwareMap, TagAwareMapOwned,
-    UnwrapOrElse,
+pub use impls::string_enum::{
+    match_entry_str_against, match_str_chunks_against, match_str_chunks_against_owned,
 };
+pub use impls::{
+    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, PairSeqKeyProbe, PairSeqMapAccess,
+    PairSeqValueProbe, PairStep, RawSlot, Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse,
+};
+
+// -- enum arm building blocks --
+pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
 
 // -- owned family --
 pub use owned::{
-    ArmState, BytesAccessOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned, DeserializeOwned,
-    DeserializerOwned, DetectDuplicatesOwned, EntryOwned, FlattenContOwned, MapAccessOwned, MapArm,
-    MapArmBase, MapArmSlot, MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned,
-    MapValueClaimOwned, MapValueProbeOwned, NextKey, NumberAccessOwned, SeqAccessOwned,
-    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStackOwned, VirtualArmSlot,
+    ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
+    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates, EntryOwned,
+    EnumAccessOwned, EnumVariantProbeOwned, False, MapAccessOwned, MapArm, MapArmBase, MapArmSlot,
+    MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned,
+    NextKey, NumberAccessOwned, SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned,
+    TagInjectingStack, True, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]
 pub use alloc::boxed::Box;
 
-pub mod utils {
-    /// Like [`core::array::repeat`], but for `clone(&mut self) -> Self`
-    #[inline(always)]
-    pub fn repeat<T, const N: usize>(f: T, mut clone: impl FnMut(&mut T) -> T) -> [T; N] {
-        let mut f = Some(f);
-        core::array::from_fn(|i| {
-            if i == N - 1 {
-                f.take().unwrap()
-            } else {
-                clone(f.as_mut().unwrap())
-            }
-        })
-    }
-}
+pub mod utils;
+
+// Re-exported so format crates can do the `TypeId::of::<T>() == TypeId::of::<u8>()`
+// check used by `utils::vec_u8_race`/`vec_u8_race_owned` callers without taking their
+// own direct dependency on `typeid`.
+pub use typeid;

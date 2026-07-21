@@ -1,3 +1,4 @@
+use const_array_concat::ConcatableArray;
 use core::future::Future;
 
 use crate::map_arm::NextKey;
@@ -145,9 +146,10 @@ pub trait Entry<'de>: Sized {
 
     type StrChunks: StrAccess<Claim = Self::Claim, Error = Self::Error>;
     type BytesChunks: BytesAccess<Claim = Self::Claim, Error = Self::Error>;
-    type NumberChunks: NumberAccess<Claim = Self::Claim, Error = Self::Error>;
+    type NumberChunks<Enc: NumberEncoding>: NumberAccess<Enc, Claim = Self::Claim, Error = Self::Error>;
     type Map: MapAccess<'de, MapClaim = Self::Claim, Error = Self::Error>;
     type Seq: SeqAccess<'de, SeqClaim = Self::Claim, Error = Self::Error>;
+    type Enum: EnumAccess<'de, Claim = Self::Claim, Error = Self::Error>;
 
     /// Attempt a **zero-copy** string borrow.
     ///
@@ -179,12 +181,14 @@ pub trait Entry<'de>: Sized {
     /// Handles all byte strings including those requiring transcoding.
     /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
     async fn deserialize_bytes_chunks(self) -> Result<Probe<Self::BytesChunks>, Self::Error>;
-    /// Begin streaming a number chunk-by-chunk. The [`Entry::Claim`] is
-    /// returned by [`NumberAccess::next_number_chunk`] when the number is
-    /// exhausted. Handles all numbers including those split across buffer
-    /// boundaries.
-    /// `Ok(Probe::Miss)` on type mismatch; `Err` on fatal format error only.
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error>;
+    /// Begin streaming a variable-length number chunk-by-chunk.
+    /// The [`Entry::Claim`] is returned by [`NumberAccess::next_number_chunk`] when the
+    /// number is exhausted. `Enc` selects the wire encoding; formats hit only on
+    /// encodings they natively support and return `Ok(Probe::Miss)` otherwise.
+    /// `Ok(Probe::Miss)` on type or encoding mismatch; `Err` on fatal format error only.
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error>;
 
     /// Begin reading a map.  The [`Entry::Claim`] is returned by
     /// [`MapAccess::iterate`] when the map is exhausted.
@@ -236,6 +240,23 @@ pub trait Entry<'de>: Sized {
     where
         T: DeserializeFromSeq<'de, Self::Seq>;
 
+    /// Begin externally-tagged enum dispatch.
+    ///
+    /// The returned [`EnumAccess`] handle drives variant identification via
+    /// [`EnumAccess::iterate`].  `Ok(Probe::Miss)` on type mismatch; `Err`
+    /// on fatal format error only.
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error>;
+
+    /// Open an enum and forward into `T`'s [`DeserializeFromEnum`] impl.
+    ///
+    /// Convenience wrapper over [`Entry::deserialize_enum`] + [`EnumAccess::iterate`].
+    async fn deserialize_enum_into<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnum<'de, Self::Enum>;
+
     /// Fork a sibling entry handle for the same item slot.
     ///
     /// Both `self` and the returned handle refer to the same slot.
@@ -249,6 +270,21 @@ pub trait Entry<'de>: Sized {
     /// Always succeeds on well-formed input.  Returns the [`Claim`](Entry::Claim)
     /// so the stream can advance.  `Err` only on malformed data.
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
+
+    /// Consume the current token as the fallback for an externally-tagged
+    /// enum's `#[strede(other)]` variant, after every named/indexed variant
+    /// has already missed.
+    ///
+    /// Default: forwards to [`Entry::skip`], appropriate for self-describing
+    /// formats where the unmatched value's shape can be discovered and
+    /// discarded generically. Schema-driven formats that cannot skip an
+    /// arbitrary-shaped value (e.g. postcard) may override this instead to
+    /// treat the unmatched discriminant as carrying no payload at all -
+    /// `#[strede(other)]` only ever targets a unit variant, so no payload
+    /// needs to be read in that case.
+    async fn skip_other(self) -> Result<Self::Claim, Self::Error> {
+        self.skip().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,13 +314,6 @@ pub trait StrAccess: Sized {
     type Claim;
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
-
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// Both `self` and the returned accessor are independent: advancing one
-    /// does not affect the other.  Both start from the current chunk
-    /// position and must each be driven to `Done` independently.
-    fn fork(&mut self) -> Self;
 
     /// Advance to the next chunk, passing it to `f`.
     ///
@@ -325,11 +354,6 @@ pub trait BytesAccess: Sized {
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
 
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// See [`StrAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
-
     /// Advance to the next chunk, passing it to `f`.
     ///
     /// - `Ok(Chunk::Data((self, r)))` - next chunk processed; accessor returned for the next call.
@@ -343,20 +367,91 @@ pub trait BytesAccess: Sized {
 }
 
 // ---------------------------------------------------------------------------
+// NumberEncoding
+// ---------------------------------------------------------------------------
+
+/// Describes the wire encoding of a variable-length number token.
+///
+/// Each implementor declares `Data` (either `str` for text or `[u8]` for
+/// binary blobs) and provides conversions from the two raw representations
+/// formats hold internally.  The `NAME` const lets format impls branch at
+/// compile time (e.g. `if Enc::NAME == Ascii::NAME`) without specialization.
+///
+/// Three built-in encodings are provided: [`Ascii`], [`BigEndian`], and
+/// [`LittleEndian`].  Third-party formats can add their own.
+pub trait NumberEncoding {
+    /// The slice type yielded to callers: `str` for text, `[u8]` for binary.
+    type Data: ?Sized;
+
+    /// Stable string identifier for this encoding.
+    /// Format impls use `Enc::NAME == SomeEncoding::NAME` to decide Hit/Miss.
+    const NAME: &'static str;
+
+    /// Convert a raw byte slice to `&Self::Data`.
+    /// Panics if the bytes are not valid for this encoding (e.g. non-UTF-8 for `Ascii`).
+    fn from_bytes(bytes: &[u8]) -> &Self::Data;
+
+    /// Convert a `&str` to `&Self::Data`.
+    fn from_str(s: &str) -> &Self::Data;
+}
+
+/// ASCII text encoding — formats that emit numbers as decimal text (e.g. JSON).
+pub struct Ascii;
+/// Big-endian binary encoding — formats that emit numbers as big-endian byte blobs.
+pub struct BigEndian;
+/// Little-endian binary encoding — formats that emit numbers as little-endian byte blobs.
+pub struct LittleEndian;
+
+impl NumberEncoding for Ascii {
+    type Data = str;
+    const NAME: &'static str = "ascii";
+    fn from_bytes(bytes: &[u8]) -> &str {
+        core::str::from_utf8(bytes).unwrap()
+    }
+    fn from_str(s: &str) -> &str {
+        s
+    }
+}
+
+impl NumberEncoding for BigEndian {
+    type Data = [u8];
+    const NAME: &'static str = "big-endian";
+    fn from_bytes(b: &[u8]) -> &[u8] {
+        b
+    }
+    fn from_str(s: &str) -> &[u8] {
+        s.as_bytes()
+    }
+}
+
+impl NumberEncoding for LittleEndian {
+    type Data = [u8];
+    const NAME: &'static str = "little-endian";
+    fn from_bytes(b: &[u8]) -> &[u8] {
+        b
+    }
+    fn from_str(s: &str) -> &[u8] {
+        s.as_bytes()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NumberAccess
 // ---------------------------------------------------------------------------
 
-/// Streams a number's textual representation in zero-copy chunks.
+/// Streams a variable-length number in zero-copy chunks.
 /// Obtained from [`Entry::deserialize_number_chunks`].
 ///
-/// Numbers are primitives — the type is already known, so no probing or
-/// racing is needed. This accessor yields the number's digits (including
-/// sign, decimal point, and exponent) as `&str` chunks. Useful for
-/// arbitrary-precision number types that cannot be represented by fixed
-/// primitives like `i64` or `f64`.
+/// `Enc` controls the wire encoding: [`Ascii`] for text formats (JSON),
+/// [`BigEndian`] / [`LittleEndian`] for binary formats (msgpack bigints, etc.).
+/// Each chunk is passed as `&Enc::Data` — `&str` for `Ascii`, `&[u8]` for binary.
+///
+/// Useful for arbitrary-precision number types that cannot be represented by
+/// fixed primitives like `i64` or `f64`. Fixed-width natives use their own
+/// `deserialize_number_*` methods instead.
 ///
 /// ```rust,ignore
-/// let mut chunks = hit!(e.deserialize_number_chunks().await);
+/// let mut chunks = hit!(e.deserialize_number_chunks::<Ascii>().await);
 /// let mut out = String::new();
 /// let claim = loop {
 ///     match chunks.next_number_chunk(|s| out.push_str(s)).await? {
@@ -365,17 +460,12 @@ pub trait BytesAccess: Sized {
 ///     }
 /// };
 /// ```
-pub trait NumberAccess: Sized {
+pub trait NumberAccess<Enc: NumberEncoding = Ascii>: Sized {
     /// Proof-of-consumption token, returned when the number is exhausted.
     /// Must match the enclosing [`Entry::Claim`].
     type Claim;
     /// Fatal error type; must match the parent [`Deserializer::Error`].
     type Error: DeserializeError;
-
-    /// Fork a sibling accessor at the same read position.
-    ///
-    /// See [`StrAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
 
     /// Advance to the next chunk, passing it to `f`.
     ///
@@ -385,12 +475,12 @@ pub trait NumberAccess: Sized {
     /// - `Pending` — no data yet.
     async fn next_number_chunk<R>(
         self,
-        f: impl FnOnce(&str) -> R,
+        f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
-// Map access - new design
+// Map access
 // ---------------------------------------------------------------------------
 
 /// A key probe for a single map key in the borrow family. Forkable for racing multiple arms.
@@ -409,6 +499,18 @@ pub trait MapKeyProbe<'de>: Sized {
     ) -> Result<Probe<(Self::KeyClaim, K)>, Self::Error>
     where
         K: Deserialize<'de, Self::KeySubDeserializer>;
+
+    /// Match the key by positional index rather than by name.
+    ///
+    /// Returns `Ok(Probe::Hit((claim, ())))` if this key corresponds to the
+    /// field at position `expected` (0-based). Returns `Ok(Probe::Miss)` by
+    /// default — formats that support positional access override this.
+    async fn deserialize_key_by_index(
+        self,
+        _expected: usize,
+    ) -> Result<Probe<(Self::KeyClaim, ())>, Self::Error> {
+        Ok(Probe::Miss)
+    }
 }
 
 /// Proof that a key was consumed. Converts into a value probe.
@@ -430,10 +532,6 @@ pub trait MapValueProbe<'de>: Sized {
 
     /// Concrete sub-deserializer this value probe spawns for [`Deserialize`] dispatch.
     type ValueSubDeserializer: Deserializer<'de, Claim = Self::ValueClaim, Error = Self::Error>;
-    /// Map access opened by [`Self::deserialize_map_into`].
-    type ValueMap: MapAccess<'de, MapClaim = Self::ValueClaim, Error = Self::Error>;
-    /// Seq access opened by [`Self::deserialize_seq_into`].
-    type ValueSeq: SeqAccess<'de, SeqClaim = Self::ValueClaim, Error = Self::Error>;
 
     fn fork(&mut self) -> Self;
 
@@ -443,20 +541,6 @@ pub trait MapValueProbe<'de>: Sized {
     ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
     where
         V: Deserialize<'de, Self::ValueSubDeserializer>;
-
-    async fn deserialize_map_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromMap<'de, Self::ValueMap>;
-
-    async fn deserialize_seq_into<V>(
-        self,
-        extra: V::Extra,
-    ) -> Result<Probe<(Self::ValueClaim, V)>, Self::Error>
-    where
-        V: DeserializeFromSeq<'de, Self::ValueSeq>;
 
     async fn skip(self) -> Result<Self::ValueClaim, Self::Error>;
 }
@@ -489,13 +573,27 @@ pub trait MapAccess<'de>: Sized {
 
     type KeyProbe: MapKeyProbe<'de, Error = Self::Error>;
 
-    fn fork(&mut self) -> Self;
-
-    /// Drive the map iteration with the given arm stack.
+    /// Drive the map iteration with the given arm stack, for a fixed
+    /// compile-time field set (structs, enums) whose end is signaled by the
+    /// arm stack becoming satisfied. See [`crate::MapArmStack::Dynamic`].
     ///
     /// Returns `Hit((MapClaim, Outputs))` on success, `Miss` if a value
     /// type mismatched or a required field was missing, `Err` on format errors.
     async fn iterate<S: MapArmStack<'de, Self::KeyProbe>>(
+        self,
+        arms: S,
+    ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;
+
+    /// Drive the map iteration for an unbounded/runtime-sized collection
+    /// (e.g. HashMap's `CollectMap`) rather than a fixed schema — see
+    /// [`crate::MapArmStack::Dynamic`]. No default: most formats' maps are
+    /// wire-uniform regardless of consumer shape, in which case both this
+    /// and [`Self::iterate`] should delegate to one shared helper rather than
+    /// one calling the other. Formats with a genuinely different wire shape
+    /// for schema-less collections (e.g. postcard, whose structs have no
+    /// wire framing at all but whose collections carry an explicit length)
+    /// give this a real, different implementation instead.
+    async fn iterate_dyn<S: MapArmStack<'de, Self::KeyProbe>>(
         self,
         arms: S,
     ) -> Result<Probe<(Self::MapClaim, S::Outputs)>, Self::Error>;
@@ -523,8 +621,12 @@ pub type VP2<'de, D> = <<KP<'de, D> as MapKeyProbe<'de>>::KeyClaim as MapKeyClai
 pub type SE<'de, D> =
     <<<D as Deserializer<'de>>::Entry as Entry<'de>>::Seq as SeqAccess<'de>>::Elem;
 
+/// Shorthand for the enum variant probe type reachable from a `Deserializer`.
+pub type EVP<'de, D> =
+    <<<D as Deserializer<'de>>::Entry as Entry<'de>>::Enum as EnumAccess<'de>>::VariantProbe;
+
+pub use crate::enum_arm::EnumArmStack;
 pub use crate::map_arm::MapArmStack;
-pub use crate::map_arm::borrow::FlattenCont;
 
 // ---------------------------------------------------------------------------
 // SeqAccess
@@ -562,11 +664,6 @@ pub trait SeqAccess<'de>: Sized {
     /// Owned handle for one sequence element.  See [`SeqEntry`].
     type Elem: SeqEntry<'de, Claim = Self::ElemClaim, Error = Self::Error>;
 
-    /// Fork a sibling accessor at the same sequence position.
-    ///
-    /// See [`MapAccess::fork`] for full semantics.
-    fn fork(&mut self) -> Self;
-
     /// Advance to the next element, passing `N` owned [`SeqEntry`] handles to `f`.
     ///
     /// Returns:
@@ -593,10 +690,6 @@ pub trait SeqEntry<'de>: Sized {
 
     /// Concrete sub-deserializer this seq element spawns for [`Deserialize`] dispatch.
     type SubDeserializer: Deserializer<'de, Claim = Self::Claim, Error = Self::Error>;
-    /// Map access opened by [`Self::get_map_into`].
-    type Map: MapAccess<'de, MapClaim = Self::Claim, Error = Self::Error>;
-    /// Seq access opened by [`Self::get_seq_into`].
-    type Seq: SeqAccess<'de, SeqClaim = Self::Claim, Error = Self::Error>;
 
     /// Deserialize the element as `T` by spawning a [`Self::SubDeserializer`]
     /// and delegating to `T::deserialize`.
@@ -604,22 +697,166 @@ pub trait SeqEntry<'de>: Sized {
     where
         T: Deserialize<'de, Self::SubDeserializer>;
 
-    /// Open the element as a map and forward into `T`'s [`DeserializeFromMap`] impl.
-    async fn get_map_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromMap<'de, Self::Map>;
-
-    /// Open the element as a seq and forward into `T`'s [`DeserializeFromSeq`] impl.
-    async fn get_seq_into<T>(self, extra: T::Extra) -> Result<Probe<(Self::Claim, T)>, Self::Error>
-    where
-        T: DeserializeFromSeq<'de, Self::Seq>;
-
     /// Fork a sibling element handle for the same sequence slot.
     fn fork(&mut self) -> Self;
 
     /// Consume and discard the element without deserializing it.
     /// Returns the [`Claim`](SeqEntry::Claim) so the stream can advance.
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
+}
+
+// ---------------------------------------------------------------------------
+// EnumAccess - variant identification + payload dispatch
+// ---------------------------------------------------------------------------
+
+/// The format's variant-identification surface, analogous to [`MapKeyProbe`].
+///
+/// Each arm in an [`EnumArmStack`] calls one of the probe methods on a forked
+/// `EnumVariantProbe` to simultaneously identify its variant *and* deserialize
+/// its payload.  Because identification and payload are read in a single call,
+/// formats where the discriminant and payload are interleaved (e.g. a msgpack
+/// array whose first element is the variant index and second is the payload) are
+/// handled naturally.
+///
+/// Formats implement the methods they actually support and return
+/// `Ok(Probe::Miss)` from the rest.  A default `Miss` impl is provided for every
+/// method so formats only need to fill in what applies to them.
+pub trait EnumVariantProbe<'de>: Sized {
+    type Error: DeserializeError;
+
+    /// Proof-of-consumption produced by a successful probe.  Must match the
+    /// enclosing [`Entry::Claim`].
+    type Claim: 'de;
+
+    /// Sub-deserializer used to deserialize non-unit variant payloads.
+    type PayloadDeserializer: Deserializer<'de, Claim = Self::Claim, Error = Self::Error>;
+
+    /// Fork a sibling probe at the same read position.
+    ///
+    /// All forked probes must be driven concurrently (e.g. via [`select_probe!`](crate::select_probe)).
+    /// See [`crate::owned::DeserializerOwned`] for the deadlock hazard.
+    fn fork(&mut self) -> Self;
+
+    // --- string-name based (JSON, CBOR text, msgpack str-tagged) ---
+
+    /// Match a **unit** variant against `candidates` by comparing the current
+    /// token to each `(wire_name, local_idx)` pair.
+    ///
+    /// Returns `Ok(Probe::Hit((Claim, matched_local_idx)))` on a match,
+    /// `Ok(Probe::Miss)` if the current token is not a string or does not match
+    /// any candidate.
+    async fn deserialize_unit_by_name<W>(
+        self,
+        _candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        Ok(Probe::Miss)
+    }
+
+    /// Match a **non-unit** variant by name and deserialize its payload as `T`.
+    ///
+    /// Returns `Ok(Probe::Hit((Claim, matched_local_idx, value)))` on a match,
+    /// `Ok(Probe::Miss)` if the current token is not a single-key map or the key
+    /// does not match any candidate.
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        _candidates: W,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+        W: ConcatableArray<T = (&'static str, usize)> + Copy + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        Ok(Probe::Miss)
+    }
+
+    // --- index/positional based (msgpack int-tagged, positional formats) ---
+
+    /// Match a **unit** variant by integer or positional index.
+    ///
+    /// Returns `Ok(Probe::Hit((Claim, expected_idx)))` on a match,
+    /// `Ok(Probe::Miss)` otherwise.
+    async fn deserialize_unit_by_index(
+        self,
+        _expected_idx: usize,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error> {
+        Ok(Probe::Miss)
+    }
+
+    /// Match a **non-unit** variant by index and deserialize its payload as `T`.
+    ///
+    /// Returns `Ok(Probe::Hit((Claim, expected_idx, value)))` on a match,
+    /// `Ok(Probe::Miss)` otherwise.
+    async fn deserialize_payload_by_index<T>(
+        self,
+        _expected_idx: usize,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+    {
+        Ok(Probe::Miss)
+    }
+
+    // --- untagged (shape-based) ---
+
+    /// Try to deserialize `T` directly from the current token with no discriminant.
+    ///
+    /// Used for untagged variants: each arm races concurrently with a forked probe
+    /// via `EnumArmStack::race`. Returns `Hit((Claim, value))` if the token matches
+    /// `T`'s shape, `Miss` otherwise.  Default impl: `Ok(Probe::Miss)`.
+    async fn deserialize_value_by_shape<T>(
+        self,
+        _extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: Deserialize<'de, Self::PayloadDeserializer>,
+    {
+        Ok(Probe::Miss)
+    }
+}
+
+/// An in-progress enum access handle, analogous to [`MapAccess`].
+///
+/// The format drives variant identification by calling [`EnumAccess::iterate`]
+/// with an [`EnumArmStack`].  Each arm's closure receives a forked
+/// [`EnumVariantProbe`] and is fully responsible for identifying its variant
+/// and deserializing its payload in a single call.
+///
+/// Obtained from [`Entry::deserialize_enum`].
+pub trait EnumAccess<'de>: Sized {
+    type Error: DeserializeError;
+
+    /// Proof-of-consumption returned on successful variant dispatch.  Must
+    /// match the enclosing [`Entry::Claim`].
+    type Claim: 'de;
+
+    type VariantProbe: EnumVariantProbe<'de, Claim = Self::Claim, Error = Self::Error>;
+
+    /// Drive variant dispatch with the given arm stack.
+    ///
+    /// Returns `Hit((Claim, Outputs))` when an arm matched,
+    /// `Miss` when no arm matched, `Err` on a fatal format error.
+    async fn iterate<S>(self, arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: crate::enum_arm::EnumArmStack<'de, Self::VariantProbe>;
+}
+
+/// Types whose deserialization starts from an already-opened [`EnumAccess`].
+///
+/// Analogous to [`DeserializeFromMap`].  Used for externally-tagged enum dispatch:
+/// the derive macro emits a `DeserializeFromEnum` impl for each enum type and
+/// the `Deserialize` impl delegates to [`Entry::deserialize_enum_into`].
+pub trait DeserializeFromEnum<'de, E: EnumAccess<'de>>: Sized {
+    type Extra;
+    async fn deserialize_from_enum(
+        e: E,
+        extra: Self::Extra,
+    ) -> Result<Probe<(E::Claim, Self)>, E::Error>;
 }
 
 // ---------------------------------------------------------------------------

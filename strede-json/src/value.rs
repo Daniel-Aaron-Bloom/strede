@@ -20,11 +20,13 @@ use strede::{
     },
     hit,
     owned::{
-        DeserializerOwned as _, EntryOwned as _, MapAccessOwned as _, MapKeyClaimOwned,
-        MapKeyProbeOwned, MapValueProbeOwned,
+        DeserializerOwned as _, EntryOwned as _, KP as OwnedKP, MapAccessOwned as _,
+        MapKeyClaimOwned, MapKeyProbeOwned, MapValueProbeOwned, VP as OwnedVP,
     },
     select_probe,
 };
+
+use core::future::Future;
 
 use crate::JsonError;
 use crate::chunked::{ChunkedJsonClaim, ChunkedJsonSubDeserializer, capture_raw_value_chunked};
@@ -83,7 +85,14 @@ impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for ValueBorrowed<'de> {
                     let r: Result<
                         Probe<(JsonClaim<'de>, Vec<(Cow<'de, str>, ValueBorrowed<'de>)>)>,
                         JsonError,
-                    > = alloc::boxed::Box::pin(map.iterate(CollectObject::new())).await;
+                    > = alloc::boxed::Box::pin(map.iterate(CollectObject::new(
+                        |kp| kp.deserialize_key::<Cow<'de, str>>(()),
+                        |vp, k| async move {
+                            let (vc, v) = hit!(vp.deserialize_value::<ValueBorrowed<'de>>(()).await);
+                            Ok(Probe::Hit((vc, (k, v))))
+                        },
+                    )))
+                    .await;
                     let (c, out) = hit!(r);
                     Ok(Probe::Hit((c, ValueBorrowed::Object(out))))
                 },
@@ -109,17 +118,20 @@ impl<'de> Deserialize<'de, crate::JsonDeserializer<'de>> for ValueBorrowed<'de> 
     }
 }
 
-/// Arm stack that collects all key-value pairs into a `Vec<(Cow<'de, str>, ValueBorrowed<'de>)>`.
 #[cfg(not(feature = "arbitrary_precision"))]
-struct CollectObject<'de> {
+struct CollectObject<'de, KeyFn, ValFn> {
+    key_fn: KeyFn,
+    val_fn: ValFn,
     pending_key: Option<Cow<'de, str>>,
     out: Vec<(Cow<'de, str>, ValueBorrowed<'de>)>,
 }
 
 #[cfg(not(feature = "arbitrary_precision"))]
-impl<'de> CollectObject<'de> {
-    fn new() -> Self {
+impl<'de, KeyFn, ValFn> CollectObject<'de, KeyFn, ValFn> {
+    fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
         Self {
+            key_fn,
+            val_fn,
             pending_key: None,
             out: Vec::new(),
         }
@@ -127,17 +139,26 @@ impl<'de> CollectObject<'de> {
 }
 
 #[cfg(not(feature = "arbitrary_precision"))]
-impl<'de, KP> strede::MapArmStack<'de, KP> for CollectObject<'de>
+impl<'de, KP, KeyFn, KeyFut, ValFn, ValFut> strede::MapArmStack<'de, KP>
+    for CollectObject<'de, KeyFn, ValFn>
 where
     KP: MapKeyProbe<'de>,
-    Cow<'de, str>: Deserialize<'de, KP::KeySubDeserializer, Extra = ()>,
-    ValueBorrowed<'de>: Deserialize<
-            'de,
-            <<KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe as MapValueProbe<'de>>::ValueSubDeserializer,
-            Extra = (),
+    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, Cow<'de, str>)>, KP::Error>>,
+    ValFn: FnMut(<KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe, Cow<'de, str>) -> ValFut,
+    ValFut: Future<
+        Output = Result<
+            Probe<(
+                <<KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe as MapValueProbe<'de>>::ValueClaim,
+                (Cow<'de, str>, ValueBorrowed<'de>),
+            )>,
+            KP::Error,
         >,
+    >,
 {
     const SIZE: usize = 1;
+    const FIELD_COUNT: usize = 1;
+    type Dynamic = strede::True;
     type Outputs = Vec<(Cow<'de, str>, ValueBorrowed<'de>)>;
 
     fn unsatisfied_count(&self) -> usize {
@@ -147,31 +168,45 @@ where
         1
     }
 
-    type RaceState = ();
-    fn init_race(&mut self, _: KP) {
-        unreachable!()
+    type RaceState = KeyFut;
+    fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+        (self.key_fn)(kp)
     }
+    #[allow(clippy::type_complexity)]
     fn poll_race_one(
         &mut self,
-        _: core::pin::Pin<&mut ()>,
+        state: core::pin::Pin<&mut KeyFut>,
         _: usize,
-        _: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-        unreachable!()
+        match state.poll(cx) {
+            core::task::Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                self.pending_key = Some(k);
+                core::task::Poll::Ready(Ok(Probe::Hit((0, kc))))
+            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
+            core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
     }
 
-    type DispatchState = ();
+    type DispatchState = ValFut;
     fn init_dispatch(
         &mut self,
         _: usize,
-        _: <KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe,
-    ) {
-        unreachable!()
+        vp: <KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe,
+    ) -> ValFut {
+        let k = self
+            .pending_key
+            .take()
+            .expect("dispatch without pending key");
+        (self.val_fn)(vp, k)
     }
+    #[allow(clippy::type_complexity)]
     fn poll_dispatch(
         &mut self,
-        _: core::pin::Pin<&mut ()>,
-        _: &mut core::task::Context<'_>,
+        state: core::pin::Pin<&mut ValFut>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<
         Result<
             Probe<(
@@ -181,33 +216,15 @@ where
             KP::Error,
         >,
     > {
-        unreachable!()
-    }
-
-    async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-        let (kc, k) = hit!(kp.deserialize_key::<Cow<'de, str>>(()).await);
-        self.pending_key = Some(k);
-        Ok(Probe::Hit((0, kc)))
-    }
-
-    async fn dispatch_value(
-        &mut self,
-        _: usize,
-        vp: <KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe,
-    ) -> Result<
-        Probe<(
-            <<KP::KeyClaim as MapKeyClaim<'de>>::ValueProbe as MapValueProbe<'de>>::ValueClaim,
-            (),
-        )>,
-        KP::Error,
-    > {
-        let k = self
-            .pending_key
-            .take()
-            .expect("dispatch without pending key");
-        let (vc, v) = hit!(vp.deserialize_value::<ValueBorrowed<'de>>(()).await);
-        self.out.push((k, v));
-        Ok(Probe::Hit((vc, ())))
+        match state.poll(cx) {
+            core::task::Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                self.out.push((k, v));
+                core::task::Poll::Ready(Ok(Probe::Hit((vc, ()))))
+            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
+            core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
     }
 
     fn take_outputs(&mut self) -> Self::Outputs {
@@ -268,7 +285,14 @@ where
                     let r: Result<
                         Probe<(ChunkedJsonClaim<'s, B, F>, Vec<(String, ValueOwned)>)>,
                         JsonError,
-                    > = alloc::boxed::Box::pin(map.iterate(CollectObjectOwned::new())).await;
+                    > = alloc::boxed::Box::pin(map.iterate(CollectObjectOwned::new(
+                        |kp: OwnedKP<ChunkedJsonSubDeserializer<'s, B, F>>| kp.deserialize_key::<String>(()),
+                        |vp: OwnedVP<OwnedKP<ChunkedJsonSubDeserializer<'s, B, F>>>, k| async move {
+                            let (vc, v) = hit!(vp.deserialize_value::<ValueOwned>(()).await);
+                            Ok(Probe::Hit((vc, (k, v))))
+                        },
+                    )))
+                    .await;
                     let (c, out) = hit!(r);
                     Ok(Probe::Hit((c, ValueOwned::Object(out))))
                 },
@@ -294,30 +318,44 @@ where
     }
 }
 
-struct CollectObjectOwned {
+struct CollectObjectOwned<KeyFn, ValFn> {
+    key_fn: KeyFn,
+    val_fn: ValFn,
     pending_key: Option<String>,
     out: Vec<(String, ValueOwned)>,
 }
 
-impl CollectObjectOwned {
-    fn new() -> Self {
+impl<KeyFn, ValFn> CollectObjectOwned<KeyFn, ValFn> {
+    fn new(key_fn: KeyFn, val_fn: ValFn) -> Self {
         Self {
+            key_fn,
+            val_fn,
             pending_key: None,
             out: Vec::new(),
         }
     }
 }
 
-impl<KP> strede::MapArmStackOwned<KP> for CollectObjectOwned
+impl<KP, KeyFn, KeyFut, ValFn, ValFut> strede::MapArmStackOwned<KP>
+    for CollectObjectOwned<KeyFn, ValFn>
 where
     KP: MapKeyProbeOwned,
-    String: DeserializeOwned<KP::KeySubDeserializer, Extra = ()>,
-    ValueOwned: DeserializeOwned<
-            <<KP::KeyClaim as MapKeyClaimOwned>::ValueProbe as MapValueProbeOwned>::ValueSubDeserializer,
-            Extra = (),
+    KeyFn: FnMut(KP) -> KeyFut,
+    KeyFut: Future<Output = Result<Probe<(KP::KeyClaim, String)>, KP::Error>>,
+    ValFn: FnMut(<KP::KeyClaim as MapKeyClaimOwned>::ValueProbe, String) -> ValFut,
+    ValFut: Future<
+        Output = Result<
+            Probe<(
+                <<KP::KeyClaim as MapKeyClaimOwned>::ValueProbe as MapValueProbeOwned>::ValueClaim,
+                (String, ValueOwned),
+            )>,
+            KP::Error,
         >,
+    >,
 {
     const SIZE: usize = 1;
+    const FIELD_COUNT: usize = 1;
+    type Dynamic = strede::True;
     type Outputs = Vec<(String, ValueOwned)>;
 
     fn unsatisfied_count(&self) -> usize {
@@ -327,31 +365,45 @@ where
         1
     }
 
-    type RaceState = ();
-    fn init_race(&mut self, _: KP) {
-        unreachable!()
+    type RaceState = KeyFut;
+    fn init_race(&mut self, kp: KP, _: usize, _: usize) -> KeyFut {
+        (self.key_fn)(kp)
     }
+    #[allow(clippy::type_complexity)]
     fn poll_race_one(
         &mut self,
-        _: core::pin::Pin<&mut ()>,
+        state: core::pin::Pin<&mut KeyFut>,
         _: usize,
-        _: &mut core::task::Context<'_>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
-        unreachable!()
+        match state.poll(cx) {
+            core::task::Poll::Ready(Ok(Probe::Hit((kc, k)))) => {
+                self.pending_key = Some(k);
+                core::task::Poll::Ready(Ok(Probe::Hit((0, kc))))
+            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
+            core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
     }
 
-    type DispatchState = ();
+    type DispatchState = ValFut;
     fn init_dispatch(
         &mut self,
         _: usize,
-        _: <KP::KeyClaim as MapKeyClaimOwned>::ValueProbe,
-    ) {
-        unreachable!()
+        vp: <KP::KeyClaim as MapKeyClaimOwned>::ValueProbe,
+    ) -> ValFut {
+        let k = self
+            .pending_key
+            .take()
+            .expect("dispatch without pending key");
+        (self.val_fn)(vp, k)
     }
+    #[allow(clippy::type_complexity)]
     fn poll_dispatch(
         &mut self,
-        _: core::pin::Pin<&mut ()>,
-        _: &mut core::task::Context<'_>,
+        state: core::pin::Pin<&mut ValFut>,
+        cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<
         Result<
             Probe<(
@@ -361,33 +413,15 @@ where
             KP::Error,
         >,
     > {
-        unreachable!()
-    }
-
-    async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
-        let (kc, k) = hit!(kp.deserialize_key::<String>(()).await);
-        self.pending_key = Some(k);
-        Ok(Probe::Hit((0, kc)))
-    }
-
-    async fn dispatch_value(
-        &mut self,
-        _: usize,
-        vp: <KP::KeyClaim as MapKeyClaimOwned>::ValueProbe,
-    ) -> Result<
-        Probe<(
-            <<KP::KeyClaim as MapKeyClaimOwned>::ValueProbe as MapValueProbeOwned>::ValueClaim,
-            (),
-        )>,
-        KP::Error,
-    > {
-        let k = self
-            .pending_key
-            .take()
-            .expect("dispatch without pending key");
-        let (vc, v) = hit!(vp.deserialize_value::<ValueOwned>(()).await);
-        self.out.push((k, v));
-        Ok(Probe::Hit((vc, ())))
+        match state.poll(cx) {
+            core::task::Poll::Ready(Ok(Probe::Hit((vc, (k, v))))) => {
+                self.out.push((k, v));
+                core::task::Poll::Ready(Ok(Probe::Hit((vc, ()))))
+            }
+            core::task::Poll::Ready(Ok(Probe::Miss)) => core::task::Poll::Ready(Ok(Probe::Miss)),
+            core::task::Poll::Ready(Err(e)) => core::task::Poll::Ready(Err(e)),
+            core::task::Poll::Pending => core::task::Poll::Pending,
+        }
     }
 
     fn take_outputs(&mut self) -> Self::Outputs {

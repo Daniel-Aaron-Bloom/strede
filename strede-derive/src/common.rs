@@ -61,27 +61,31 @@ pub enum FieldContext {
 
 /// Auto-generated bound for one field in the borrow family.
 ///
-/// Borrow family always assumes `'de` and `__D` are in scope.
+/// Borrow family always assumes `'de` is in scope. `d_ident` names the
+/// in-scope `Deserializer<'de>` type param (usually `__D`, but helper impls
+/// with their own generic — e.g. tuple-variant seq helpers — may use a
+/// different name like `__D2` to avoid colliding with an outer `__D`).
 pub fn field_bound_borrow(
     krate: &syn::Path,
     ty: &syn::Type,
     ctx: FieldContext,
+    d_ident: &syn::Ident,
 ) -> syn::WherePredicate {
     match ctx {
         FieldContext::Direct => syn::parse_quote!(
-            #ty: #krate::Deserialize<'de, __D, Extra = ()>
+            #ty: #krate::Deserialize<'de, #d_ident, Extra = ()>
         ),
         FieldContext::MapValue => syn::parse_quote!(
             #ty: #krate::Deserialize<
                 'de,
-                <#krate::borrow::VP2<'de, __D> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                <#krate::borrow::VP2<'de, #d_ident> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
                 Extra = ()
             >
         ),
         FieldContext::SeqElem => syn::parse_quote!(
             #ty: #krate::Deserialize<
                 'de,
-                <#krate::borrow::SE<'de, __D> as #krate::SeqEntry<'de>>::SubDeserializer,
+                <#krate::borrow::SE<'de, #d_ident> as #krate::SeqEntry<'de>>::SubDeserializer,
                 Extra = ()
             >
         ),
@@ -89,24 +93,28 @@ pub fn field_bound_borrow(
 }
 
 /// Auto-generated bound for one field in the owned family.
+///
+/// `d_ident` names the in-scope `DeserializerOwned` type param — see
+/// `field_bound_borrow` for why this isn't always `__D`.
 pub fn field_bound_owned(
     krate: &syn::Path,
     ty: &syn::Type,
     ctx: FieldContext,
+    d_ident: &syn::Ident,
 ) -> syn::WherePredicate {
     match ctx {
         FieldContext::Direct => syn::parse_quote!(
-            #ty: #krate::DeserializeOwned<__D, Extra = ()>
+            #ty: #krate::DeserializeOwned<#d_ident, Extra = ()>
         ),
         FieldContext::MapValue => syn::parse_quote!(
             #ty: #krate::DeserializeOwned<
-                <#krate::owned::VP2<__D> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                <#krate::owned::VP2<#d_ident> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
                 Extra = ()
             >
         ),
         FieldContext::SeqElem => syn::parse_quote!(
             #ty: #krate::DeserializeOwned<
-                <#krate::owned::SE<__D> as #krate::SeqEntryOwned>::SubDeserializer,
+                <#krate::owned::SE<#d_ident> as #krate::SeqEntryOwned>::SubDeserializer,
                 Extra = ()
             >
         ),
@@ -152,82 +160,13 @@ pub fn has_universal_blanket(ty: &syn::Type) -> bool {
     }
 }
 
-/// Returns true if any path segment ident inside `ty` matches an ident in `params`.
-pub fn mentions_type_param(ty: &syn::Type, params: &[syn::Ident]) -> bool {
-    let mut found = false;
-    mentions_type_param_inner(ty, params, &mut found);
-    found
-}
-
-fn mentions_type_param_inner(ty: &syn::Type, params: &[syn::Ident], found: &mut bool) {
-    if *found {
-        return;
-    }
-    match ty {
-        syn::Type::Path(p) => {
-            if let Some(qself) = &p.qself {
-                mentions_type_param_inner(&qself.ty, params, found);
-            }
-            // A bare ident path like `T` matches only when the path has a single
-            // segment matching one of the params.
-            if p.qself.is_none()
-                && p.path.segments.len() == 1
-                && let Some(seg) = p.path.segments.first()
-                && matches!(seg.arguments, syn::PathArguments::None)
-                && params.iter().any(|tp| tp == &seg.ident)
-            {
-                *found = true;
-                return;
-            }
-            for seg in &p.path.segments {
-                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                    for arg in &args.args {
-                        if let syn::GenericArgument::Type(t) = arg {
-                            mentions_type_param_inner(t, params, found);
-                        }
-                    }
-                }
-            }
-        }
-        syn::Type::Reference(r) => mentions_type_param_inner(&r.elem, params, found),
-        syn::Type::Tuple(t) => {
-            for e in &t.elems {
-                mentions_type_param_inner(e, params, found);
-            }
-        }
-        syn::Type::Array(a) => mentions_type_param_inner(&a.elem, params, found),
-        syn::Type::Slice(s) => mentions_type_param_inner(&s.elem, params, found),
-        syn::Type::Paren(p) => mentions_type_param_inner(&p.elem, params, found),
-        syn::Type::Group(g) => mentions_type_param_inner(&g.elem, params, found),
-        syn::Type::TraitObject(t) => {
-            for b in &t.bounds {
-                if let syn::TypeParamBound::Trait(tb) = b {
-                    for seg in &tb.path.segments {
-                        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                            for arg in &args.args {
-                                if let syn::GenericArgument::Type(t) = arg {
-                                    mentions_type_param_inner(t, params, found);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Whether a field is flattened and, if so, whether it opts into heap allocation
-/// to break deeply-nested async state-machine chains that would overflow the stack.
+/// Whether a field is flattened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FlattenMode {
     /// Not flattened.
     None,
-    /// `#[strede(flatten)]` - zero-alloc; may stack-overflow with 3+ flatten fields.
+    /// `#[strede(flatten)]`.
     Plain,
-    /// `#[strede(flatten(boxed))]` - heap-allocates to break the async chain.
-    Boxed,
 }
 
 // ---------------------------------------------------------------------------
@@ -703,17 +642,21 @@ pub fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 Ok(())
             } else if meta.path.is_ident("flatten") {
                 if meta.input.peek(syn::token::Paren) {
-                    // flatten(boxed)
+                    // The only legacy paren form was `flatten(boxed)`, which existed
+                    // to break the old continuation-chain async state machine. The
+                    // current `MapFieldProvider`-based codegen runs a single
+                    // `iterate` future, so the boxing workaround is no longer needed.
                     let inner;
                     syn::parenthesized!(inner in meta.input);
                     let ident: syn::Ident = inner.parse()?;
-                    if ident != "boxed" {
-                        return Err(syn::Error::new_spanned(ident, "expected `flatten(boxed)`"));
-                    }
-                    flatten = FlattenMode::Boxed;
-                } else {
-                    flatten = FlattenMode::Plain;
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        "`#[strede(flatten(...))]` is no longer supported; use plain \
+                         `#[strede(flatten)]` instead. The `flatten(boxed)` workaround \
+                         was removed alongside the old continuation-chain codegen.",
+                    ));
                 }
+                flatten = FlattenMode::Plain;
                 Ok(())
             } else if meta.path.is_ident("deserialize_with") {
                 let value = meta.value()?;

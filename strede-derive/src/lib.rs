@@ -109,13 +109,6 @@
 //! be combined with `rename`, `alias`, `default`, `skip_deserializing`,
 //! `deserialize_with`, `from`, or `try_from`.
 //!
-//! ## `#[strede(flatten(boxed))]`
-//!
-//! Same as `flatten`, but heap-allocates each continuation future via `Box::pin` to
-//! avoid stack overflow from deeply-nested async state machines. Recommended when a
-//! struct has 3+ flatten fields. Any annotated flatten field enables boxed mode for the
-//! entire flatten chain. Requires the `alloc` feature.
-//!
 //! ## `#[strede(borrow)]` / `#[strede(borrow = "'a + 'b")]`
 //!
 //! **Borrow family only.** Controls which `'de: 'lifetime` bounds are emitted for a

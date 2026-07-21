@@ -9,7 +9,7 @@ authors.workspace = true
 categories.workspace = true
 keywords.workspace = true
 description = "JSON format backend for strede"
-readme = "../README.md"
+readme = "README.md"
 
 [dependencies]
 strede = { path = "../strede", version = "=0.1.1" }

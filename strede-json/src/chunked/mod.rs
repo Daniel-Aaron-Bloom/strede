@@ -33,8 +33,9 @@ use core::future::Future;
 use core::mem;
 use strede::utils::repeat;
 use strede::{
-    Buffer, DeserializeFromMapOwned, DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned,
-    EntryOwned, Handle, Probe, SharedBuf, hit,
+    Ascii, Buffer, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    DeserializeOwned, DeserializerOwned, EntryOwned, EnumAccessOwned, EnumArmStackOwned,
+    EnumVariantProbeOwned, Handle, NumberEncoding, Probe, SharedBuf, hit,
 };
 
 // ---------------------------------------------------------------------------
@@ -714,6 +715,43 @@ pub(crate) async fn capture_raw_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut 
     Ok(handle)
 }
 
+/// Bit-per-depth open-bracket tracker for `skip_value_chunked`. Bit `i` is 1
+/// when depth `i+1` was opened by `{`, 0 when opened by `[`. Depths beyond
+/// 4096 are not validated.
+struct FixedBitSet([u64; 64]);
+
+impl FixedBitSet {
+    const fn new() -> Self {
+        Self([0u64; 64])
+    }
+
+    /// Returns `false` when `depth` exceeds the tracked range (> 4096).
+    fn set(&mut self, depth: usize, is_object: bool) -> bool {
+        let i = depth - 1;
+        if i >= 4096 {
+            return false;
+        }
+        let word = i / 64;
+        let bit = i % 64;
+        if is_object {
+            self.0[word] |= 1u64 << bit;
+        } else {
+            self.0[word] &= !(1u64 << bit);
+        }
+        true
+    }
+
+    fn is_object(&self, depth: usize) -> Option<bool> {
+        let i = depth - 1;
+        if i >= 4096 {
+            return None;
+        }
+        let word = i / 64;
+        let bit = i % 64;
+        Some((self.0[word] >> bit) & 1 == 1)
+    }
+}
+
 /// Skip one complete JSON value (scalar, string, object, or array) in chunked
 /// mode. Uses iterative depth tracking instead of recursion to stay no_std.
 pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
@@ -737,19 +775,48 @@ pub(super) async fn skip_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             *tokenizer = Tokenizer::new();
             Ok(handle)
         }
-        Token::Simple(SimpleToken::ObjectStart | SimpleToken::ArrayStart, t) => {
+        Token::Simple(open @ (SimpleToken::ObjectStart | SimpleToken::ArrayStart), t) => {
             *tokenizer = t;
             let mut depth = 1usize;
+            let mut stack = FixedBitSet::new();
+            stack.set(depth, open == SimpleToken::ObjectStart);
             while depth > 0 {
                 let mut pending = None;
                 let (h, tok) = next_dispatch(handle, tokenizer, offset, &mut pending).await?;
                 handle = h;
                 match tok {
-                    Token::Simple(SimpleToken::ObjectStart | SimpleToken::ArrayStart, t) => {
-                        *tokenizer = t;
+                    Token::Simple(
+                        inner @ (SimpleToken::ObjectStart | SimpleToken::ArrayStart),
+                        t,
+                    ) => {
                         depth += 1;
+                        if stack.set(depth, inner == SimpleToken::ObjectStart) {
+                            *tokenizer = t;
+                        } else {
+                            #[cfg(feature = "alloc")]
+                            {
+                                handle = alloc::boxed::Box::pin(skip_value_chunked(
+                                    handle,
+                                    tokenizer,
+                                    offset,
+                                    Token::Simple(inner, t),
+                                ))
+                                .await?;
+                                depth -= 1;
+                            }
+                            #[cfg(not(feature = "alloc"))]
+                            {
+                                *tokenizer = t;
+                            }
+                        }
                     }
-                    Token::Simple(SimpleToken::ObjectEnd | SimpleToken::ArrayEnd, t) => {
+                    Token::Simple(close @ (SimpleToken::ObjectEnd | SimpleToken::ArrayEnd), t) => {
+                        if let Some(was_object) = stack.is_object(depth) {
+                            let is_object_end = close == SimpleToken::ObjectEnd;
+                            if was_object != is_object_end {
+                                return Err(JsonError::UnexpectedByte { byte: 0 });
+                            }
+                        }
                         *tokenizer = t;
                         depth -= 1;
                     }
@@ -785,10 +852,10 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     type SubDeserializer = ChunkedJsonSubDeserializer<'s, B, F>;
     type StrChunks = ChunkedJsonStrAccess<'s, B, F>;
     type BytesChunks = ChunkedJsonBytesAccess<'s, B, F>;
-    type NumberChunks = ChunkedJsonNumberAccess<'s, B, F>;
+    type NumberChunks<Enc: NumberEncoding> = ChunkedJsonNumberAccess<'s, B, F>;
     type Map = ChunkedJsonMapAccessOwned<'s, B, F>;
     type Seq = ChunkedJsonSeqAccess<'s, B, F>;
-
+    type Enum = ChunkedJsonEnumAccess<'s, B, F>;
     #[inline(always)]
     fn fork(&mut self) -> Self {
         Self {
@@ -827,7 +894,12 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     }
 
     #[inline(always)]
-    async fn deserialize_number_chunks(self) -> Result<Probe<Self::NumberChunks>, Self::Error> {
+    async fn deserialize_number_chunks<Enc: NumberEncoding>(
+        self,
+    ) -> Result<Probe<Self::NumberChunks<Enc>>, Self::Error> {
+        if Enc::NAME != Ascii::NAME {
+            return Ok(Probe::Miss);
+        }
         match self.token {
             Token::Number(access) => Ok(Probe::Hit(ChunkedJsonNumberAccess {
                 handle: self.handle,
@@ -941,6 +1013,35 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EntryOwned for ChunkedJsonEntry<'s, B
     }
 
     #[inline(always)]
+    async fn deserialize_enum(self) -> Result<Probe<Self::Enum>, Self::Error> {
+        Ok(Probe::Hit(ChunkedJsonEnumAccess {
+            handle: self.handle,
+            token: self.token,
+            tokenizer: self.tokenizer,
+            offset: self.offset,
+            start_offset: self.start_offset,
+        }))
+    }
+
+    #[inline(always)]
+    async fn deserialize_enum_into<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeFromEnumOwned<Self::Enum>,
+    {
+        let enum_access = ChunkedJsonEnumAccess {
+            handle: self.handle,
+            token: self.token,
+            tokenizer: self.tokenizer,
+            offset: self.offset,
+            start_offset: self.start_offset,
+        };
+        T::deserialize_from_enum_owned(enum_access, extra).await
+    }
+
+    #[inline(always)]
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         let mut tokenizer = self.tokenizer;
         let mut offset = self.offset;
@@ -961,3 +1062,317 @@ use access::{
     ChunkedJsonBytesAccess, ChunkedJsonMapAccessOwned, ChunkedJsonNumberAccess,
     ChunkedJsonSeqAccess, ChunkedJsonStrAccess,
 };
+
+// ---------------------------------------------------------------------------
+// ChunkedJsonEnumAccess / ChunkedJsonEnumVariantProbe
+// ---------------------------------------------------------------------------
+
+/// [`EnumAccessOwned`] for the chunked JSON deserializer.
+///
+/// - Unit variants: bare string token (`"VariantName"`)
+/// - Non-unit variants: single-key object (`{"VariantName": <payload>}`)
+pub struct ChunkedJsonEnumAccess<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    token: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+    start_offset: usize,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedJsonEnumAccess<'s, B, F> {
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'s, B, F>;
+    type VariantProbe = ChunkedJsonEnumVariantProbe<'s, B, F>;
+
+    async fn iterate<S>(self, mut arms: S) -> Result<Probe<(Self::Claim, S::Outputs)>, Self::Error>
+    where
+        S: EnumArmStackOwned<Self::VariantProbe>,
+    {
+        let vp = ChunkedJsonEnumVariantProbe {
+            handle: self.handle,
+            token: self.token,
+            tokenizer: self.tokenizer,
+            offset: self.offset,
+            start_offset: self.start_offset,
+        };
+        let (_idx, claim) = hit!(arms.race(vp).await);
+        let outputs = arms.take_outputs();
+        Ok(Probe::Hit((claim, outputs)))
+    }
+}
+
+/// [`EnumVariantProbeOwned`] for the chunked JSON deserializer.
+pub struct ChunkedJsonEnumVariantProbe<'s, B: Buffer, F: AsyncFnMut(&mut B)> {
+    handle: Handle<'s, B, F>,
+    token: Token,
+    tokenizer: Tokenizer,
+    offset: usize,
+    start_offset: usize,
+}
+
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumVariantProbeOwned
+    for ChunkedJsonEnumVariantProbe<'s, B, F>
+{
+    type Error = JsonError;
+    type Claim = ChunkedJsonClaim<'s, B, F>;
+    type PayloadDeserializer = ChunkedJsonSubDeserializer<'s, B, F>;
+
+    fn fork(&mut self) -> Self {
+        Self {
+            handle: self.handle.fork(),
+            token: self.token.clone(),
+            tokenizer: self.tokenizer.clone(),
+            offset: self.offset,
+            start_offset: self.start_offset,
+        }
+    }
+
+    async fn deserialize_unit_by_name<W>(
+        self,
+        candidates: W,
+    ) -> Result<Probe<(Self::Claim, usize)>, Self::Error>
+    where
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        use access::ChunkedJsonStrAccess;
+        use strede::StrAccessOwned as _;
+
+        // Only match string tokens (unit variants are bare strings).
+        let mut str_access = match self.token {
+            Token::Str(access) => ChunkedJsonStrAccess {
+                handle: self.handle,
+                access,
+                offset: self.offset,
+                char_buf: [0; 4],
+            },
+            _ => return Ok(Probe::Miss),
+        };
+
+        let mut viable = candidates.map(|_| true);
+        let cands = candidates.as_ref();
+        let mut consumed: usize = 0;
+        loop {
+            let result = str_access
+                .next_str(|s: &str| {
+                    let new_consumed = consumed + s.len();
+                    let v = viable.as_mut();
+                    for (i, &(k, _)) in cands.iter().enumerate() {
+                        if !v[i] {
+                            continue;
+                        }
+                        if new_consumed > k.len()
+                            || &k.as_bytes()[consumed..new_consumed] != s.as_bytes()
+                        {
+                            v[i] = false;
+                        }
+                    }
+                    consumed = new_consumed;
+                })
+                .await?;
+            if !viable.as_ref().iter().any(|v| *v) {
+                return Ok(Probe::Miss);
+            }
+            match result {
+                strede::Chunk::Data((new, ())) => str_access = new,
+                strede::Chunk::Done(claim) => {
+                    let v = viable.as_ref();
+                    for (i, &(k, idx)) in cands.iter().enumerate() {
+                        if v[i] && k.len() == consumed {
+                            return Ok(Probe::Hit((claim, idx)));
+                        }
+                    }
+                    return Ok(Probe::Miss);
+                }
+            }
+        }
+    }
+
+    async fn deserialize_payload_by_name<T, W>(
+        self,
+        candidates: W,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, usize, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+        W: strede::ConcatableArray<T = (&'static str, usize)>
+            + Copy
+            + AsRef<[(&'static str, usize)]>,
+        W::OtherArray<bool>: AsRef<[bool]> + AsMut<[bool]>,
+    {
+        use access::ChunkedJsonKeyProbe;
+
+        // Expect a single-key object `{"VariantName": <payload>}`.
+        let (handle, mut tokenizer, mut offset) = match self.token {
+            Token::Simple(SimpleToken::ObjectStart, tok) => (self.handle, tok, self.offset),
+            _ => return Ok(Probe::Miss),
+        };
+
+        // Read the key token (or empty-object `}`).
+        let mut pending: Option<Token> = None;
+        let start_key_offset = offset;
+        let (handle, key_tok) =
+            next_dispatch(handle, &mut tokenizer, &mut offset, &mut pending).await?;
+
+        if let Token::Simple(SimpleToken::ObjectEnd, _) = key_tok {
+            // Empty object — no variant matched.
+            return Ok(Probe::Miss);
+        }
+
+        // Build a key probe and match against candidates via a sub-deserializer.
+        let key_probe = ChunkedJsonKeyProbe {
+            handle,
+            key_tok,
+            tokenizer,
+            offset,
+            start_offset: start_key_offset,
+        };
+
+        // Deserialize the key as MatchVals<usize, [(&'static str, usize); N]> to find the candidate index.
+        use strede::{
+            MapKeyClaimOwned as _, MapKeyProbeOwned as _, MapValueClaimOwned as _,
+            MapValueProbeOwned as _, MatchVals,
+        };
+        let (key_claim, MatchVals(idx, _)): (ChunkedJsonClaim<'s, B, F>, MatchVals<usize, W>) =
+            match key_probe
+                .deserialize_key::<MatchVals<usize, W>>(candidates)
+                .await?
+            {
+                Probe::Hit(v) => v,
+                Probe::Miss => return Ok(Probe::Miss),
+            };
+
+        // Advance past `:` and get the value token.
+        let value_probe: access::ChunkedJsonValueProbe<'s, B, F> =
+            key_claim.into_value_probe().await?;
+
+        // Deserialize the value as T via MapValueProbeOwned::deserialize_value.
+        let (value_claim, t): (ChunkedJsonClaim<'s, B, F>, T) =
+            match value_probe.deserialize_value::<T>(extra).await? {
+                Probe::Hit(v) => v,
+                Probe::Miss => return Ok(Probe::Miss),
+            };
+
+        // Expect `}` — externally-tagged enum has exactly one key-value pair.
+        let map_claim = match value_claim.next_key(0, 0).await? {
+            strede::NextKey::Done(c) => c,
+            strede::NextKey::Entry(_) => return Ok(Probe::Miss),
+        };
+
+        Ok(Probe::Hit((map_claim, idx, t)))
+    }
+
+    async fn deserialize_value_by_shape<T>(
+        self,
+        extra: T::Extra,
+    ) -> Result<Probe<(Self::Claim, T)>, Self::Error>
+    where
+        T: DeserializeOwned<Self::PayloadDeserializer>,
+    {
+        let sub = ChunkedJsonSubDeserializer::new(
+            self.handle,
+            self.tokenizer,
+            self.offset,
+            self.start_offset,
+            self.token,
+        );
+        T::deserialize_owned(sub, extra).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::ChunkedJsonDeserializer;
+    use std::{boxed::Box, vec::Vec};
+    use strede::shared_buf::SharedBuf;
+    use strede::{DeserializeOwned, Skip};
+    use strede_test_util::block_on;
+
+    fn skip_input(input: &'static [u8]) -> Result<(), crate::JsonError> {
+        block_on(SharedBuf::with_async(
+            input,
+            async move |buf: &mut &[u8]| {
+                *buf = &[];
+            },
+            async |shared| {
+                let de = ChunkedJsonDeserializer::new(shared);
+                match Skip::deserialize_owned(de, ()).await? {
+                    strede::Probe::Hit(_) => Ok(()),
+                    strede::Probe::Miss => Err(crate::JsonError::UnexpectedByte { byte: 0 }),
+                }
+            },
+        ))
+    }
+
+    #[test]
+    fn skip_mismatched_object_close_with_array_end() {
+        // {] is not valid JSON — object opened but array-end used to close it.
+        assert!(skip_input(b"{]").is_err());
+    }
+
+    #[test]
+    fn skip_mismatched_array_close_with_object_end() {
+        // [} is not valid JSON — array opened but object-end used to close it.
+        assert!(skip_input(b"[}").is_err());
+    }
+
+    #[test]
+    fn skip_mismatched_nested() {
+        // {"a": [} — mismatch inside a nested structure.
+        assert!(skip_input(b"{\"a\":[}").is_err());
+    }
+
+    #[test]
+    fn skip_matched_object() {
+        assert!(skip_input(b"{}").is_ok());
+    }
+
+    #[test]
+    fn skip_matched_array() {
+        assert!(skip_input(b"[]").is_ok());
+    }
+
+    /// Build a `&'static [u8]` from a `Vec` via `Box::leak` for use in tests.
+    fn skip_input_owned(input: Vec<u8>) -> Result<(), crate::JsonError> {
+        skip_input(Box::leak(input.into_boxed_slice()))
+    }
+
+    /// 4096 `[`s + `{}` + 4096 `]`s — valid at any depth, must succeed in both alloc and no-alloc.
+    #[test]
+    fn skip_deep_nesting_valid() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'[', 4096));
+        input.extend_from_slice(b"{}");
+        input.extend(std::iter::repeat_n(b']', 4096));
+        assert!(skip_input_owned(input).is_ok());
+    }
+
+    /// 4096 `[`s + `{` + `]` (mismatched close at depth 4097) + 4096 `]`s.
+    /// With `alloc`, the recursive call catches the mismatch and returns an error.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn skip_deep_nesting_mismatch_alloc() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat(b'[').take(4096));
+        input.push(b'{');
+        input.push(b']'); // closes `{` with `]` — mismatch
+        input.extend(std::iter::repeat(b']').take(4096));
+        assert!(skip_input_owned(input).is_err());
+    }
+
+    /// Same mismatch, but without `alloc`. Validation is skipped beyond depth 4096
+    /// so the mismatched close is silently accepted and skip returns `Ok`.
+    #[cfg(not(feature = "alloc"))]
+    #[test]
+    fn skip_deep_nesting_mismatch_no_alloc() {
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'[', 4096));
+        input.push(b'{');
+        input.push(b']'); // closes `{` with `]` — mismatch silently ignored
+        input.extend(std::iter::repeat_n(b']', 4096));
+        assert!(skip_input_owned(input).is_ok());
+    }
+}

@@ -22,6 +22,31 @@ pub use owned::MapArmStackOwned;
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
+// True / False - type-level booleans for MapArmStack::Dynamic / MapArmStackOwned::Dynamic
+// ---------------------------------------------------------------------------
+
+/// Type-level "true", paired with [`False`]. Used as
+/// [`crate::MapArmStack::Dynamic`] / [`crate::MapArmStackOwned::Dynamic`] for
+/// arm stacks representing an unbounded/runtime-sized collection (e.g.
+/// HashMap's `CollectMap`) that requires the format to read an explicit
+/// wire-level length before iterating.
+///
+/// Encoding this as a type (selected via associated-type dispatch) rather
+/// than a `bool` const lets a format provide two genuinely separate
+/// implementations for the two iteration strategies — one per marker type —
+/// instead of one shared function with a runtime `if`. The latter forces the
+/// compiler to lay out the union of both branches' state for every
+/// monomorphization, even though only one branch is ever reachable for a
+/// given concrete arm stack.
+pub struct True;
+
+/// Type-level "false", paired with [`True`]. The default/expected value for
+/// arm stacks with a fixed compile-time field set (structs, enums) whose end
+/// is signaled by the arm stack becoming satisfied rather than by a wire
+/// length.
+pub struct False;
+
+// ---------------------------------------------------------------------------
 // NextKey - shared by both families' value-claim traits
 // ---------------------------------------------------------------------------
 
@@ -58,8 +83,11 @@ impl<K, V> ArmState<K, V> {
 /// One slot in the arm stack. Holds the key callback, value callback, and
 /// accumulated state for a single struct field.
 ///
-/// - `KeyFn: FnMut(KP) -> KeyFut` where `KeyFut: Future<Output = Result<Probe<(KeyClaim, K)>, Error>>`
-/// - `ValFn: FnMut(ValueProbe, K) -> ValFut` where `ValFut: Future<Output = Result<Probe<(ValueClaim, V)>, Error>>`
+/// - `KeyFn: FnMut(KP, usize) -> KeyFut` — races against an incoming key probe from the
+///   format. The `usize` is this arm's global positional index (0-based), computed at
+///   `init_race` time. Named-only arms ignore it; arms that also support positional access
+///   can call `kp.deserialize_key_by_index(i)` and race it via `select_probe!`.
+/// - `ValFn: FnMut(ValueProbe, K) -> ValFut` — dispatches the value once a key is resolved.
 pub struct MapArmSlot<K, V, KeyFn, ValFn> {
     pub key_fn: KeyFn,
     pub val_fn: ValFn,
@@ -107,7 +135,7 @@ impl<Rest, S, T> core::ops::Add<MapArm<T>> for (Rest, S) {
 /// - Stores `K` from the key race in `pending_key` so `init_dispatch` can
 ///   pass it to `val_fn`.
 ///
-/// `KeyFn: FnMut(KP) -> KeyFut` - creates the key-matching future.
+/// `KeyFn: FnMut(KP, usize) -> KeyFut` - creates the key-matching future.
 /// `ValFn: FnMut(VP, K) -> ValFut` - creates the value-dispatch future.
 pub struct VirtualArmSlot<K, KeyFn, ValFn> {
     pub key_fn: KeyFn,
@@ -132,21 +160,16 @@ impl<K, KeyFn, ValFn> VirtualArmSlot<K, KeyFn, ValFn> {
 /// `KeyFn` produces the dup arm's key-race future (calls `deserialize_key`).
 /// `SkipFn` produces the dup arm's value-skip future (calls `vp.skip()`).
 /// Both are closures whose types are inferred at construction.
-pub struct DetectDuplicatesOwned<S, const M: usize, KeyFn, SkipFn> {
+pub struct DetectDuplicates<S, W, KeyFn, SkipFn> {
     pub inner: S,
     pub key_fn: KeyFn,
     pub skip_fn: SkipFn,
-    pub wire_names: [(&'static str, usize); M],
+    pub wire_names: W,
     pub dup: &'static str,
 }
 
-impl<S, const M: usize, KeyFn, SkipFn> DetectDuplicatesOwned<S, M, KeyFn, SkipFn> {
-    pub fn new(
-        inner: S,
-        wire_names: [(&'static str, usize); M],
-        key_fn: KeyFn,
-        skip_fn: SkipFn,
-    ) -> Self {
+impl<S, W, KeyFn, SkipFn> DetectDuplicates<S, W, KeyFn, SkipFn> {
+    pub fn new(inner: S, wire_names: W, key_fn: KeyFn, skip_fn: SkipFn) -> Self {
         Self {
             inner,
             key_fn,
@@ -161,22 +184,20 @@ impl<S, const M: usize, KeyFn, SkipFn> DetectDuplicatesOwned<S, M, KeyFn, SkipFn
 /// tag field and capture the matched variant index into a `Cell<Option<usize>>`.
 ///
 /// Tag arm is at index 0 (highest priority). Inner arms at indices 1..SIZE.
-pub struct TagInjectingStackOwned<'v, S, const N: usize, TagKeyFn, TagValFn> {
+pub struct TagInjectingStack<'v, S, W, TagKeyFn, TagValFn> {
     pub inner: S,
     pub tag_key_fn: TagKeyFn,
     pub tag_val_fn: TagValFn,
     pub tag_field: &'static str,
-    pub tag_candidates: [(&'static str, usize); N],
+    pub tag_candidates: W,
     pub tag_value: &'v core::cell::Cell<Option<usize>>,
 }
 
-impl<'v, S, const N: usize, TagKeyFn, TagValFn>
-    TagInjectingStackOwned<'v, S, N, TagKeyFn, TagValFn>
-{
+impl<'v, S, W, TagKeyFn, TagValFn> TagInjectingStack<'v, S, W, TagKeyFn, TagValFn> {
     pub fn new(
         inner: S,
         tag_field: &'static str,
-        tag_candidates: [(&'static str, usize); N],
+        tag_candidates: W,
         tag_value: &'v core::cell::Cell<Option<usize>>,
         tag_key_fn: TagKeyFn,
         tag_val_fn: TagValFn,
@@ -234,7 +255,7 @@ pub enum ConcatDispatchState<AState, BState> {
     InB(#[pin] BState),
 }
 
-/// Pinned race state for wrappers that add a virtual arm (`SkipUnknownOwned`, `DetectDuplicatesOwned`).
+/// Pinned race state for wrappers that add a virtual arm (`SkipUnknownOwned`, `DetectDuplicates`).
 #[pin_project]
 pub struct WrapperRaceState<InnerState, VirtualFut> {
     #[pin]
@@ -250,7 +271,7 @@ pub enum WrapperDispatchState<InnerState, VirtualFut> {
     Inner(#[pin] InnerState),
 }
 
-/// Race state for [`TagInjectingStackOwned`]: tag future + inner state.
+/// Race state for [`TagInjectingStack`]: tag future + inner state.
 /// Tag arm is at index 0, inner arms at 1..SIZE.
 #[pin_project]
 pub struct TagRaceState<TagFut, InnerState> {
@@ -260,7 +281,7 @@ pub struct TagRaceState<TagFut, InnerState> {
     pub inner: InnerState,
 }
 
-/// Dispatch state for [`TagInjectingStackOwned`].
+/// Dispatch state for [`TagInjectingStack`].
 #[pin_project(project = TagDispatchProj)]
 pub enum TagDispatchState<TagFut, InnerState> {
     Tag(#[pin] TagFut),
@@ -308,13 +329,14 @@ where
 
 /// Build a left-nested arm tuple from a flat list of arm definitions.
 ///
-/// Each arm is `key_closure => value_closure`, which expands to a
-/// [`MapArmSlot`] wrapping the two closures.
+/// Each arm is `key_closure => value_closure`. Key closures receive `(KP, usize)` where
+/// the `usize` is the arm's global positional index — ignore it (`_i`) for named-only
+/// matching, or pass it to `kp.deserialize_key_by_index(i)` for positional support.
 ///
 /// ```rust,ignore
 /// let arms = map_arms! {
-///     |kp| kp.deserialize_key::<Match, _>("secs") => |vp, k| { ... },
-///     |kp| kp.deserialize_key::<Match, _>("nanos") => |vp, k| { ... },
+///     |kp, _i| kp.deserialize_key::<Match, _>("secs") => |vp, k| { ... },
+///     |kp, _i| kp.deserialize_key::<Match, _>("nanos") => |vp, k| { ... },
 /// };
 /// ```
 ///
@@ -355,7 +377,7 @@ macro_rules! SkipUnknown {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp: $vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbe as _;
                     let vc = vp.skip().await?;
@@ -369,7 +391,7 @@ macro_rules! SkipUnknown {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbe as _;
                     let vc = vp.skip().await?;
@@ -386,10 +408,10 @@ macro_rules! DetectDuplicates {
     ($inner:expr, $wire_names:expr, $kp:ty, $vp:ty) => {{
         use $crate::MapKeyProbe as _;
         let __wn = $wire_names;
-        $crate::DetectDuplicatesOwned::new(
+        $crate::DetectDuplicates::new(
             $inner,
             __wn,
-            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
             |vp: $vp| vp.skip(),
         )
     }};
@@ -403,12 +425,12 @@ macro_rules! TagInjectingStack {
         use $crate::MapValueProbe as _;
         let __tf = $tag_field;
         let __tc = $tag_candidates;
-        $crate::TagInjectingStackOwned::new(
+        $crate::TagInjectingStack::new(
             $inner,
             __tf,
             __tc,
             $tag_value,
-            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
             move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
         )
     }};
@@ -429,7 +451,7 @@ macro_rules! SkipUnknownOwned {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp: $kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp: $vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbeOwned as _;
                     let vc = vp.skip().await?;
@@ -444,7 +466,7 @@ macro_rules! SkipUnknownOwned {
         (
             $inner,
             $crate::VirtualArmSlot::new(
-                |kp| kp.deserialize_key::<$crate::Skip>(()),
+                |kp, _i: usize| kp.deserialize_key::<$crate::Skip>(()),
                 |vp, _k: $crate::Skip| async move {
                     use $crate::MapValueProbeOwned as _;
                     let vc = vp.skip().await?;
@@ -458,17 +480,17 @@ macro_rules! SkipUnknownOwned {
 /// Wraps a [`MapArmStackOwned`] to return a duplicate-field error (owned family).
 ///
 /// `DetectDuplicatesOwned!(inner, wire_names, KP, VP)` expands to
-/// `DetectDuplicatesOwned::new(inner, wire_names, key_fn, skip_fn)` with typed closures.
+/// `DetectDuplicates::new(inner, wire_names, key_fn, skip_fn)` with typed closures.
 #[macro_export]
 macro_rules! DetectDuplicatesOwned {
     ($inner:expr, $wire_names:expr, $kp:ty, $vp:ty) => {{
         use $crate::MapKeyProbeOwned as _;
         use $crate::MapValueProbeOwned as _;
         let __wn = $wire_names;
-        $crate::DetectDuplicatesOwned::new(
+        $crate::DetectDuplicates::new(
             $inner,
             __wn,
-            move |kp: $kp| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::MatchVals<usize, _>>(__wn),
             |vp: $vp| vp.skip(),
         )
     }};
@@ -476,7 +498,7 @@ macro_rules! DetectDuplicatesOwned {
 
 /// Wraps a [`MapArmStackOwned`] to intercept a tag field (owned family).
 ///
-/// `TagInjectingStackOwned!(inner, tag_field, tag_candidates, tag_value, KP, VP)`
+/// `TagInjectingStack!(inner, tag_field, tag_candidates, tag_value, KP, VP)`
 #[macro_export]
 macro_rules! TagInjectingStackOwned {
     ($inner:expr, $tag_field:expr, $tag_candidates:expr, $tag_value:expr, $kp:ty, $vp:ty) => {{
@@ -484,12 +506,12 @@ macro_rules! TagInjectingStackOwned {
         use $crate::MapValueProbeOwned as _;
         let __tf = $tag_field;
         let __tc = $tag_candidates;
-        $crate::TagInjectingStackOwned::new(
+        $crate::TagInjectingStack::new(
             $inner,
             __tf,
             __tc,
             $tag_value,
-            move |kp: $kp| kp.deserialize_key::<$crate::Match>(__tf),
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
             move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
         )
     }};

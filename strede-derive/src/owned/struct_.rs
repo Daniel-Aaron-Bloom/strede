@@ -5,7 +5,7 @@ use syn::{Data, DeriveInput, Fields};
 use super::gen_container_from_owned;
 use crate::common::{
     DefaultAttr, FieldContext, apply_field_bound, classify_fields, field_bound_owned,
-    insert_d_owned, mentions_type_param, type_param_bound_owned,
+    insert_d_owned, type_param_bound_owned,
 };
 
 pub(super) fn expand_owned(
@@ -117,6 +117,7 @@ pub(super) fn expand_owned(
         // Build generics with DeserializeOwned bound only for the transparent field.
         let mut impl_gen = input.generics.clone();
         insert_d_owned(&mut impl_gen, krate);
+        let d_ident = format_ident!("__D");
         {
             let wc = impl_gen.make_where_clause();
             if let Some(preds) = &container_attrs.bound {
@@ -134,14 +135,22 @@ pub(super) fn expand_owned(
                     transparent_ty,
                     &transparent_cf.bound,
                     has_custom,
-                    |ty| field_bound_owned(krate, ty, FieldContext::Direct),
+                    |ty| field_bound_owned(krate, ty, FieldContext::Direct, &d_ident),
                 );
                 if let Some(ft) = &transparent_cf.from {
-                    wc.predicates
-                        .push(field_bound_owned(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_owned(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 } else if let Some(ft) = &transparent_cf.try_from {
-                    wc.predicates
-                        .push(field_bound_owned(krate, ft, FieldContext::Direct));
+                    wc.predicates.push(field_bound_owned(
+                        krate,
+                        ft,
+                        FieldContext::Direct,
+                        &d_ident,
+                    ));
                 }
             }
         }
@@ -215,10 +224,11 @@ pub(super) fn expand_owned(
         });
     }
 
-    // ---- tuple struct (seq-based) -------------------------------------------
+    // ---- tuple struct: gather seq variables used by DeserializeFromSeqOwned impl ----
+    // Named structs have acc_names=[] and dfs_impl=empty; tuple structs populate both.
 
-    if !is_named {
-        let acc_names: Vec<_> = (0..field_types.len())
+    let (acc_names, dfs_impl) = if !is_named {
+        let acc_names: Vec<syn::Ident> = (0..field_types.len())
             .map(|i| format_ident!("__f{}", i))
             .collect();
 
@@ -228,36 +238,6 @@ pub(super) fn expand_owned(
             .zip(classified_fields.iter())
             .filter(|(_, cf)| !cf.skip_deserializing)
             .collect();
-
-        let mut impl_gen = input.generics.clone();
-        insert_d_owned(&mut impl_gen, krate);
-        {
-            let wc = impl_gen.make_where_clause();
-            if let Some(preds) = &container_attrs.bound {
-                wc.predicates.extend(preds.iter().cloned());
-            } else {
-                for tp in input.generics.type_params() {
-                    let ident = &tp.ident;
-                    wc.predicates.push(type_param_bound_owned(krate, ident));
-                }
-                for (ty, cf) in &de_field_types_and_cfs {
-                    let has_custom = cf.deserialize_owned_with.is_some()
-                        || cf.from.is_some()
-                        || cf.try_from.is_some();
-                    apply_field_bound(wc, ty, &cf.bound, has_custom, |t| {
-                        field_bound_owned(krate, t, FieldContext::SeqElem)
-                    });
-                    if let Some(ft) = &cf.from {
-                        wc.predicates
-                            .push(field_bound_owned(krate, ft, FieldContext::SeqElem));
-                    } else if let Some(ft) = &cf.try_from {
-                        wc.predicates
-                            .push(field_bound_owned(krate, ft, FieldContext::SeqElem));
-                    }
-                }
-            }
-        }
-        let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
 
         // Generate sequential seq reads for non-skipped fields,
         // and default expressions for skipped fields.
@@ -303,45 +283,97 @@ pub(super) fn expand_owned(
             })
             .collect();
 
-        return Ok(quote! {
-            #[allow(unreachable_code)]
-            const _: () = {
-                use #krate::{
-                    DefaultValue as _, DeserializeOwned as _, DeserializerOwned as _, EntryOwned as _,
-                    SeqAccessOwned as _, SeqEntryOwned as _,
-                };
-
-                impl #impl_generics #krate::DeserializeOwned<__D> for #name #ty_generics #where_clause {
-                    type Extra = ();
-                    async fn deserialize_owned(
-                        d: __D,
-                        _extra: (),
-                    ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
-                    {
-                        d.entry(|[__e]| async {
-                            let __seq = #krate::hit!(__e.deserialize_seq().await);
-
-                            #( #seq_reads )*
-
-                            // Expect sequence exhaustion.
-                            let __v = #krate::hit!(__seq.next::<1, _, _, ()>(|[__se]| async {
-                                ::core::result::Result::Ok(#krate::Probe::Miss)
-                            }).await);
-                            let __claim = #krate::or_miss!(__v.done());
-                            ::core::result::Result::Ok(#krate::Probe::Hit((
-                                __claim,
-                                #name( #( #acc_names, )* ),
-                            )))
-                        }).await
+        // Build DeserializeFromSeqOwned<__S> where-clause: bounds on __S::Elem::SubDeserializer.
+        let mut dfs_gen = input.generics.clone();
+        dfs_gen
+            .params
+            .push(syn::parse_quote!(__S: #krate::SeqAccessOwned));
+        {
+            let wc = dfs_gen.make_where_clause();
+            if let Some(preds) = &container_attrs.bound {
+                wc.predicates.extend(preds.iter().cloned());
+            } else {
+                for tp in input.generics.type_params() {
+                    let ident = &tp.ident;
+                    wc.predicates.push(syn::parse_quote!(
+                        #ident: #krate::DeserializeOwned<
+                            <<__S as #krate::SeqAccessOwned>::Elem as #krate::SeqEntryOwned>::SubDeserializer,
+                            Extra = ()
+                        >
+                    ));
+                }
+                for (ty, cf) in &de_field_types_and_cfs {
+                    let has_custom = cf.deserialize_owned_with.is_some()
+                        || cf.from.is_some()
+                        || cf.try_from.is_some();
+                    apply_field_bound(wc, ty, &cf.bound, has_custom, |t| {
+                        syn::parse_quote!(
+                            #t: #krate::DeserializeOwned<
+                                <<__S as #krate::SeqAccessOwned>::Elem as #krate::SeqEntryOwned>::SubDeserializer,
+                                Extra = ()
+                            >
+                        )
+                    });
+                    if let Some(ft) = &cf.from {
+                        wc.predicates.push(syn::parse_quote!(
+                            #ft: #krate::DeserializeOwned<
+                                <<__S as #krate::SeqAccessOwned>::Elem as #krate::SeqEntryOwned>::SubDeserializer,
+                                Extra = ()
+                            >
+                        ));
+                    } else if let Some(ft) = &cf.try_from {
+                        wc.predicates.push(syn::parse_quote!(
+                            #ft: #krate::DeserializeOwned<
+                                <<__S as #krate::SeqAccessOwned>::Elem as #krate::SeqEntryOwned>::SubDeserializer,
+                                Extra = ()
+                            >
+                        ));
                     }
                 }
-            };
-        });
-    }
+            }
+        }
+        let (dfs_impl_generics, _, dfs_where_clause) = dfs_gen.split_for_impl();
+
+        let acc_names_tok = acc_names.clone();
+        let dfs = quote! {
+            impl #dfs_impl_generics #krate::DeserializeFromSeqOwned<__S> for #name #ty_generics
+                #dfs_where_clause
+            {
+                type Extra = ();
+                async fn deserialize_from_seq_owned(
+                    mut __seq: __S,
+                    _extra: (),
+                ) -> ::core::result::Result<
+                    #krate::Probe<(<__S as #krate::SeqAccessOwned>::SeqClaim, Self)>,
+                    <__S as #krate::SeqAccessOwned>::Error,
+                > {
+                    #( #seq_reads )*
+                    let __v = #krate::hit!(__seq.next::<1, _, _, ()>(|[__se]| async {
+                        ::core::result::Result::Ok(#krate::Probe::Miss)
+                    }).await);
+                    let __claim = #krate::or_miss!(__v.done());
+                    ::core::result::Result::Ok(#krate::Probe::Hit((
+                        __claim,
+                        #name( #( #acc_names_tok, )* ),
+                    )))
+                }
+            }
+        };
+
+        (acc_names, dfs)
+    } else {
+        (vec![], quote! {})
+    };
 
     // ---- named struct (map-based, existing codegen) -------------------------
 
-    let field_names: Vec<_> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+    // For named structs use the real field ident; for tuple structs use __f0, __f1, ... (same as
+    // acc_names computed above, which serve as local variable names throughout codegen).
+    let field_names: Vec<syn::Ident> = if is_named {
+        fields.iter().map(|f| f.ident.clone().unwrap()).collect()
+    } else {
+        acc_names.clone()
+    };
 
     // Filtered views: only non-skipped fields participate in deserialization.
     // Split into regular (arm-based) and flatten fields.
@@ -349,7 +381,7 @@ pub(super) fn expand_owned(
         .iter()
         .zip(classified_fields.iter())
         .filter(|(_, cf)| !cf.skip_deserializing && cf.flatten == crate::common::FlattenMode::None)
-        .map(|(n, _)| *n)
+        .map(|(n, _)| n)
         .collect();
     let de_field_types: Vec<_> = field_types
         .iter()
@@ -364,7 +396,7 @@ pub(super) fn expand_owned(
         .zip(field_types.iter())
         .zip(classified_fields.iter())
         .filter(|(_, cf)| cf.flatten != crate::common::FlattenMode::None)
-        .map(|((n, t), cf)| (*n, *t, cf.flatten))
+        .map(|((n, t), cf)| (n as &syn::Ident, *t, cf.flatten))
         .collect();
 
     // For deserialize_owned_with / from / try_from: compute value types and conversions.
@@ -409,37 +441,487 @@ pub(super) fn expand_owned(
         krate,
     );
 
-    // D6 — detect generic-T flatten fields on stable.
-    let type_param_idents: Vec<syn::Ident> = input
-        .generics
-        .type_params()
-        .map(|tp| tp.ident.clone())
-        .collect();
-    for (fname, flat_ty, _) in &flatten_fields {
-        let fcf = classified_fields
+    // Walk all fields in declaration order, classifying each as Skip / Regular / Flatten.
+    enum FieldKind<'a> {
+        Skip,
+        Regular { reg_idx: usize },
+        Flatten { ty: &'a syn::Type },
+    }
+    let field_kinds: Vec<FieldKind> = {
+        let mut reg_idx = 0usize;
+        field_names
             .iter()
-            .zip(field_names.iter())
-            .find(|(_, n)| **n == *fname)
-            .map(|(cf, _)| cf);
-        let has_explicit_bound = fcf.map(|cf| cf.bound.is_some()).unwrap_or(false);
-        if !has_explicit_bound
-            && !type_param_idents.is_empty()
-            && mentions_type_param(flat_ty, &type_param_idents)
-        {
-            let msg = "`#[strede(flatten)]` on a field whose type mentions a struct type \
-                       parameter is not supported on stable Rust. Add `#[strede(bound = \
-                       \"...\")]` to the field, or enable the `nightly-flatten` feature.";
-            return Ok(quote! {
-                ::core::compile_error!(#msg);
+            .zip(classified_fields.iter())
+            .zip(field_types.iter())
+            .map(|((_n, cf), ty)| {
+                if cf.skip_deserializing {
+                    FieldKind::Skip
+                } else if cf.flatten == crate::common::FlattenMode::None {
+                    let r = reg_idx;
+                    reg_idx += 1;
+                    FieldKind::Regular { reg_idx: r }
+                } else {
+                    FieldKind::Flatten { ty }
+                }
+            })
+            .collect()
+    };
+
+    enum Segment<'a> {
+        Regular(Vec<usize>),
+        Flatten { ty: &'a syn::Type },
+    }
+    let segments: Vec<Segment> = {
+        let mut out: Vec<Segment> = vec![];
+        let mut cur_reg: Vec<usize> = vec![];
+        for kind in &field_kinds {
+            match kind {
+                FieldKind::Skip => {}
+                FieldKind::Regular { reg_idx } => cur_reg.push(*reg_idx),
+                FieldKind::Flatten { ty } => {
+                    if !cur_reg.is_empty() {
+                        out.push(Segment::Regular(core::mem::take(&mut cur_reg)));
+                    }
+                    out.push(Segment::Flatten { ty });
+                }
+            }
+        }
+        if !cur_reg.is_empty() {
+            out.push(Segment::Regular(cur_reg));
+        }
+        out
+    };
+
+    let arm_offset_tokens: Vec<TokenStream2> = {
+        let mut out = vec![];
+        let mut terms: Vec<TokenStream2> = vec![];
+        for kind in &field_kinds {
+            let cur = if terms.is_empty() {
+                quote! { 0usize }
+            } else {
+                quote! { ( #( #terms )+* ) }
+            };
+            out.push(cur);
+            match kind {
+                FieldKind::Skip => {}
+                FieldKind::Regular { .. } => terms.push(quote! { 1usize }),
+                FieldKind::Flatten { ty, .. } => terms.push(quote! {
+                    <#ty as #krate::MapFieldProviderOwned<__KP>>::ARMS
+                }),
+            }
+        }
+        out
+    };
+
+    let key_type_for = |cf: &crate::common::ClassifiedField| -> TokenStream2 {
+        let n = 1 + cf.aliases.len();
+        if n == 1 {
+            quote! { #krate::Match }
+        } else {
+            quote! { #krate::MatchVals<(), [(&'static str, ()); #n]> }
+        }
+    };
+
+    let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
+        let cf = de_classified[reg_idx];
+        let val_type = &de_value_types[reg_idx];
+        let val_conv = &de_value_conversions[reg_idx];
+        let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
+        for alias in &cf.aliases {
+            wire_names.push(alias.as_str());
+        }
+        let key_fn = if wire_names.len() == 1 {
+            let wname = wire_names[0];
+            quote! {
+                |mut __kp: __KP, __i: usize| async move {
+                    let __kp2 = __kp.fork();
+                    #krate::select_probe! {
+                        __kp.deserialize_key::<#krate::Match>(#wname),
+                        async move {
+                            let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                            ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::Match)))
+                        },
+                    }
+                }
+            }
+        } else {
+            quote! {
+                |mut __kp: __KP, __i: usize| async move {
+                    let __kp2 = __kp.fork();
+                    #krate::select_probe! {
+                        __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*]),
+                        async move {
+                            let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                            ::core::result::Result::Ok(#krate::Probe::Hit((
+                                __kc,
+                                #krate::MatchVals((), ::core::marker::PhantomData),
+                            )))
+                        },
+                    }
+                }
+            }
+        };
+        let val_fn = quote! {
+            |__vp: #krate::owned::VP<__KP>, __k| async move {
+                let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#val_type>(()).await);
+                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #val_conv))))
+            }
+        };
+        quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
+    };
+
+    // --- type Outputs ---
+    let outputs_type_tokens: TokenStream2 = {
+        if segments.is_empty() {
+            quote! { () }
+        } else {
+            let mut acc: Option<TokenStream2> = None;
+            for seg in &segments {
+                let seg_out = match seg {
+                    Segment::Regular(regs) => {
+                        let mut t = quote! { () };
+                        for r in regs {
+                            let cf = de_classified[*r];
+                            let kt = key_type_for(cf);
+                            let vt = &de_value_types[*r];
+                            t = quote! { (#t, ::core::option::Option<(#kt, #vt)>) };
+                        }
+                        t
+                    }
+                    Segment::Flatten { ty } => quote! {
+                        <#ty as #krate::MapFieldProviderOwned<__KP>>::Outputs
+                    },
+                };
+                acc = Some(match acc {
+                    None => seg_out,
+                    Some(prev) => quote! { (#prev, #seg_out) },
+                });
+            }
+            acc.unwrap()
+        }
+    };
+
+    // --- const ARMS ---
+    let arms_const_tokens: TokenStream2 = {
+        let terms: Vec<TokenStream2> = field_kinds
+            .iter()
+            .filter_map(|k| match k {
+                FieldKind::Skip => None,
+                FieldKind::Regular { .. } => Some(quote! { 1usize }),
+                FieldKind::Flatten { ty, .. } => Some(quote! {
+                    <#ty as #krate::MapFieldProviderOwned<__KP>>::ARMS
+                }),
+            })
+            .collect();
+        if terms.is_empty() {
+            quote! { 0usize }
+        } else {
+            quote! { #( #terms )+* }
+        }
+    };
+
+    // --- type WireNames ---
+    let wire_names_type_tokens: TokenStream2 = {
+        let mut acc: Option<TokenStream2> = None;
+        for seg in &segments {
+            let piece = match seg {
+                Segment::Regular(regs) => {
+                    let n: usize = regs
+                        .iter()
+                        .map(|r| 1 + de_classified[*r].aliases.len())
+                        .sum();
+                    quote! { [(&'static str, usize); #n] }
+                }
+                Segment::Flatten { ty } => quote! {
+                    <<#ty as #krate::MapFieldProviderOwned<__KP>>::WireNames
+                        as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>
+                },
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => quote! {
+                    #krate::ArrayConcat<(&'static str, usize), #prev, #piece>
+                },
             });
         }
-    }
+        acc.unwrap_or_else(|| quote! { [(&'static str, usize); 0] })
+    };
 
-    // Build impl generics.
-    let mut impl_gen = input.generics.clone();
-    insert_d_owned(&mut impl_gen, krate);
+    // --- fn wire_names() body ---
+    let wire_names_body_tokens: TokenStream2 = {
+        let mut field_iter = field_kinds.iter().enumerate();
+        let mut acc: Option<TokenStream2> = None;
+        for seg in &segments {
+            let piece = match seg {
+                Segment::Regular(regs) => {
+                    let mut entries: Vec<TokenStream2> = vec![];
+                    for _ in 0..regs.len() {
+                        loop {
+                            let (i, kind) = field_iter.next().expect("regular field present");
+                            if matches!(kind, FieldKind::Regular { .. }) {
+                                let offset = &arm_offset_tokens[i];
+                                let reg_idx = if let FieldKind::Regular { reg_idx } = kind {
+                                    *reg_idx
+                                } else {
+                                    unreachable!()
+                                };
+                                let cf = de_classified[reg_idx];
+                                let primary = &cf.wire_name;
+                                entries.push(quote! { (#primary, #offset) });
+                                for a in &cf.aliases {
+                                    entries.push(quote! { (#a, #offset) });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    let n = entries.len();
+                    quote! { [#( #entries ),*] as [(&'static str, usize); #n] }
+                }
+                Segment::Flatten { ty } => loop {
+                    let (i, kind) = field_iter.next().expect("flatten field present");
+                    if matches!(kind, FieldKind::Flatten { .. }) {
+                        let offset = &arm_offset_tokens[i];
+                        break quote! {
+                            <#ty as #krate::MapFieldProviderOwned<__KP>>::wire_names()
+                                .map(|(__s, __i)| (__s, __i + #offset))
+                        };
+                    }
+                },
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => quote! { #krate::ArrayConcat::new(#prev, #piece) },
+            });
+        }
+        acc.unwrap_or_else(|| quote! { [] as [(&'static str, usize); 0] })
+    };
+
+    // --- fn make_arms() body ---
+    let make_arms_body_tokens: TokenStream2 = {
+        let mut acc: Option<TokenStream2> = None;
+        for seg in &segments {
+            let piece = match seg {
+                Segment::Regular(regs) => {
+                    let mut t = quote! { #krate::MapArmBase };
+                    for r in regs {
+                        let slot = build_arm_slot(*r);
+                        t = quote! { (#t, #slot) };
+                    }
+                    t
+                }
+                Segment::Flatten { ty } => quote! {
+                    <#ty as #krate::MapFieldProviderOwned<__KP>>::make_arms()
+                },
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => quote! { #krate::StackConcat(#prev, #piece) },
+            });
+        }
+        acc.unwrap_or_else(|| quote! { #krate::MapArmBase })
+    };
+
+    // --- fn from_outputs() body ---
+    let from_outputs_body_tokens: TokenStream2 = {
+        let seg_out_names: Vec<syn::Ident> = (0..segments.len())
+            .map(|i| format_ident!("__seg_out_{}", i))
+            .collect();
+        let outer_pat: TokenStream2 = if seg_out_names.is_empty() {
+            quote! { () }
+        } else {
+            let mut p: Option<TokenStream2> = None;
+            for n in &seg_out_names {
+                p = Some(match p {
+                    None => quote! { #n },
+                    Some(prev) => quote! { (#prev, #n) },
+                });
+            }
+            p.unwrap()
+        };
+
+        let mut seg_stmts: Vec<TokenStream2> = vec![];
+        let mut field_iter = field_kinds.iter().enumerate();
+        for (seg_i, seg) in segments.iter().enumerate() {
+            let seg_out = &seg_out_names[seg_i];
+            match seg {
+                Segment::Regular(regs) => {
+                    let inner_pat: TokenStream2 = {
+                        let mut p = quote! { () };
+                        for r in regs {
+                            let ident = format_ident!("__opt_{}", r);
+                            p = quote! { (#p, #ident) };
+                        }
+                        p
+                    };
+                    seg_stmts.push(quote! { let #inner_pat = #seg_out; });
+                    for _ in 0..regs.len() {
+                        loop {
+                            let (_i, kind) = field_iter.next().expect("regular");
+                            if let FieldKind::Regular { reg_idx } = kind {
+                                let cf = de_classified[*reg_idx];
+                                let fname = de_field_names[*reg_idx];
+                                let opt_ident = format_ident!("__opt_{}", reg_idx);
+                                let val_conv = &de_value_conversions[*reg_idx];
+                                let none_branch: TokenStream2 = match &cf.default {
+                                    Some(DefaultAttr::Trait) => {
+                                        quote! { ::core::default::Default::default() }
+                                    }
+                                    Some(DefaultAttr::Expr(expr)) => {
+                                        quote! { #krate::DefaultWrapper(#expr).value() }
+                                    }
+                                    None => quote! {
+                                        return ::core::option::Option::None
+                                    },
+                                };
+                                seg_stmts.push(quote! {
+                                    let #fname = match #opt_ident {
+                                        ::core::option::Option::Some((_, __v)) => __v #val_conv,
+                                        ::core::option::Option::None => #none_branch,
+                                    };
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+                Segment::Flatten { ty } => {
+                    loop {
+                        let (_i, kind) = field_iter.next().expect("flatten");
+                        if let FieldKind::Flatten { .. } = kind {
+                            break;
+                        }
+                    }
+                    let fname = {
+                        let prior_flat = segments[..seg_i]
+                            .iter()
+                            .filter(|s| matches!(s, Segment::Flatten { .. }))
+                            .count();
+                        flatten_fields[prior_flat].0
+                    };
+                    seg_stmts.push(quote! {
+                        let #fname = match <#ty as #krate::MapFieldProviderOwned<__KP>>
+                            ::from_outputs(#seg_out)
+                        {
+                            ::core::option::Option::Some(__v) => __v,
+                            ::core::option::Option::None => return ::core::option::Option::None,
+                        };
+                    });
+                }
+            }
+        }
+
+        let skip_stmts: Vec<TokenStream2> = field_names
+            .iter()
+            .zip(classified_fields.iter())
+            .filter(|(_, cf)| cf.skip_deserializing)
+            .map(|(fname, cf)| {
+                let default_expr: TokenStream2 = match &cf.default {
+                    Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
+                    Some(DefaultAttr::Expr(expr)) => {
+                        quote! { #krate::DefaultWrapper(#expr).value() }
+                    }
+                    None => unreachable!("validated in classify_fields"),
+                };
+                quote! { let #fname = #default_expr; }
+            })
+            .collect();
+
+        let construction = if is_named {
+            quote! { #name { #( #field_names, )* } }
+        } else {
+            quote! { #name( #( #field_names, )* ) }
+        };
+
+        quote! {
+            let #outer_pat = __outputs;
+            #( #seg_stmts )*
+            #( #skip_stmts )*
+            ::core::option::Option::Some(#construction)
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // Where-clause builders
+    // ------------------------------------------------------------------
+
+    let mut mfp_impl_gen = input.generics.clone();
+    mfp_impl_gen
+        .params
+        .push(syn::parse_quote!(__KP: #krate::MapKeyProbeOwned));
     {
-        let wc = impl_gen.make_where_clause();
+        let wc = mfp_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in input.generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::DeserializeOwned<
+                        <#krate::owned::VP<__KP> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            for (ty, cf) in de_field_types.iter().zip(de_classified.iter()) {
+                let has_custom = cf.deserialize_owned_with.is_some()
+                    || cf.from.is_some()
+                    || cf.try_from.is_some();
+                apply_field_bound(wc, ty, &cf.bound, has_custom, |t| {
+                    syn::parse_quote!(
+                        #t: #krate::DeserializeOwned<
+                            <#krate::owned::VP<__KP> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                            Extra = ()
+                        >
+                    )
+                });
+            }
+            for (_, flat_ty, _) in &flatten_fields {
+                wc.predicates.push(syn::parse_quote!(
+                    #flat_ty: #krate::MapFieldProviderOwned<__KP>
+                ));
+                wc.predicates.push(syn::parse_quote!(
+                    <<#flat_ty as #krate::MapFieldProviderOwned<__KP>>::WireNames
+                        as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>:
+                        ::core::marker::Copy
+                ));
+            }
+        }
+    }
+    let (mfp_impl_generics, _, mfp_where_clause) = mfp_impl_gen.split_for_impl();
+
+    // DeserializeFromMapOwned impl where-clause.
+    let mut dfm_impl_gen = input.generics.clone();
+    crate::common::insert_m_owned(&mut dfm_impl_gen, krate);
+    {
+        let wc = dfm_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in input.generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::DeserializeOwned<
+                        <#krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
+                         as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            wc.predicates.push(syn::parse_quote!(
+                #name #ty_generics: #krate::MapFieldProviderOwned<
+                    <__M as #krate::MapAccessOwned>::KeyProbe
+                >
+            ));
+        }
+    }
+    let (dfm_impl_generics, _, dfm_where_clause) = dfm_impl_gen.split_for_impl();
+
+    // DeserializeOwned impl where-clause.
+    let mut de_impl_gen = input.generics.clone();
+    insert_d_owned(&mut de_impl_gen, krate);
+    {
+        let wc = de_impl_gen.make_where_clause();
         if let Some(preds) = &container_attrs.bound {
             wc.predicates.extend(preds.iter().cloned());
         } else {
@@ -447,491 +929,96 @@ pub(super) fn expand_owned(
                 let ident = &tp.ident;
                 wc.predicates.push(type_param_bound_owned(krate, ident));
             }
-            for (ty, cf) in de_field_types.iter().zip(de_classified.iter()) {
-                let has_custom = cf.deserialize_owned_with.is_some()
-                    || cf.from.is_some()
-                    || cf.try_from.is_some();
-                apply_field_bound(wc, ty, &cf.bound, has_custom, |t| {
-                    field_bound_owned(krate, t, FieldContext::MapValue)
-                });
+            wc.predicates.push(syn::parse_quote!(
+                #name #ty_generics: #krate::DeserializeFromMapOwned<
+                    <__D::Entry as #krate::EntryOwned>::Map,
+                    Extra = ()
+                >
+            ));
+            if !is_named {
+                wc.predicates.push(syn::parse_quote!(
+                    #name #ty_generics: #krate::DeserializeFromSeqOwned<
+                        <__D::Entry as #krate::EntryOwned>::Seq,
+                        Extra = ()
+                    >
+                ));
             }
-            // D6 option α: no bound emitted for flatten field types; rustc resolves at use site.
-            // Map iteration uses Match/Skip key probes — add their bounds.
-            let dup_n: usize = de_classified.iter().map(|cf| 1 + cf.aliases.len()).sum();
-            let _ = dup_n; // universal Match/MatchVals/Skip impls cover the key bounds
         }
     }
-    let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
+    let (de_impl_generics, _, de_where_clause) = de_impl_gen.split_for_impl();
 
-    // Output binding names - one per non-skipped, non-flatten field.
-    let de_out_names: Vec<syn::Ident> = de_field_names
-        .iter()
-        .map(|n| format_ident!("__out_{}", n))
-        .collect();
-
-    // Build one MapArmSlot per non-skipped, non-flatten field, parameterized
-    // by the KP/VP type tokens (different for Deserialize __D vs DeserializeFromMap __M).
-    let build_arm_slots = |kp_ty: TokenStream2, vp_ty: TokenStream2| -> Vec<TokenStream2> {
-        de_field_names
-            .iter()
-            .zip(de_classified.iter())
-            .zip(de_value_types.iter().zip(de_value_conversions.iter()))
-            .map(|((_, cf), (vt, vc))| {
-                let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
-                for alias in &cf.aliases {
-                    wire_names.push(alias.as_str());
-                }
-                let key_fn = if wire_names.len() == 1 {
-                    let name = wire_names[0];
-                    quote! {
-                        |mut __kp: #kp_ty| {
-                            __kp.deserialize_key::<#krate::Match>(#name)
-                        }
-                    }
-                } else {
-                    quote! {
-                        |mut __kp: #kp_ty| {
-                            __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wire_names, ()), )*])
-                        }
-                    }
-                };
-                let val_fn = quote! {
-                    |__vp: #vp_ty, __k| async move {
-                        let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#vt>(()).await);
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #vc))))
-                    }
-                };
-                quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
-            })
-            .collect()
+    let dfm_arms_expr: TokenStream2 = {
+        let mut e = quote! {
+            #krate::DetectDuplicatesOwned!(
+                <Self as #krate::MapFieldProviderOwned<<__M as #krate::MapAccessOwned>::KeyProbe>>::make_arms(),
+                <Self as #krate::MapFieldProviderOwned<<__M as #krate::MapAccessOwned>::KeyProbe>>::wire_names(),
+                <__M as #krate::MapAccessOwned>::KeyProbe,
+                #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
+            )
+        };
+        if allow_unknown_fields {
+            e = quote! {
+                #krate::SkipUnknownOwned!(
+                    #e,
+                    <__M as #krate::MapAccessOwned>::KeyProbe,
+                    #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
+                )
+            };
+        }
+        e
     };
 
-    let arm_slots: Vec<TokenStream2> = build_arm_slots(
-        quote! { #krate::owned::KP<__D> },
-        quote! { #krate::owned::VP2<__D> },
-    );
-    let arm_slots_m: Vec<TokenStream2> = build_arm_slots(
-        quote! { <__M as #krate::MapAccessOwned>::KeyProbe },
-        quote! { #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe> },
-    );
-
-    // Build the flat (wire_name, arm_index) array for DetectDuplicatesOwned.
-    let dup_wire_names: Vec<TokenStream2> = de_classified
-        .iter()
-        .enumerate()
-        .flat_map(|(arm_idx, cf)| {
-            let mut entries: Vec<TokenStream2> = vec![];
-            let primary = &cf.wire_name;
-            entries.push(quote! { (#primary, #arm_idx) });
-            for alias in &cf.aliases {
-                entries.push(quote! { (#alias, #arm_idx) });
-            }
-            entries
-        })
-        .collect();
-    let dup_wire_names_count = dup_wire_names.len();
-
-    // Output pattern for regular (non-flatten) fields.
-    let output_pat = {
-        let mut pat = quote! { () };
-        for out_name in &de_out_names {
-            pat = quote! { (#pat, #out_name) };
-        }
-        pat
-    };
-
-    // Field finalizers for non-skipped, non-flatten fields.
-    let regular_field_finalizers: Vec<TokenStream2> = field_names
-        .iter()
-        .zip(classified_fields.iter())
-        .filter(|(_, cf)| cf.flatten == crate::common::FlattenMode::None)
-        .map(|(fname, cf)| {
-            if cf.skip_deserializing {
-                let default_expr = match &cf.default {
-                    Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
-                    Some(DefaultAttr::Expr(expr)) => {
-                        quote! { #krate::DefaultWrapper(#expr).value() }
-                    }
-                    None => unreachable!("validated in classify_fields"),
-                };
-                return quote! { let #fname = #default_expr; };
-            }
-            let out_name = format_ident!("__out_{}", fname);
-            let none_branch = match &cf.default {
-                Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
-                Some(DefaultAttr::Expr(expr)) => quote! { #krate::DefaultWrapper(#expr).value() },
-                None => quote! { return ::core::result::Result::Ok(#krate::Probe::Miss) },
-            };
-            quote! {
-                let #fname = match #out_name {
-                    ::core::option::Option::Some((_k, __v)) => __v,
-                    ::core::option::Option::None => #none_branch,
-                };
-            }
-        })
-        .collect();
-
-    // Generate the deserialization body - two paths: with flatten or without.
-    let mut flatten_cont_structs = TokenStream2::new();
-    let deser_body = if !flatten_fields.is_empty() {
-        let outer_arms_expr = {
-            let mut expr = quote! { #krate::MapArmBase };
-            for slot in &arm_slots {
-                expr = quote! { (#expr, #slot) };
-            }
-            if dup_wire_names_count > 0 {
-                expr = quote! {
-                    {
-                        let __wn = [#( #dup_wire_names, )*];
-                        #krate::DetectDuplicatesOwned::new(
-                            #expr,
-                            __wn,
-                            move |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
-                            |__vp: #krate::owned::VP2<__D>| __vp.skip(),
-                        )
-                    }
-                };
-            }
-            // No skip-unknown: unclaimed keys fall through to the inner type's
-            // arms via `StackConcat` inside `FlattenMapAccessOwned`.
-            expr
-        };
-
-        let n_flat = flatten_fields.len();
-        let first_flat_name = flatten_fields[0].0;
-        let first_flat_ty = flatten_fields[0].1;
-
-        let any_boxed = flatten_fields
-            .iter()
-            .any(|(_, _, mode)| *mode == crate::common::FlattenMode::Boxed);
-        let terminal_expr = if any_boxed {
-            quote! { #krate::FlattenTerminalBoxed }
-        } else {
-            quote! { #krate::FlattenTerminal }
-        };
-
-        // Cont-struct generics: outer struct's generics plus '__cont.
-        let mut cont_struct_gens = input.generics.clone();
-        cont_struct_gens
-            .params
-            .insert(0, syn::parse_quote!('__cont));
-        let (cont_struct_impl_gens, cont_struct_ty_gens, _) = cont_struct_gens.split_for_impl();
-
-        // Cont-impl generics: cont_struct_gens + __M.
-        let mut cont_impl_gens = cont_struct_gens.clone();
-        cont_impl_gens
-            .params
-            .push(syn::parse_quote!(__M: #krate::MapAccessOwned));
-        {
-            let wc = cont_impl_gens.make_where_clause();
-            if let Some(preds) = &container_attrs.bound {
-                wc.predicates.extend(preds.iter().cloned());
-            } else {
-                for tp in input.generics.type_params() {
-                    let ident = &tp.ident;
-                    wc.predicates.push(syn::parse_quote!(
-                        #ident: #krate::DeserializeOwned<
-                            <#krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
-                             as #krate::MapValueProbeOwned>::ValueSubDeserializer,
-                            Extra = ()
-                        >
-                    ));
-                }
-                for (ty, cf) in de_field_types.iter().zip(de_classified.iter()) {
-                    let has_custom = cf.deserialize_owned_with.is_some()
-                        || cf.from.is_some()
-                        || cf.try_from.is_some();
-                    if cf.bound.is_none() && !has_custom {
-                        let bound_ty = cf.from.as_ref().or(cf.try_from.as_ref()).unwrap_or(*ty);
-                        wc.predicates.push(syn::parse_quote!(
-                            #bound_ty: #krate::DeserializeOwned<
-                                <#krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
-                                 as #krate::MapValueProbeOwned>::ValueSubDeserializer,
-                                Extra = ()
-                            >
-                        ));
-                    }
-                }
-            }
-        }
-        let (cont_impl_impl_gens, _, cont_impl_where) = cont_impl_gens.split_for_impl();
-
-        // Emit (N - 1) cont structs.
-        for i in 0..n_flat.saturating_sub(1) {
-            let cont_name = format_ident!("__FlatContO_after_{}", flatten_fields[i].0);
-            let next_field_name = flatten_fields[i + 1].0;
-            let next_field_ty = flatten_fields[i + 1].1;
-            let result_stash_ident = format_ident!("__result_{}", next_field_name);
-
-            let cell_fields: Vec<TokenStream2> = flatten_fields[i + 1..]
-                .iter()
-                .map(|(fname, fty, _)| {
-                    let cell_ident = format_ident!("__result_{}", fname);
-                    quote! {
-                        #cell_ident: &'__cont ::core::cell::Cell<::core::option::Option<#fty>>
-                    }
-                })
-                .collect();
-
-            let next_cont_expr = if i + 1 < n_flat - 1 {
-                let next_cont_name = format_ident!("__FlatContO_after_{}", flatten_fields[i + 1].0);
-                let next_args: Vec<TokenStream2> = flatten_fields[i + 2..]
-                    .iter()
-                    .map(|(fname, _, _)| {
-                        let cell_ident = format_ident!("__result_{}", fname);
-                        quote! { #cell_ident: self.#cell_ident }
-                    })
-                    .collect();
-                quote! {
-                    #next_cont_name {
-                        #( #next_args, )*
-                        __phantom: ::core::marker::PhantomData,
-                    }
-                }
-            } else {
-                terminal_expr.clone()
-            };
-
-            flatten_cont_structs.extend(quote! {
-                #[allow(non_camel_case_types)]
-                struct #cont_name #cont_struct_impl_gens {
-                    #( #cell_fields, )*
-                    __phantom: ::core::marker::PhantomData<&'__cont ()>,
-                }
-
-                impl #cont_impl_impl_gens #krate::FlattenContOwned<__M>
-                    for #cont_name #cont_struct_ty_gens
-                #cont_impl_where
-                {
-                    async fn finish<__Arms: #krate::MapArmStackOwned<<__M as #krate::MapAccessOwned>::KeyProbe>>(
-                        self,
-                        __map: __M,
-                        __arms: __Arms,
-                    ) -> ::core::result::Result<
-                        #krate::Probe<(<__M as #krate::MapAccessOwned>::MapClaim, __Arms::Outputs)>,
-                        <__M as #krate::MapAccessOwned>::Error,
-                    > {
-                        let __next_outputs_cell: ::core::cell::Cell<
-                            ::core::option::Option<__Arms::Outputs>,
-                        > = ::core::cell::Cell::new(::core::option::Option::None);
-                        let __next_fma = #krate::FlattenMapAccessOwned::new(
-                            __map,
-                            __arms,
-                            &__next_outputs_cell,
-                            #next_cont_expr,
-                        );
-                        let (__claim, __next_val) = #krate::hit!(
-                            <#next_field_ty as #krate::DeserializeFromMapOwned<_>>
-                                ::deserialize_from_map_owned(__next_fma, ()).await
-                        );
-                        self.#result_stash_ident
-                            .set(::core::option::Option::Some(__next_val));
-                        let __out = match __next_outputs_cell.take() {
-                            ::core::option::Option::Some(__v) => __v,
-                            ::core::option::Option::None => {
-                                return ::core::result::Result::Ok(#krate::Probe::Miss);
-                            }
-                        };
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __out)))
-                    }
-                }
-            });
-        }
-
-        let extra_result_cell_decls: Vec<TokenStream2> = flatten_fields[1..]
-            .iter()
-            .map(|(fname, fty, _)| {
-                let cell_ident = format_ident!("__result_{}", fname);
-                quote! {
-                    let #cell_ident: ::core::cell::Cell<::core::option::Option<#fty>>
-                        = ::core::cell::Cell::new(::core::option::Option::None);
-                }
-            })
-            .collect();
-
-        let first_cont_expr = if n_flat == 1 {
-            terminal_expr.clone()
-        } else {
-            let first_cont_name = format_ident!("__FlatContO_after_{}", first_flat_name);
-            let first_cont_args: Vec<TokenStream2> = flatten_fields[1..]
-                .iter()
-                .map(|(fname, _, _)| {
-                    let cell_ident = format_ident!("__result_{}", fname);
-                    quote! { #cell_ident: &#cell_ident }
-                })
-                .collect();
-            quote! {
-                #first_cont_name {
-                    #( #first_cont_args, )*
-                    __phantom: ::core::marker::PhantomData,
-                }
-            }
-        };
-
-        let extra_result_recovers: Vec<TokenStream2> = flatten_fields[1..]
-            .iter()
-            .map(|(fname, _, _)| {
-                let cell_ident = format_ident!("__result_{}", fname);
-                quote! {
-                    let #fname = match #cell_ident.take() {
-                        ::core::option::Option::Some(__v) => __v,
-                        ::core::option::Option::None => {
-                            return ::core::result::Result::Ok(#krate::Probe::Miss);
-                        }
-                    };
-                }
-            })
-            .collect();
-
+    let de_body = if is_named {
         quote! {
             d.entry(|[__e]| async {
-                let __map = #krate::hit!(__e.deserialize_map().await);
-                let __outer_arms = #outer_arms_expr;
-                let __outer_outputs_cell: ::core::cell::Cell<::core::option::Option<_>>
-                    = ::core::cell::Cell::new(::core::option::Option::None);
-                #( #extra_result_cell_decls )*
-                let __flatten_map = #krate::FlattenMapAccessOwned::new(
-                    __map,
-                    __outer_arms,
-                    &__outer_outputs_cell,
-                    #first_cont_expr,
-                );
-                let (__claim, #first_flat_name) = #krate::hit!(
-                    <#first_flat_ty as #krate::DeserializeFromMapOwned<_>>::deserialize_from_map_owned(
-                        __flatten_map,
-                        (),
-                    ).await
-                );
-                let #output_pat = match __outer_outputs_cell.take() {
-                    ::core::option::Option::Some(__o) => __o,
-                    ::core::option::Option::None => {
-                        return ::core::result::Result::Ok(#krate::Probe::Miss);
-                    }
-                };
-                #( #extra_result_recovers )*
-                #( #regular_field_finalizers )*
-                ::core::result::Result::Ok(
-                    #krate::Probe::Hit((__claim, #name { #( #field_names, )* }))
-                )
+                __e.deserialize_map_into::<Self>(()).await
             }).await
         }
     } else {
-        // Regular path: no flatten fields.
-        let arms_expr = {
-            let mut expr = quote! { #krate::MapArmBase };
-            for slot in &arm_slots {
-                expr = quote! { (#expr, #slot) };
-            }
-            expr = quote! {
-                {
-                    let __wn = [#( #dup_wire_names, )*];
-                    #krate::DetectDuplicatesOwned::new(
-                        #expr,
-                        __wn,
-                        move |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
-                        |__vp: #krate::owned::VP2<__D>| __vp.skip(),
-                    )
-                }
-            };
-            if allow_unknown_fields {
-                expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: #krate::owned::KP<__D>| __kp.deserialize_key::<#krate::Skip>(()),
-                    |__vp: #krate::owned::VP2<__D>, _k: #krate::Skip| async move {
-                        let __vc = __vp.skip().await?;
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                    },
-                )) };
-            }
-            expr
-        };
-
         quote! {
-            d.entry(|[__e]| async {
-                let __map = #krate::hit!(__e.deserialize_map().await);
-
-                let __arms = #arms_expr;
-                let (__claim, #output_pat) = #krate::hit!(__map.iterate(__arms).await);
-
-                #( #regular_field_finalizers )*
-
-                ::core::result::Result::Ok(
-                    #krate::Probe::Hit((__claim, #name { #( #field_names, )* }))
+            d.entry(|[__e1, __e2]| async {
+                #krate::select_probe!(biased;
+                    __e1.deserialize_map_into::<Self>(()),
+                    __e2.deserialize_seq_into::<Self>(()),
                 )
             }).await
         }
     };
 
-    // -----------------------------------------------------------------
-    // DeserializeFromMapOwned impl emission (regular non-flatten path only)
-    // -----------------------------------------------------------------
-    let dfm_impl = if flatten_fields.is_empty() {
-        let arms_expr_m = {
-            let mut expr = quote! { #krate::MapArmBase };
-            for slot in &arm_slots_m {
-                expr = quote! { (#expr, #slot) };
-            }
-            expr = quote! {
-                {
-                    let __wn = [#( #dup_wire_names, )*];
-                    #krate::DetectDuplicatesOwned::new(
-                        #expr,
-                        __wn,
-                        move |__kp: <__M as #krate::MapAccessOwned>::KeyProbe| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
-                        |__vp: #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>| __vp.skip(),
-                    )
-                }
+    Ok(quote! {
+        #[allow(unreachable_code)]
+        const _: () = {
+            use #krate::{
+                ConcatableArray as _, DefaultValue as _, DeserializeFromSeqOwned as _,
+                DeserializeOwned as _, DeserializerOwned as _, EntryOwned as _,
+                MapAccessOwned as _, MapKeyProbeOwned as _, MapValueProbeOwned as _,
+                SeqAccessOwned as _, SeqEntryOwned as _, StrAccessOwned as _,
             };
-            if allow_unknown_fields {
-                expr = quote! { (#expr, #krate::VirtualArmSlot::new(
-                    |__kp: <__M as #krate::MapAccessOwned>::KeyProbe| __kp.deserialize_key::<#krate::Skip>(()),
-                    |__vp: #krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>, _k: #krate::Skip| async move {
-                        use #krate::MapValueProbeOwned as _;
-                        let __vc = __vp.skip().await?;
-                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, ())))
-                    },
-                )) };
-            }
-            expr
-        };
 
-        let mut impl_gen_m = input.generics.clone();
-        crate::common::insert_m_owned(&mut impl_gen_m, krate);
-        {
-            let wc = impl_gen_m.make_where_clause();
-            if let Some(preds) = &container_attrs.bound {
-                wc.predicates.extend(preds.iter().cloned());
-            } else {
-                for tp in input.generics.type_params() {
-                    let ident = &tp.ident;
-                    wc.predicates.push(syn::parse_quote!(
-                        #ident: #krate::DeserializeOwned<
-                            <#krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
-                             as #krate::MapValueProbeOwned>::ValueSubDeserializer,
-                            Extra = ()
-                        >
-                    ));
+            #de_with_wrappers
+
+            #dfs_impl
+
+            impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP> for #name #ty_generics
+                #mfp_where_clause
+            {
+                type Outputs = #outputs_type_tokens;
+                const ARMS: usize = #arms_const_tokens;
+                type WireNames = #wire_names_type_tokens;
+                fn wire_names() -> Self::WireNames {
+                    #wire_names_body_tokens
                 }
-                for (ty, cf) in de_field_types.iter().zip(de_classified.iter()) {
-                    let has_custom = cf.deserialize_owned_with.is_some()
-                        || cf.from.is_some()
-                        || cf.try_from.is_some();
-                    if cf.bound.is_none() && !has_custom {
-                        let bound_ty = cf.from.as_ref().or(cf.try_from.as_ref()).unwrap_or(*ty);
-                        wc.predicates.push(syn::parse_quote!(
-                            #bound_ty: #krate::DeserializeOwned<
-                                <#krate::owned::VP<<__M as #krate::MapAccessOwned>::KeyProbe>
-                                 as #krate::MapValueProbeOwned>::ValueSubDeserializer,
-                                Extra = ()
-                            >
-                        ));
-                    }
+                fn make_arms() -> impl #krate::MapArmStackOwned<__KP, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                    #make_arms_body_tokens
+                }
+                fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                    #from_outputs_body_tokens
                 }
             }
-        }
-        let (impl_generics_m, _, where_clause_m) = impl_gen_m.split_for_impl();
 
-        quote! {
-            impl #impl_generics_m #krate::DeserializeFromMapOwned<__M> for #name #ty_generics #where_clause_m {
+            impl #dfm_impl_generics #krate::DeserializeFromMapOwned<__M> for #name #ty_generics
+                #dfm_where_clause
+            {
                 type Extra = ();
                 async fn deserialize_from_map_owned(
                     __map: __M,
@@ -940,41 +1027,38 @@ pub(super) fn expand_owned(
                     #krate::Probe<(<__M as #krate::MapAccessOwned>::MapClaim, Self)>,
                     <__M as #krate::MapAccessOwned>::Error,
                 > {
-                    let __arms = #arms_expr_m;
-                    let (__claim, #output_pat) = #krate::hit!(__map.iterate(__arms).await);
-                    #( #regular_field_finalizers )*
-                    ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name { #( #field_names, )* })))
+                    let __arms = #dfm_arms_expr;
+                    match __map.iterate(__arms).await? {
+                        #krate::Probe::Hit((__claim, __outputs)) => {
+                            match <Self as #krate::MapFieldProviderOwned<
+                                <__M as #krate::MapAccessOwned>::KeyProbe,
+                            >>::from_outputs(__outputs)
+                            {
+                                ::core::option::Option::Some(__v) => {
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __v)))
+                                }
+                                ::core::option::Option::None => {
+                                    ::core::result::Result::Ok(#krate::Probe::Miss)
+                                }
+                            }
+                        }
+                        #krate::Probe::Miss => ::core::result::Result::Ok(#krate::Probe::Miss),
+                    }
                 }
             }
-        }
-    } else {
-        TokenStream2::new()
-    };
 
-    Ok(quote! {
-        #[allow(unreachable_code)]
-        const _: () = {
-            use #krate::{
-                DefaultValue as _, DeserializeOwned as _, DeserializerOwned as _, EntryOwned as _,
-                MapKeyProbeOwned as _, MapAccessOwned as _, SeqAccessOwned as _,
-                SeqEntryOwned as _, StrAccessOwned as _, MapValueProbeOwned as _,
-            };
-
-            #de_with_wrappers
-            #flatten_cont_structs
-
-            impl #impl_generics #krate::DeserializeOwned<__D> for #name #ty_generics #where_clause {
+            impl #de_impl_generics #krate::DeserializeOwned<__D> for #name #ty_generics
+                #de_where_clause
+            {
                 type Extra = ();
                 async fn deserialize_owned(
                     d: __D,
                     _extra: (),
                 ) -> ::core::result::Result<#krate::Probe<(__D::Claim, Self)>, __D::Error>
                 {
-                    #deser_body
+                    #de_body
                 }
             }
-
-            #dfm_impl
         };
     })
 }

@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Data, DeriveInput};
 
 use crate::common::{FieldContext, field_bound_owned, insert_d_owned, parse_container_attrs};
@@ -38,8 +38,12 @@ fn gen_container_from_owned(
         if let Some(preds) = &container_attrs.bound {
             wc.predicates.extend(preds.iter().cloned());
         } else {
-            wc.predicates
-                .push(field_bound_owned(krate, from_ty, FieldContext::Direct));
+            wc.predicates.push(field_bound_owned(
+                krate,
+                from_ty,
+                FieldContext::Direct,
+                &format_ident!("__D"),
+            ));
         }
     }
     let (impl_generics, _, where_clause) = impl_gen.split_for_impl();
