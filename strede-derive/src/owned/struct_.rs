@@ -525,7 +525,6 @@ pub(super) fn expand_owned(
     let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
         let cf = de_classified[reg_idx];
         let val_type = &de_value_types[reg_idx];
-        let val_conv = &de_value_conversions[reg_idx];
         let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
         for alias in &cf.aliases {
             wire_names.push(alias.as_str());
@@ -564,7 +563,7 @@ pub(super) fn expand_owned(
         let val_fn = quote! {
             |__vp: #krate::owned::VP<__KP>, __k| async move {
                 let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#val_type>(()).await);
-                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #val_conv))))
+                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
             }
         };
         quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
@@ -875,6 +874,21 @@ pub(super) fn expand_owned(
                         >
                     )
                 });
+                if let Some(ft) = &cf.from {
+                    wc.predicates.push(syn::parse_quote!(
+                        #ft: #krate::DeserializeOwned<
+                            <#krate::owned::VP<__KP> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                            Extra = ()
+                        >
+                    ));
+                } else if let Some(ft) = &cf.try_from {
+                    wc.predicates.push(syn::parse_quote!(
+                        #ft: #krate::DeserializeOwned<
+                            <#krate::owned::VP<__KP> as #krate::MapValueProbeOwned>::ValueSubDeserializer,
+                            Extra = ()
+                        >
+                    ));
+                }
             }
             for (_, flat_ty, _) in &flatten_fields {
                 wc.predicates.push(syn::parse_quote!(

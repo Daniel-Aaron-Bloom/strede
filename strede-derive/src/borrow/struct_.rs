@@ -407,8 +407,13 @@ pub(super) fn expand(
                     let has_custom =
                         cf.deserialize_with.is_some() || cf.from.is_some() || cf.try_from.is_some();
                     apply_borrow_field_bound(wc, ty, &cf.bound, has_custom, &cf.borrow);
-                    if cf.bound.is_none() && !has_custom {
+                    if cf.bound.is_none() && cf.deserialize_with.is_none() {
                         let bound_ty = cf.from.as_ref().or(cf.try_from.as_ref()).unwrap_or(*ty);
+                        if cf.from.is_some() || cf.try_from.is_some() {
+                            for lt in borrow_lifetimes(bound_ty, &None) {
+                                wc.predicates.push(syn::parse_quote!('de: #lt));
+                            }
+                        }
                         if !has_universal_blanket(bound_ty) {
                             wc.predicates.push(syn::parse_quote!(
                                 #bound_ty: #krate::Deserialize<
@@ -417,15 +422,6 @@ pub(super) fn expand(
                                     Extra = ()
                                 >
                             ));
-                        }
-                    }
-                    if let Some(ft) = &cf.from {
-                        for lt in borrow_lifetimes(ft, &None) {
-                            wc.predicates.push(syn::parse_quote!('de: #lt));
-                        }
-                    } else if let Some(ft) = &cf.try_from {
-                        for lt in borrow_lifetimes(ft, &None) {
-                            wc.predicates.push(syn::parse_quote!('de: #lt));
                         }
                     }
                 }
@@ -654,7 +650,6 @@ pub(super) fn expand(
     let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
         let cf = de_classified[reg_idx];
         let val_type = &de_value_types[reg_idx];
-        let val_conv = &de_value_conversions[reg_idx];
         let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
         for alias in &cf.aliases {
             wire_names.push(alias.as_str());
@@ -693,7 +688,7 @@ pub(super) fn expand(
         let val_fn = quote! {
             |__vp: #krate::borrow::VP<'de, __KP>, __k| async move {
                 let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#val_type>(()).await);
-                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #val_conv))))
+                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
             }
         };
         quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
@@ -1032,8 +1027,13 @@ pub(super) fn expand(
                 let has_custom =
                     cf.deserialize_with.is_some() || cf.from.is_some() || cf.try_from.is_some();
                 apply_borrow_field_bound(wc, ty, &cf.bound, has_custom, &cf.borrow);
-                if cf.bound.is_none() && !has_custom {
+                if cf.bound.is_none() && cf.deserialize_with.is_none() {
                     let bound_ty = cf.from.as_ref().or(cf.try_from.as_ref()).unwrap_or(*ty);
+                    if cf.from.is_some() || cf.try_from.is_some() {
+                        for lt in borrow_lifetimes(bound_ty, &None) {
+                            wc.predicates.push(syn::parse_quote!('de: #lt));
+                        }
+                    }
                     if !has_universal_blanket(bound_ty) {
                         wc.predicates.push(syn::parse_quote!(
                             #bound_ty: #krate::Deserialize<

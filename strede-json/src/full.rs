@@ -29,7 +29,7 @@ use strede::{
     DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe, MapAccess,
     MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe, MatchVals, NextKey,
     NumberAccess, NumberEncoding, Probe, SeqAccess, SeqEntry, StrAccess, hit,
-    match_entry_str_against, utils::repeat,
+    match_entry_str_against, or_miss, utils::repeat,
 };
 
 // ---------------------------------------------------------------------------
@@ -529,7 +529,7 @@ impl<'de> JsonEntry<'de> {
                     Ok(None) => return Err(JsonError::InvalidNumber),
                     Err(e) => return Err(e),
                 };
-                let value = T::parse(s)?;
+                let value = or_miss!(T::parse(s));
                 Ok(Probe::Hit((
                     JsonClaim {
                         tokenizer: Tokenizer::new(),
@@ -544,14 +544,14 @@ impl<'de> JsonEntry<'de> {
 }
 
 trait ParseNum: Sized {
-    fn parse(s: &str) -> Result<Self, JsonError>;
+    fn parse(s: &str) -> Option<Self>;
 }
 
 macro_rules! impl_parse_num {
     ($($t:ty),*) => {
         $(impl ParseNum for $t {
-            fn parse(s: &str) -> Result<Self, JsonError> {
-                s.parse().map_err(|_| JsonError::InvalidNumber)
+            fn parse(s: &str) -> Option<Self> {
+                s.parse().ok()
             }
         })*
     };
