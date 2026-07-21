@@ -1,8 +1,6 @@
 use super::*;
 use crate::borrow::{DeserializeFromMap, MapAccess, MapKeyProbe, MapValueProbe};
-use crate::owned::{
-    DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned,
-};
+use crate::owned::{DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned};
 use crate::{hit, or_miss, select_probe};
 
 // -------------------------------------------------------------------------

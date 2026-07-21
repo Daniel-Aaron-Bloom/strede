@@ -56,7 +56,10 @@ fn unit_variant_out_of_range_misses() {
 #[test]
 fn unit_variant_truncated_errors() {
     // varint with continuation bit set but no next byte
-    assert_eq!(parse_owned!(Signal, &[0x80]).unwrap_err(), PostcardError::UnexpectedEnd);
+    assert_eq!(
+        parse_owned!(Signal, &[0x80]).unwrap_err(),
+        PostcardError::UnexpectedEnd
+    );
 }
 
 // --- Struct variant ---
@@ -198,5 +201,8 @@ fn other_with_unexpected_trailing_payload_errors() {
     // `PostcardEntry::skip_other`/`ChunkedPostcardEntry::skip_other`.
     let mut data = varint(2);
     data.extend_from_slice(&varint(123));
-    assert_eq!(parse_owned!(WithOther, &data).unwrap_err(), PostcardError::ExpectedEnd);
+    assert_eq!(
+        parse_owned!(WithOther, &data).unwrap_err(),
+        PostcardError::ExpectedEnd
+    );
 }

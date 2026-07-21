@@ -32,7 +32,10 @@ fn parse(input: &[u8]) -> Result<Option<CborValue>, CborError> {
 
 #[test]
 fn null_value() {
-    assert!(matches!(parse(&[cbor_null()]).unwrap().unwrap(), CborValue::Null));
+    assert!(matches!(
+        parse(&[cbor_null()]).unwrap().unwrap(),
+        CborValue::Null
+    ));
 }
 
 #[test]

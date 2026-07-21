@@ -311,10 +311,7 @@ enum WithOther {
 
 #[test]
 fn other_catches_unrecognized_discriminant() {
-    assert_eq!(
-        parse::<WithOther>(&varint(2)),
-        Ok(Some(WithOther::Unknown))
-    );
+    assert_eq!(parse::<WithOther>(&varint(2)), Ok(Some(WithOther::Unknown)));
     assert_eq!(
         parse::<WithOther>(&varint(99)),
         Ok(Some(WithOther::Unknown))
@@ -333,10 +330,7 @@ fn other_does_not_shadow_known_variants() {
 fn other_leaves_no_trailing_bytes_for_unit_fallback() {
     // Nothing follows the discriminant for the `other` case, so there's no
     // trailing-bytes error.
-    assert_eq!(
-        parse::<WithOther>(&varint(2)),
-        Ok(Some(WithOther::Unknown))
-    );
+    assert_eq!(parse::<WithOther>(&varint(2)), Ok(Some(WithOther::Unknown)));
 }
 
 #[test]

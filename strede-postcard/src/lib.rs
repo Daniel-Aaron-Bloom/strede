@@ -17,9 +17,9 @@ mod varint;
 #[cfg(feature = "alloc")]
 mod vec;
 
-pub use error::PostcardError;
 pub use chunked::access::ChunkedPostcardBytesAccess;
 pub use chunked::{ChunkedPostcardClaim, ChunkedPostcardDeserializer};
+pub use error::PostcardError;
 pub use full::{
     PostcardBytesAccess, PostcardClaim, PostcardDeserializer, PostcardEntry, PostcardEnumAccess,
     PostcardEnumVariantProbe, PostcardMapAccess, PostcardMapKeyProbe, PostcardMapValueProbe,

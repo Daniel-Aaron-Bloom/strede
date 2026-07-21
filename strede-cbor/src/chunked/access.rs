@@ -1,6 +1,8 @@
 //! Owned-family accessor types for the chunked CBOR deserializer.
 
-use super::{ChunkedCborClaim, ChunkedCborSubDeserializer, next_dispatch, refill, skip_value_chunked};
+use super::{
+    ChunkedCborClaim, ChunkedCborSubDeserializer, next_dispatch, refill, skip_value_chunked,
+};
 use crate::CborError;
 use crate::token::CborToken;
 use core::future::Future;

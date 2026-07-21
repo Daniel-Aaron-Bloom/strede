@@ -26,7 +26,10 @@ macro_rules! impl_deserialize_vec_borrow {
             T: Deserialize<'de, JsonSubDeserializer<'de>, Extra = ()>,
         {
             type Extra = ();
-            async fn deserialize(d: $de, _: ()) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(JsonClaim<'de>, Self)>, JsonError> {
                 if typeid::of::<T>() == typeid::of::<u8>() {
                     let (claim, v) = hit!(vec_u8_race(d).await);
                     // Safety: T == u8 confirmed by the TypeId check above.

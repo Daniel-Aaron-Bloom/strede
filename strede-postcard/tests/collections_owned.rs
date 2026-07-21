@@ -122,10 +122,7 @@ fn vec_u8_bytes_values() {
 fn vec_u8_bytes_high_values() {
     // Values 128-255: the seq path would misparse these (varint != raw byte).
     let data: Vec<u8> = (0u8..=255).collect();
-    assert_eq!(
-        parse_owned!(Vec<u8>, &pbytes(&data)),
-        Ok(Some(data))
-    );
+    assert_eq!(parse_owned!(Vec<u8>, &pbytes(&data)), Ok(Some(data)));
 }
 
 // --- Option<Vec<u32>> ---

@@ -25,7 +25,10 @@ macro_rules! impl_deserialize_vec_borrow {
             T: Deserialize<'de, CborSubDeserializer<'de>, Extra = ()>,
         {
             type Extra = ();
-            async fn deserialize(d: $de, _: ()) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
+            async fn deserialize(
+                d: $de,
+                _: (),
+            ) -> Result<Probe<(CborClaim<'de>, Self)>, CborError> {
                 if typeid::of::<T>() == typeid::of::<u8>() {
                     let (claim, v) = hit!(vec_u8_race(d).await);
                     // Safety: T == u8 confirmed by the TypeId check above.

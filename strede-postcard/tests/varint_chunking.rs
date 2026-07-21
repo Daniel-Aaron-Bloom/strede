@@ -151,7 +151,10 @@ fn map_count_varint_split_for_hashmap() {
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
         .map(|i| (varint(i as u64), varint((i * 2) as u64)))
         .collect();
-    let pair_refs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    let pair_refs: Vec<(&[u8], &[u8])> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
     let bytes: Vec<u8> = pmap(&pair_refs);
     let expected: HashMap<u32, u32> = (0..200u32).map(|i| (i, i * 2)).collect();
     for chunk_size in 1..=7 {

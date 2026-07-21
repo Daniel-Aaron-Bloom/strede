@@ -45,7 +45,8 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> StrAccessOwned for ChunkedPostcardStr
                 let end = start + take;
                 let s = {
                     let buf = self.handle.buf();
-                    core::str::from_utf8(&buf[start..end]).map_err(|_| PostcardError::InvalidUtf8)?
+                    core::str::from_utf8(&buf[start..end])
+                        .map_err(|_| PostcardError::InvalidUtf8)?
                 };
                 let r = f(s);
                 self.offset += take;
@@ -134,7 +135,9 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedPostcardMapKeyProbe<'s, B, F> 
     }
 }
 
-impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyProbeOwned for ChunkedPostcardMapKeyProbe<'s, B, F> {
+impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapKeyProbeOwned
+    for ChunkedPostcardMapKeyProbe<'s, B, F>
+{
     type Error = PostcardError;
     type KeyClaim = ChunkedPostcardClaim<'s, B, F>;
     type KeySubDeserializer = ChunkedPostcardSubDeserializer<'s, B, F>;

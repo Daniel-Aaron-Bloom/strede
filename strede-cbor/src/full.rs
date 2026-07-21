@@ -531,8 +531,7 @@ impl<'de> Entry<'de> for CborEntry<'de> {
         match self.token {
             CborToken::Null | CborToken::Undefined => Ok(Probe::Hit((self.into_claim(), None))),
             other => {
-                let sub =
-                    CborSubDeserializer::new_with_raw(self.src, other, None, self.raw_start);
+                let sub = CborSubDeserializer::new_with_raw(self.src, other, None, self.raw_start);
                 let (claim, v) = hit!(T::deserialize(sub, extra).await);
                 Ok(Probe::Hit((claim, Some(v))))
             }

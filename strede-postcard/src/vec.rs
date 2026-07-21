@@ -17,7 +17,9 @@ use crate::chunked::{ChunkedPostcardDeserializer, ChunkedPostcardSubDeserializer
 use crate::full::{PostcardClaim, PostcardDeserializer, PostcardSubDeserializer};
 use strede::{
     Buffer, Deserialize, DeserializeOwned, DeserializerOwned, Probe, hit, typeid,
-    utils::{u8_vec_as_t, vec_u8_bytes_only, vec_u8_bytes_only_owned, vec_via_seq, vec_via_seq_owned},
+    utils::{
+        u8_vec_as_t, vec_u8_bytes_only, vec_u8_bytes_only_owned, vec_via_seq, vec_via_seq_owned,
+    },
 };
 
 macro_rules! impl_deserialize_vec_borrow {

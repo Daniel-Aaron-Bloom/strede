@@ -117,8 +117,8 @@ fn decode_value_borrow<'de>(raw_start: &'de [u8]) -> DecodeValueBorrowFuture<'de
                             if src.len() < len {
                                 return Err(CborError::UnexpectedEnd);
                             }
-                            let chunk =
-                                core::str::from_utf8(&src[..len]).map_err(|_| CborError::InvalidUtf8)?;
+                            let chunk = core::str::from_utf8(&src[..len])
+                                .map_err(|_| CborError::InvalidUtf8)?;
                             out.push_str(chunk);
                             src = &src[len..];
                         }

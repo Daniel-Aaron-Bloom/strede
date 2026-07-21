@@ -14,7 +14,9 @@ use crate::{
     full::{ParseNum, PostcardClaim, PostcardDeserializer, PostcardSubDeserializer},
     varint::{decode_varint, decode_zigzag},
 };
-use strede::{Buffer, Deserialize, DeserializeOwned, Deserializer, DeserializerOwned, Handle, Probe};
+use strede::{
+    Buffer, Deserialize, DeserializeOwned, Deserializer, DeserializerOwned, Handle, Probe,
+};
 
 // ---------------------------------------------------------------------------
 // ParseNum implementations
