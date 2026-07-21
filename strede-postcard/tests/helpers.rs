@@ -106,3 +106,82 @@ pub fn pi128(v: i128) -> Vec<u8> {
     out.extend_from_slice(&varint(hi));
     out
 }
+
+/// Deserialize `$ty` from `$input: &[u8]` through the owned/chunked family,
+/// feeding the whole input upfront via a trivial "empty the buffer to signal
+/// EOF" loader (matches the pattern `strede-msgpack`/`strede-cbor`'s owned
+/// tests use). Expands to a `Result<Option<$ty>, PostcardError>`, mirroring
+/// the borrow-family `parse::<T>(input)` helper pattern used elsewhere in
+/// this crate's tests.
+///
+/// A macro rather than a generic function: the loader closure's type is
+/// anonymous per call site, and threading it through a `for<'s> T:
+/// DeserializeOwned<ChunkedPostcardDeserializer<'s, ..., F>>` bound on a
+/// shared function runs into HRTB/generic-closure ergonomics that
+/// `strede-msgpack`/`strede-cbor`'s own owned-family tests sidestep by
+/// inlining `SharedBuf::with_async` per test - this macro gets the same
+/// inlining without the per-test boilerplate.
+#[allow(unused_macros)]
+macro_rules! parse_owned {
+    ($ty:ty, $input:expr) => {{
+        use strede::{Probe, SharedBuf};
+        use strede_postcard::chunked::ChunkedPostcardDeserializer;
+        use strede_test_util::block_on_loop;
+
+        let input: &[u8] = $input;
+        block_on_loop(SharedBuf::with_async(
+            input,
+            async |buf: &mut &[u8]| {
+                *buf = &[];
+            },
+            async |shared| {
+                let de = ChunkedPostcardDeserializer::new(shared);
+                match <$ty as strede::DeserializeOwned<_>>::deserialize_owned(de, ()).await {
+                    Ok(Probe::Hit((_, v))) => Ok(Some(v)),
+                    Ok(Probe::Miss) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            },
+        ))
+    }};
+}
+
+/// Like [`parse_owned!`], but feeds `$input` through the loader
+/// `$chunk_size` bytes at a time (via a `Cell<usize>`-tracked position)
+/// instead of handing over the whole input upfront. Forces every
+/// varint/byte read in the deserialization path to refill mid-value at
+/// every possible split point - this is the harness `varint_chunking.rs`
+/// uses to prove the resumable varint decoder (postcard's one genuinely new
+/// piece of chunked-specific logic, with no msgpack/CBOR precedent) is
+/// correct across real chunk boundaries, not just against a
+/// whole-input-upfront loader that never actually forces a mid-value
+/// refill.
+#[allow(unused_macros)]
+macro_rules! parse_owned_chunked {
+    ($ty:ty, $input:expr, $chunk_size:expr) => {{
+        use strede::{Probe, SharedBuf};
+        use strede_postcard::chunked::ChunkedPostcardDeserializer;
+        use strede_test_util::block_on_loop;
+
+        let input: &[u8] = $input;
+        let chunk_size: usize = $chunk_size;
+        let pos = ::core::cell::Cell::new(chunk_size.min(input.len()));
+        block_on_loop(SharedBuf::with_async(
+            &input[..chunk_size.min(input.len())],
+            async |buf: &mut &[u8]| {
+                let start = pos.get();
+                let end = (start + chunk_size).min(input.len());
+                pos.set(end);
+                *buf = &input[start..end];
+            },
+            async |shared| {
+                let de = ChunkedPostcardDeserializer::new(shared);
+                match <$ty as strede::DeserializeOwned<_>>::deserialize_owned(de, ()).await {
+                    Ok(Probe::Hit((_, v))) => Ok(Some(v)),
+                    Ok(Probe::Miss) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            },
+        ))
+    }};
+}

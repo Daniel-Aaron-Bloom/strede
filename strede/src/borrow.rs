@@ -270,6 +270,21 @@ pub trait Entry<'de>: Sized {
     /// Always succeeds on well-formed input.  Returns the [`Claim`](Entry::Claim)
     /// so the stream can advance.  `Err` only on malformed data.
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
+
+    /// Consume the current token as the fallback for an externally-tagged
+    /// enum's `#[strede(other)]` variant, after every named/indexed variant
+    /// has already missed.
+    ///
+    /// Default: forwards to [`Entry::skip`], appropriate for self-describing
+    /// formats where the unmatched value's shape can be discovered and
+    /// discarded generically. Schema-driven formats that cannot skip an
+    /// arbitrary-shaped value (e.g. postcard) may override this instead to
+    /// treat the unmatched discriminant as carrying no payload at all -
+    /// `#[strede(other)]` only ever targets a unit variant, so no payload
+    /// needs to be read in that case.
+    async fn skip_other(self) -> Result<Self::Claim, Self::Error> {
+        self.skip().await
+    }
 }
 
 // ---------------------------------------------------------------------------

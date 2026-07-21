@@ -13,6 +13,8 @@ mod token;
 
 #[cfg(feature = "alloc")]
 mod value;
+#[cfg(feature = "alloc")]
+mod vec;
 
 pub use chunked::ChunkedCborDeserializer;
 pub use error::CborError;

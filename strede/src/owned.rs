@@ -194,6 +194,17 @@ pub trait EntryOwned: Sized {
 
     fn fork(&mut self) -> Self;
     async fn skip(self) -> Result<Self::Claim, Self::Error>;
+
+    /// Consume the current token as the fallback for an externally-tagged
+    /// enum's `#[strede(other)]` variant, after every named/indexed variant
+    /// has already missed.
+    ///
+    /// Default: forwards to [`EntryOwned::skip`]. See
+    /// [`Entry::skip_other`](crate::Entry::skip_other) for the rationale on
+    /// why schema-driven formats may want to override this instead.
+    async fn skip_other(self) -> Result<Self::Claim, Self::Error> {
+        self.skip().await
+    }
 }
 
 /// Owned counterpart to [`crate::StrAccess`]. Takes `self` by value and a sync

@@ -123,6 +123,14 @@ and `ChunkedJsonDeserializer` / `ChunkedJsonSubDeserializer` (owned family).
 Number parsing uses the Eisel-Lemire fast path for floats; integers are parsed
 directly from the wire token.
 
+`Vec<T>: Deserialize` / `DeserializeOwned` (`src/vec.rs`, requires `alloc`) is
+likewise this crate's responsibility, not core strede's - see the workspace
+README's "Implementing a format backend" section for why. `Vec<u8>`
+specifically races a zero-copy/chunked read of the JSON string's UTF-8 bytes
+against the plain seq-of-elements reading, since a JSON string token and an
+array token are wire-distinguishable; every other `Vec<T>` goes straight
+through the seq path.
+
 ## Features
 
 | feature | description |

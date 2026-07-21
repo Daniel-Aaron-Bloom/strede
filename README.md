@@ -595,8 +595,42 @@ String-like types (`String`, `Cow<str>`, `Box<str>`, `&'de str`) are already
 provided by core strede generically via `deserialize_str` / `deserialize_str_chunks`
 — your backend gets them for free once `Entry` is implemented. The dividing line
 is: types whose wire encoding is format-independent ship in core; types whose
-encoding is format-dependent (numbers, booleans, raw bytes) are your
-responsibility.
+encoding is format-dependent (numbers, booleans, raw bytes, and `Vec<u8>`'s
+bytes-vs-seq disambiguation — see below) are your responsibility.
+
+### `Vec<T>` impls are format-specific too
+
+Unlike `String`/`Cow<str>`/etc., `Vec<T>: Deserialize` / `DeserializeOwned` is
+**not** provided by core strede — each backend implements it. This is
+deliberate: a `Vec<u8>` can in principle be read either as raw bytes or as a
+sequence of `u8` elements, and whether it's safe to try both and take
+whichever hits depends entirely on your wire format. Self-describing formats
+with a dedicated byte-string token (JSON, CBOR, MessagePack) can always tell
+the two apart from the wire alone, so racing them is sound. Schema-driven
+formats may not be able to at all — see `strede-postcard`, where a bare `u8`
+is itself varint-encoded, so "raw bytes" and "sequence of `u8` varints" are
+genuinely different encodings that only coincide for element values `< 0x80`
+and diverge above that, with no wire tag to say which one a writer meant.
+Racing them there would be unsound (the losing arm can run past the real
+payload and surface a spurious fatal error). Only your format knows which
+case it's in, so `strede::utils` gives you the building blocks rather than
+making the choice for you:
+
+- `utils::vec_via_seq` / `vec_via_seq_owned` — always read as a plain
+  sequence, no bytes fast path. Use this for every `T` you don't special-case.
+- `utils::vec_u8_race` / `vec_u8_race_owned` — for `T = u8`, race "raw bytes"
+  against "sequence of `u8` elements"; sound only when your wire format tags
+  the two differently.
+- `utils::vec_u8_bytes_only` / `vec_u8_bytes_only_owned` — for `T = u8`,
+  always read as raw bytes with no seq fallback ever considered; use this
+  when your format has no wire tag to disambiguate and `Vec<u8>` should
+  unconditionally mean "raw bytes" (see `strede-postcard`).
+
+A typical impl special-cases `T == u8` via
+`typeid::of::<T>() == typeid::of::<u8>()` (the `typeid` crate is re-exported
+as `strede::typeid`) and picks the appropriate `u8` helper, falling through to
+`vec_via_seq`/`vec_via_seq_owned` for every other `T`. See any
+`strede-*/src/vec.rs` for a worked example.
 
 ### Claim threading
 

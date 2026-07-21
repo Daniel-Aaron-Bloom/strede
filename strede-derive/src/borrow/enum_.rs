@@ -807,7 +807,7 @@ fn expand_enum_external_tagged_borrow(
                 match __e1.deserialize_enum_into::<Self>(()).await? {
                     #krate::Probe::Hit(__v) => ::core::result::Result::Ok(#krate::Probe::Hit(__v)),
                     #krate::Probe::Miss => {
-                        let __claim = __e2.skip().await?;
+                        let __claim = __e2.skip_other().await?;
                         ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name::#other_vname)))
                     }
                 }

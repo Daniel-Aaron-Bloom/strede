@@ -625,8 +625,8 @@ fn expand_owned_enum_external_tagged(
 
     // Build the DeserializeOwned body. When an `other` variant is present, use two
     // entry handles: the first calls `deserialize_enum_into`, and the second is a
-    // fallback that `skip()`s the value (which iterate returned Miss without consuming)
-    // and returns the `other` variant.
+    // fallback that `skip_other()`s the value (which iterate returned Miss without
+    // consuming) and returns the `other` variant.
     let deserialize_owned_body = match other_variant(classified) {
         Some(other_vname) => quote! {
             d.entry(|[__e1, __e2]| async {
@@ -634,7 +634,7 @@ fn expand_owned_enum_external_tagged(
                     #krate::Probe::Hit(__v) => ::core::result::Result::Ok(#krate::Probe::Hit(__v)),
                     #krate::Probe::Miss => {
                         // No arm matched — consume the value and return the `other` variant.
-                        let __claim = __e2.skip().await?;
+                        let __claim = __e2.skip_other().await?;
                         ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #name::#other_vname)))
                     }
                 }

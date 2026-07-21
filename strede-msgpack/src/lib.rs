@@ -16,6 +16,8 @@ pub(crate) mod token;
 
 #[cfg(feature = "alloc")]
 mod value;
+#[cfg(feature = "alloc")]
+mod vec;
 
 pub use error::MsgpackError;
 pub use timestamp::MsgpackTimestamp;

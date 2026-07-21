@@ -130,6 +130,7 @@ Deserializer<'de>     — stream handle; entry(self, closure) → Result<Probe<(
                         deserialize_enum_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                         fork(&mut self) → Self
                         skip(self) → Result<Claim, Error>
+                        skip_other(self) → Result<Claim, Error>
     StrAccess         — streaming string chunks; next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
     BytesAccess       — streaming byte chunks;   next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
     NumberAccess      — streaming number chunks; next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
@@ -191,6 +192,7 @@ DeserializerOwned      — entry(self, closure) → Result<Probe<(Claim, R)>, Er
                              deserialize_enum_into::<T>(self, extra) → Result<Probe<(Claim, T)>, Error>
                              fork(&mut self) → Self
                              skip(self) → Result<Claim, Error>
+                             skip_other(self) → Result<Claim, Error>
     StrAccessOwned     — next_str(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
     BytesAccessOwned   — next_bytes(self, |&[u8]| -> R) → Result<Chunk<(Self, R), Claim>, Error>
     NumberAccessOwned  — next_number_chunk(self, |&str| -> R) → Result<Chunk<(Self, R), Claim>, Error>
@@ -293,6 +295,19 @@ miss signal.
 trait in both families. Used as associated types (e.g. `type StrChunks =
 Never<…>`) on entry/accessor impls that never produce those accessor kinds,
 so the trait obligation is satisfied without dead code.
+
+`Entry::skip_other` / `EntryOwned::skip_other` — consumes the current token as
+the fallback for an externally-tagged enum's `#[strede(other)]` catch-all,
+after every named/indexed variant has missed. Defaults to forwarding to
+`skip`, which is correct for self-describing formats (JSON, MessagePack,
+CBOR) where the unmatched value's shape can be discovered and discarded
+generically. Schema-driven formats that cannot implement `skip` at all (e.g.
+postcard, see `strede-postcard`) can still override `skip_other`: since
+`other` is validated to target only a unit variant, the unmatched
+discriminant can be treated as carrying no payload, with no need to know its
+shape. This mirrors upstream `postcard`+`serde`'s own `#[serde(other)]`
+convention. The caveat carries over too: if the real (unrecognized) variant
+actually had a payload, those bytes are left unconsumed.
 
 ### `map_arm` module — map iteration infrastructure
 
@@ -705,10 +720,12 @@ match null; newtype/tuple/struct variants use `deserialize_value`.
 
 `#[strede(other)]` — on a unit enum variant. Acts as catch-all: when no
 tagged variant matches the discriminant, this variant is returned instead of
-`Probe::Miss`. For map-keyed (non-unit) variants, the unknown key's value is
-skipped before returning the `other` variant. Restrictions: unit variants only;
-at most one per enum; cannot combine with `rename`, `alias`, or `untagged`;
-cannot coexist with `#[strede(untagged)]` variants on the same enum.
+`Probe::Miss`. The derive consumes the unmatched value via
+`Entry::skip_other`/`EntryOwned::skip_other` (default: forwards to `skip`)
+before returning the `other` variant — see `skip_other` below. Restrictions:
+unit variants only; at most one per enum; cannot combine with `rename`,
+`alias`, or `untagged`; cannot coexist with `#[strede(untagged)]` variants on
+the same enum.
 
 `#[strede(default)]` — on a struct field. If the field is missing from the
 data, calls `Default::default()` instead of returning `Probe::Miss`.

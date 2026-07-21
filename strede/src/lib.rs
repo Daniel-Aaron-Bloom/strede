@@ -155,17 +155,9 @@ pub use owned::{
 #[cfg(feature = "alloc")]
 pub use alloc::boxed::Box;
 
-pub mod utils {
-    /// Like [`core::array::repeat`], but for `clone(&mut self) -> Self`
-    #[inline(always)]
-    pub fn repeat<T, const N: usize>(f: T, mut clone: impl FnMut(&mut T) -> T) -> [T; N] {
-        let mut f = Some(f);
-        core::array::from_fn(|i| {
-            if i == N - 1 {
-                f.take().unwrap()
-            } else {
-                clone(f.as_mut().unwrap())
-            }
-        })
-    }
-}
+pub mod utils;
+
+// Re-exported so format crates can do the `TypeId::of::<T>() == TypeId::of::<u8>()`
+// check used by `utils::vec_u8_race`/`vec_u8_race_owned` callers without taking their
+// own direct dependency on `typeid`.
+pub use typeid;

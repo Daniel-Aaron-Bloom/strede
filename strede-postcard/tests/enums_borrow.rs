@@ -293,3 +293,60 @@ fn large_discriminant_two_bytes() {
 fn large_discriminant_129() {
     assert_eq!(parse::<Wide>(&varint(129)), Ok(Some(Wide::V129)));
 }
+
+// --- `#[strede(other)]` catch-all ---
+//
+// `other` only ever targets a unit variant, so the fallback never needs to
+// skip a payload: an unrecognized discriminant is treated as carrying no
+// payload at all, matching upstream postcard/serde's own `#[serde(other)]`
+// convention (verified against the real `postcard` + `serde` crates).
+
+#[derive(Debug, PartialEq, Deserialize)]
+enum WithOther {
+    A,     // 0
+    B(u8), // 1
+    #[strede(other)]
+    Unknown,
+}
+
+#[test]
+fn other_catches_unrecognized_discriminant() {
+    assert_eq!(
+        parse::<WithOther>(&varint(2)),
+        Ok(Some(WithOther::Unknown))
+    );
+    assert_eq!(
+        parse::<WithOther>(&varint(99)),
+        Ok(Some(WithOther::Unknown))
+    );
+}
+
+#[test]
+fn other_does_not_shadow_known_variants() {
+    assert_eq!(parse::<WithOther>(&varint(0)), Ok(Some(WithOther::A)));
+    let mut data = varint(1);
+    data.extend_from_slice(&varint(7));
+    assert_eq!(parse::<WithOther>(&data), Ok(Some(WithOther::B(7))));
+}
+
+#[test]
+fn other_leaves_no_trailing_bytes_for_unit_fallback() {
+    // Nothing follows the discriminant for the `other` case, so there's no
+    // trailing-bytes error.
+    assert_eq!(
+        parse::<WithOther>(&varint(2)),
+        Ok(Some(WithOther::Unknown))
+    );
+}
+
+#[test]
+fn other_with_unexpected_trailing_payload_errors() {
+    // If the real (unrecognized) variant actually carried a payload on the
+    // wire, `other`'s zero-payload assumption leaves those bytes unconsumed —
+    // surfacing as a top-level trailing-bytes error rather than silently
+    // discarding them. This is the schema-evolution caveat documented on
+    // `PostcardEntry::skip_other`.
+    let mut data = varint(2);
+    data.extend_from_slice(&varint(123));
+    assert_eq!(parse_err::<WithOther>(&data), PostcardError::ExpectedEnd);
+}

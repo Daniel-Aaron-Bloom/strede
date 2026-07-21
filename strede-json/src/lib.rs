@@ -13,6 +13,8 @@ pub mod number;
 pub(crate) mod token;
 #[cfg(feature = "alloc")]
 pub mod value;
+#[cfg(feature = "alloc")]
+mod vec;
 
 pub use error::JsonError;
 pub use full::{

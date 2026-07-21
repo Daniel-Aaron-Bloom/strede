@@ -1,68 +1,19 @@
 use super::*;
 use crate::borrow::{DeserializeFromMap, MapAccess, MapKeyProbe, MapValueProbe};
 use crate::owned::{
-    BytesAccessOwned, DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned,
+    DeserializeFromMapOwned, MapAccessOwned, MapKeyProbeOwned, MapValueProbeOwned,
 };
 use crate::{hit, or_miss, select_probe};
 
-/// Reinterpret a `Vec<u8>` as `Vec<T>` via raw-parts cast.
-/// # Safety
-/// Caller must have confirmed `TypId::of::<T>() == TypId::of::<u8>()`.
-#[cfg(feature = "alloc")]
-unsafe fn u8_vec_as_t<T>(v: alloc::vec::Vec<u8>) -> alloc::vec::Vec<T> {
-    let mut v = core::mem::ManuallyDrop::new(v);
-    // SAFETY: delegated to caller (T == u8, same size/alignment/drop).
-    unsafe { alloc::vec::Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity()) }
-}
-
 // -------------------------------------------------------------------------
-// Vec<T> — both families. Emits universal Deserialize (delegating through
-// deserialize_seq_into) + shape-specific DeserializeFromSeq (iterates seq).
+// Vec<T> — shape-specific DeserializeFromSeq only (iterates an already-opened
+// seq; format-agnostic, no ambiguity). There is deliberately no universal
+// `Deserialize`/`DeserializeOwned` impl here: whether `Vec<u8>` can safely
+// race a "raw bytes" reading against "a sequence of u8 elements" depends on
+// whether the format's wire representation can tell the two apart, which
+// only the format itself knows (see `strede::utils` and the `strede-*`
+// format crates, each of which provides its own `Vec<T>` impl).
 // -------------------------------------------------------------------------
-
-#[cfg(feature = "alloc")]
-impl<'de, D, T> Deserialize<'de, D> for alloc::vec::Vec<T>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<
-        'de,
-        <<<D::Entry as Entry<'de>>::Seq as SeqAccess<'de>>::Elem as SeqEntry<'de>>::SubDeserializer,
-        Extra = (),
-    >,
-{
-    type Extra = ();
-    async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        if typeid::of::<T>() == typeid::of::<u8>() {
-            return d.entry(|[e1, e2, e3]| async move {
-                select_probe!(biased;
-                    async move {
-                        let (claim, b) = hit!(e1.deserialize_bytes().await);
-                        // Safety: T == u8 confirmed by TypId check.
-                        let v = unsafe { u8_vec_as_t(b.to_vec()) };
-                        Ok(Probe::Hit((claim, v)))
-                    },
-                    async move {
-                        let mut chunks = hit!(e2.deserialize_bytes_chunks().await);
-                        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                        loop {
-                            match chunks.next_bytes(|b| out.extend_from_slice(b)).await? {
-                                Chunk::Data((new, ())) => chunks = new,
-                                Chunk::Done(claim) => {
-                                    // Safety: T == u8 confirmed by TypId check.
-                                    let v = unsafe { u8_vec_as_t(out) };
-                                    return Ok(Probe::Hit((claim, v)));
-                                }
-                            }
-                        }
-                    },
-                    e3.deserialize_seq_into::<Self>(()),
-                )
-            }).await;
-        }
-        d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await })
-            .await
-    }
-}
 
 #[cfg(feature = "alloc")]
 impl<'de, S, T> DeserializeFromSeq<'de, S> for alloc::vec::Vec<T>
@@ -92,43 +43,6 @@ where
                 Probe::Miss => return Ok(Probe::Miss),
             }
         }
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<D, T> DeserializeOwned<D> for alloc::vec::Vec<T>
-where
-    D: DeserializerOwned,
-    T: DeserializeOwned<
-        <<<D::Entry as EntryOwned>::Seq as SeqAccessOwned>::Elem as SeqEntryOwned>::SubDeserializer,
-        Extra = (),
-    >,
-{
-    type Extra = ();
-    async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
-        if typeid::of::<T>() == typeid::of::<u8>() {
-            return d.entry(|[e1, e2]| async move {
-                select_probe!(biased;
-                    async move {
-                        let mut chunks = hit!(e1.deserialize_bytes_chunks().await);
-                        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-                        loop {
-                            match chunks.next_bytes(|b| out.extend_from_slice(b)).await? {
-                                Chunk::Data((new, ())) => chunks = new,
-                                Chunk::Done(claim) => {
-                                    // Safety: T == u8 confirmed by TypId check.
-                                    let v = unsafe { u8_vec_as_t(out) };
-                                    return Ok(Probe::Hit((claim, v)));
-                                }
-                            }
-                        }
-                    },
-                    e2.deserialize_seq_into::<Self>(()),
-                )
-            }).await;
-        }
-        d.entry(|[e]| async move { e.deserialize_seq_into::<Self>(()).await })
-            .await
     }
 }
 
@@ -211,6 +125,7 @@ where
         <<<D::Entry as Entry<'de>>::Seq as SeqAccess<'de>>::Elem as SeqEntry<'de>>::SubDeserializer,
         Extra = (),
     >,
+    alloc::vec::Vec<T>: Deserialize<'de, D, Extra = ()>,
 {
     type Extra = ();
     async fn deserialize(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {
@@ -227,6 +142,7 @@ where
         <<<D::Entry as EntryOwned>::Seq as SeqAccessOwned>::Elem as SeqEntryOwned>::SubDeserializer,
         Extra = (),
     >,
+    alloc::vec::Vec<T>: DeserializeOwned<D, Extra = ()>,
 {
     type Extra = ();
     async fn deserialize_owned(d: D, _: ()) -> Result<Probe<(D::Claim, Self)>, D::Error> {

@@ -315,6 +315,22 @@ impl<'de> Entry<'de> for PostcardEntry<'de> {
     async fn skip(self) -> Result<Self::Claim, Self::Error> {
         Err(PostcardError::CannotSkip)
     }
+
+    /// `#[strede(other)]` only ever targets a unit variant (enforced at
+    /// derive time), so once every named/indexed variant has missed, the
+    /// unmatched discriminant is treated as carrying no payload — mirroring
+    /// upstream `postcard`+`serde`'s own `#[serde(other)]` behavior, where an
+    /// unrecognized discriminant likewise consumes nothing beyond itself.
+    /// If the real (unrecognized) variant actually carried a payload on the
+    /// wire, those bytes are left unconsumed and will surface as a
+    /// `PostcardError::ExpectedEnd` (or corrupt a sibling read, if nested) —
+    /// the same schema-evolution caveat that applies upstream.
+    async fn skip_other(self) -> Result<Self::Claim, Self::Error> {
+        let (_discriminant, consumed) = decode_varint(self.src)?;
+        Ok(PostcardClaim {
+            src: &self.src[consumed..],
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
