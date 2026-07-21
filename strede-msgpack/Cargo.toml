@@ -12,11 +12,11 @@ description = "MessagePack format backend for strede"
 readme = "README.md"
 
 [dependencies]
-strede = { path = "../strede", version = "=0.1.1" }
+strede = { path = "../strede", version = "=0.2.0" }
 
 [features]
 alloc = []
 
 [dev-dependencies]
-strede-derive = { path = "../strede-derive", version = "=0.1.1", features = ["alloc"] }
+strede-derive = { path = "../strede-derive", version = "=0.2.0", features = ["alloc"] }
 strede-test-util = { path = "../strede-test-util" }
