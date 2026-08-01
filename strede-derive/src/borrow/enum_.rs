@@ -95,6 +95,39 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
                     >
                 ));
             }
+            // Untagged struct/tuple variants dispatch via
+            // `deserialize_value::<HelperT>(())` (`gen_untagged_probe_chain_borrow` /
+            // `expand_enum_with_untagged`'s `deserialize_value_by_shape`), i.e. the
+            // *helper type itself* is the payload passed to `deserialize_value`, not
+            // its individual field types (the `field_types` loop above pushes bounds
+            // keyed on raw field types, which is correct for `Newtype(ty)` variants
+            // where `ty` *is* the payload, but does nothing useful for `Struct`/`Tuple`
+            // variants - their payload is `__VariantN`/`__TupleVariantN`). Missing this
+            // bound left every untagged struct/tuple variant with a non-blanket field
+            // type unable to compile at all (never previously covered by any test).
+            for cv in &classified {
+                if !cv.untagged {
+                    continue;
+                }
+                let helper_ty: syn::Type = match &cv.kind {
+                    VariantKind::Struct(_) => {
+                        let id = format_ident!("__Variant{}", cv.index);
+                        syn::parse_quote!(#id)
+                    }
+                    VariantKind::Tuple(_) => {
+                        let id = format_ident!("__TupleVariant{}", cv.index);
+                        syn::parse_quote!(#id)
+                    }
+                    VariantKind::Newtype(_) | VariantKind::Unit => continue,
+                };
+                wc.predicates.push(syn::parse_quote!(
+                    #helper_ty: #krate::Deserialize<
+                        'de,
+                        <__D::Entry as #krate::Entry<'de>>::SubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
             // Map iteration uses Match/Skip key probes.
             // For enums: map iteration only happens for non-unit non-untagged variants.
             let dup_n: usize = classified
@@ -220,6 +253,16 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
         let tuple_variant_helpers = gen_tuple_variant_helpers_borrow(&classified, krate);
         let struct_variant_helpers =
             gen_struct_variant_helpers_borrow(&classified, krate, container_attrs.rename_all);
+        // `MapFieldProvider` impl so this purely-untagged enum can be used as
+        // a `#[strede(flatten)]` field's type - see
+        // `gen_enum_candidate_map_field_provider_untagged_borrow`.
+        let flatten_provider = gen_enum_candidate_map_field_provider_untagged_borrow(
+            name,
+            &classified,
+            krate,
+            &container_attrs,
+            &input.generics,
+        );
         return Ok(quote! {
             #[allow(unreachable_code)]
             const _: () = {
@@ -230,6 +273,7 @@ pub(super) fn expand(input: DeriveInput, krate: &syn::Path) -> syn::Result<Token
                 };
                 #tuple_variant_helpers
                 #struct_variant_helpers
+                #flatten_provider
                 impl #impl_generics #krate::Deserialize<'de, __D> for #name #ty_generics #where_clause {
                     type Extra = ();
                     async fn deserialize(
@@ -368,6 +412,30 @@ fn gen_tuple_variant_helpers_borrow(
 }
 
 /// Generate helper struct definitions and Deserialize impls for struct variants (borrow family).
+/// Field-kind classification shared by the segment-building helpers below —
+/// mirrors `struct_::expand`'s `FieldKind`/`Segment` split so a variant's
+/// `#[strede(flatten)]` fields compose via `StackConcat` + `MapFieldProvider`
+/// instead of being treated as ordinary nested-map fields.
+enum VariantFieldKind<'a> {
+    Skip,
+    Regular {
+        reg_idx: usize,
+    },
+    Flatten {
+        ty: &'a syn::Type,
+        borrow: &'a Option<crate::common::BorrowAttr>,
+    },
+}
+
+enum VariantSegment<'a> {
+    Regular(Vec<usize>),
+    Flatten {
+        ty: &'a syn::Type,
+        #[allow(dead_code)]
+        borrow: &'a Option<crate::common::BorrowAttr>,
+    },
+}
+
 fn gen_struct_variant_helpers_borrow(
     classified: &[ClassifiedVariant],
     krate: &syn::Path,
@@ -384,120 +452,482 @@ fn gen_struct_variant_helpers_borrow(
                 Err(_) => continue,
             };
 
-            let de_classified: Vec<_> = cf.iter().filter(|f| !f.skip_deserializing).collect();
-
-            // Build arm slots for helper struct.
-            // KP/VP are projected directly from __M2 since the helper's DeserializeFromMap
-            // impl is generic over the access type, not a Deserializer.
-            let arm_slots: Vec<TokenStream2> = field_names
-                .iter()
-                .zip(field_types.iter())
-                .zip(de_classified.iter())
-                .map(|((fname, fty), dcf)| {
-                    let mut wnames: Vec<&str> = vec![dcf.wire_name.as_str()];
-                    for a in &dcf.aliases { wnames.push(a.as_str()); }
-                    let key_fn = if wnames.len() == 1 {
-                        let wn = wnames[0];
-                        quote! {
-                            |mut __kp: <__M2 as #krate::MapAccess<'de>>::KeyProbe, __i: usize| async move {
-                                let __kp2 = __kp.fork();
-                                #krate::select_probe! {
-                                    __kp.deserialize_key::<#krate::Match>(#wn),
-                                    async move {
-                                        let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
-                                        ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::Match)))
-                                    },
-                                }
+            // Classify each field as Skip / Regular / Flatten (declaration order).
+            let field_kinds: Vec<VariantFieldKind> = {
+                let mut reg_idx = 0usize;
+                field_names
+                    .iter()
+                    .zip(cf.iter())
+                    .zip(field_types.iter())
+                    .map(|((_n, c), ty)| {
+                        if c.skip_deserializing {
+                            VariantFieldKind::Skip
+                        } else if c.flatten == crate::common::FlattenMode::None {
+                            let r = reg_idx;
+                            reg_idx += 1;
+                            VariantFieldKind::Regular { reg_idx: r }
+                        } else {
+                            VariantFieldKind::Flatten {
+                                ty,
+                                borrow: &c.borrow,
                             }
                         }
+                    })
+                    .collect()
+            };
+
+            // Group consecutive regular fields into segments; each flatten field is
+            // its own segment. Segments are joined with `StackConcat`.
+            let segments: Vec<VariantSegment> = {
+                let mut out: Vec<VariantSegment> = vec![];
+                let mut cur_reg: Vec<usize> = vec![];
+                for kind in &field_kinds {
+                    match kind {
+                        VariantFieldKind::Skip => {}
+                        VariantFieldKind::Regular { reg_idx } => cur_reg.push(*reg_idx),
+                        VariantFieldKind::Flatten { ty, borrow } => {
+                            if !cur_reg.is_empty() {
+                                out.push(VariantSegment::Regular(core::mem::take(&mut cur_reg)));
+                            }
+                            out.push(VariantSegment::Flatten { ty, borrow });
+                        }
+                    }
+                }
+                if !cur_reg.is_empty() {
+                    out.push(VariantSegment::Regular(cur_reg));
+                }
+                out
+            };
+
+            // Regular-only filtered views (skip_deserializing and flatten fields excluded).
+            let de_classified: Vec<_> = cf
+                .iter()
+                .filter(|c| !c.skip_deserializing && c.flatten == crate::common::FlattenMode::None)
+                .collect();
+            let de_field_names: Vec<_> = field_names
+                .iter()
+                .zip(cf.iter())
+                .filter(|(_, c)| {
+                    !c.skip_deserializing && c.flatten == crate::common::FlattenMode::None
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            let de_field_types: Vec<_> = field_types
+                .iter()
+                .zip(cf.iter())
+                .filter(|(_, c)| {
+                    !c.skip_deserializing && c.flatten == crate::common::FlattenMode::None
+                })
+                .map(|(t, _)| *t)
+                .collect();
+
+            // Flatten field idents, in declaration order.
+            let flatten_field_names: Vec<_> = field_names
+                .iter()
+                .zip(field_kinds.iter())
+                .filter(|(_, k)| matches!(k, VariantFieldKind::Flatten { .. }))
+                .map(|(n, _)| *n)
+                .collect();
+
+            // Per-field absolute arm offset (skip fields get an unused placeholder).
+            // Generic over `__KP2` (a free `MapKeyProbe<'de>` parameter) rather than
+            // tied to a specific `MapAccess::KeyProbe` projection, matching struct_.rs.
+            let arm_offset_tokens: Vec<TokenStream2> = {
+                let mut out = vec![];
+                let mut terms: Vec<TokenStream2> = vec![];
+                for kind in &field_kinds {
+                    let cur = if terms.is_empty() {
+                        quote! { 0usize }
                     } else {
-                        quote! {
-                            |mut __kp: <__M2 as #krate::MapAccess<'de>>::KeyProbe, __i: usize| async move {
-                                let __kp2 = __kp.fork();
-                                #krate::select_probe! {
-                                    __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wnames, ()), )*]),
-                                    async move {
-                                        let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
-                                        ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::MatchVals((), ::core::marker::PhantomData))))
-                                    },
+                        quote! { ( #( #terms )+* ) }
+                    };
+                    out.push(cur);
+                    match kind {
+                        VariantFieldKind::Skip => {}
+                        VariantFieldKind::Regular { .. } => terms.push(quote! { 1usize }),
+                        VariantFieldKind::Flatten { ty, .. } => terms.push(quote! {
+                            <#ty as #krate::MapFieldProvider<'de, __KP2>>::ARMS
+                        }),
+                    }
+                }
+                out
+            };
+
+            // Builds an arm slot for a regular field (races deserialize_key against
+            // deserialize_key_by_index for positional formats), same shape as before.
+            let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
+                let dcf = de_classified[reg_idx];
+                let fty = de_field_types[reg_idx];
+                let mut wnames: Vec<&str> = vec![dcf.wire_name.as_str()];
+                for a in &dcf.aliases {
+                    wnames.push(a.as_str());
+                }
+                let key_fn = if wnames.len() == 1 {
+                    let wn = wnames[0];
+                    quote! {
+                        |mut __kp: __KP2, __i: usize| async move {
+                            let __kp2 = __kp.fork();
+                            #krate::select_probe! {
+                                __kp.deserialize_key::<#krate::Match>(#wn),
+                                async move {
+                                    let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::Match)))
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    quote! {
+                        |mut __kp: __KP2, __i: usize| async move {
+                            let __kp2 = __kp.fork();
+                            #krate::select_probe! {
+                                __kp.deserialize_key::<#krate::MatchVals<(), _>>([#( (#wnames, ()), )*]),
+                                async move {
+                                    let (__kc, ()) = #krate::hit!(__kp2.deserialize_key_by_index(__i).await);
+                                    ::core::result::Result::Ok(#krate::Probe::Hit((__kc, #krate::MatchVals((), ::core::marker::PhantomData))))
+                                },
+                            }
+                        }
+                    }
+                };
+                quote! {
+                    #krate::MapArmSlot::new(
+                        #key_fn,
+                        |__vp: #krate::borrow::VP<'de, __KP2>, __k| async move {
+                            let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#fty>(()).await);
+                            ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                        }
+                    )
+                }
+            };
+
+            // --- arm stack expression (regular segments left-nested, flatten segments
+            // delegate to MapFieldProvider::make_arms(), joined via StackConcat) ---
+            // This is the literal body of `MapFieldProvider::make_arms()` — no
+            // DetectDuplicates wrapping here (that only happens in the
+            // DeserializeFromMap impl's own arms-building expression below).
+            let make_arms_expr: TokenStream2 = {
+                let mut acc: Option<TokenStream2> = None;
+                for seg in &segments {
+                    let piece = match seg {
+                        VariantSegment::Regular(regs) => {
+                            let mut t = quote! { #krate::MapArmBase };
+                            for r in regs {
+                                let slot = build_arm_slot(*r);
+                                t = quote! { (#t, #slot) };
+                            }
+                            t
+                        }
+                        VariantSegment::Flatten { ty, .. } => quote! {
+                            <#ty as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                        },
+                    };
+                    acc = Some(match acc {
+                        None => piece,
+                        Some(prev) => quote! { #krate::StackConcat(#prev, #piece) },
+                    });
+                }
+                acc.unwrap_or_else(|| quote! { #krate::MapArmBase })
+            };
+
+            // --- wire-names array expression, offset per segment ---
+            // This is the literal body of `MapFieldProvider::wire_names()`.
+            let wire_names_expr: TokenStream2 = {
+                let mut field_iter = field_kinds.iter().enumerate();
+                let mut acc: Option<TokenStream2> = None;
+                for seg in &segments {
+                    let piece = match seg {
+                        VariantSegment::Regular(regs) => {
+                            let mut entries: Vec<TokenStream2> = vec![];
+                            for _ in 0..regs.len() {
+                                loop {
+                                    let (i, kind) =
+                                        field_iter.next().expect("regular field present");
+                                    if let VariantFieldKind::Regular { reg_idx } = kind {
+                                        let offset = &arm_offset_tokens[i];
+                                        let dcf = de_classified[*reg_idx];
+                                        let primary = &dcf.wire_name;
+                                        entries.push(quote! { (#primary, #offset) });
+                                        for a in &dcf.aliases {
+                                            entries.push(quote! { (#a, #offset) });
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            let n = entries.len();
+                            quote! { [#( #entries ),*] as [(&'static str, usize); #n] }
+                        }
+                        VariantSegment::Flatten { ty, .. } => loop {
+                            let (i, kind) = field_iter.next().expect("flatten field present");
+                            if matches!(kind, VariantFieldKind::Flatten { .. }) {
+                                let offset = &arm_offset_tokens[i];
+                                break quote! {
+                                    <#ty as #krate::MapFieldProvider<'de, __KP2>>::wire_names()
+                                        .map(|(__s, __i)| (__s, __i + #offset))
+                                };
+                            }
+                        },
+                    };
+                    acc = Some(match acc {
+                        None => piece,
+                        Some(prev) => quote! { #krate::ArrayConcat::new(#prev, #piece) },
+                    });
+                }
+                acc.unwrap_or_else(|| quote! { [] as [(&'static str, usize); 0] })
+            };
+
+            // --- type Outputs ---
+            let outputs_type_tokens: TokenStream2 = {
+                if segments.is_empty() {
+                    quote! { () }
+                } else {
+                    let mut acc: Option<TokenStream2> = None;
+                    for seg in &segments {
+                        let seg_out = match seg {
+                            VariantSegment::Regular(regs) => {
+                                let mut t = quote! { () };
+                                for r in regs {
+                                    let dcf = de_classified[*r];
+                                    let kt = {
+                                        let n = 1 + dcf.aliases.len();
+                                        if n == 1 {
+                                            quote! { #krate::Match }
+                                        } else {
+                                            quote! { #krate::MatchVals<(), [(&'static str, ()); #n]> }
+                                        }
+                                    };
+                                    let vt = de_field_types[*r];
+                                    t = quote! { (#t, ::core::option::Option<(#kt, #vt)>) };
+                                }
+                                t
+                            }
+                            VariantSegment::Flatten { ty, .. } => quote! {
+                                <#ty as #krate::MapFieldProvider<'de, __KP2>>::Outputs
+                            },
+                        };
+                        acc = Some(match acc {
+                            None => seg_out,
+                            Some(prev) => quote! { (#prev, #seg_out) },
+                        });
+                    }
+                    acc.unwrap()
+                }
+            };
+
+            // --- const ARMS ---
+            let arms_const_tokens: TokenStream2 = {
+                let terms: Vec<TokenStream2> = field_kinds
+                    .iter()
+                    .filter_map(|k| match k {
+                        VariantFieldKind::Skip => None,
+                        VariantFieldKind::Regular { .. } => Some(quote! { 1usize }),
+                        VariantFieldKind::Flatten { ty, .. } => Some(quote! {
+                            <#ty as #krate::MapFieldProvider<'de, __KP2>>::ARMS
+                        }),
+                    })
+                    .collect();
+                if terms.is_empty() {
+                    quote! { 0usize }
+                } else {
+                    quote! { #( #terms )+* }
+                }
+            };
+
+            // --- type WireNames ---
+            let wire_names_type_tokens: TokenStream2 = {
+                let mut acc: Option<TokenStream2> = None;
+                for seg in &segments {
+                    let piece = match seg {
+                        VariantSegment::Regular(regs) => {
+                            let n: usize = regs
+                                .iter()
+                                .map(|r| 1 + de_classified[*r].aliases.len())
+                                .sum();
+                            quote! { [(&'static str, usize); #n] }
+                        }
+                        VariantSegment::Flatten { ty, .. } => quote! {
+                            <<#ty as #krate::MapFieldProvider<'de, __KP2>>::WireNames
+                                as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>
+                        },
+                    };
+                    acc = Some(match acc {
+                        None => piece,
+                        Some(prev) => quote! {
+                            #krate::ArrayConcat<(&'static str, usize), #prev, #piece>
+                        },
+                    });
+                }
+                acc.unwrap_or_else(|| quote! { [(&'static str, usize); 0] })
+            };
+
+            // --- output destructure pattern: one binding per segment ---
+            let seg_out_names: Vec<syn::Ident> = (0..segments.len())
+                .map(|i| format_ident!("__seg_out_{}", i))
+                .collect();
+            let output_pat: TokenStream2 = if seg_out_names.is_empty() {
+                quote! { () }
+            } else {
+                let mut p: Option<TokenStream2> = None;
+                for n in &seg_out_names {
+                    p = Some(match p {
+                        None => quote! { #n },
+                        Some(prev) => quote! { (#prev, #n) },
+                    });
+                }
+                p.unwrap()
+            };
+
+            // --- from_outputs() body: same seg_stmts/skip_stmts logic, restructured
+            // to return Option<Self> instead of Result<Probe<...>, Error> ---
+            let mut seg_stmts: Vec<TokenStream2> = vec![];
+            {
+                let mut field_iter = field_kinds.iter().enumerate();
+                for (seg_i, seg) in segments.iter().enumerate() {
+                    let seg_out = &seg_out_names[seg_i];
+                    match seg {
+                        VariantSegment::Regular(regs) => {
+                            let inner_pat: TokenStream2 = {
+                                let mut p = quote! { () };
+                                for r in regs {
+                                    let ident = format_ident!("__opt_{}", r);
+                                    p = quote! { (#p, #ident) };
+                                }
+                                p
+                            };
+                            seg_stmts.push(quote! { let #inner_pat = #seg_out; });
+                            for _ in 0..regs.len() {
+                                loop {
+                                    let (_i, kind) = field_iter.next().expect("regular");
+                                    if let VariantFieldKind::Regular { reg_idx } = kind {
+                                        let dcf = de_classified[*reg_idx];
+                                        let fname = de_field_names[*reg_idx];
+                                        let opt_ident = format_ident!("__opt_{}", reg_idx);
+                                        let none_branch: TokenStream2 = match &dcf.default {
+                                            Some(DefaultAttr::Trait) => {
+                                                quote! { ::core::default::Default::default() }
+                                            }
+                                            Some(DefaultAttr::Expr(expr)) => {
+                                                quote! { #krate::DefaultWrapper(#expr).value() }
+                                            }
+                                            None => quote! {
+                                                return ::core::option::Option::None
+                                            },
+                                        };
+                                        seg_stmts.push(quote! {
+                                            let #fname = match #opt_ident {
+                                                ::core::option::Option::Some((_, __v)) => __v,
+                                                ::core::option::Option::None => #none_branch,
+                                            };
+                                        });
+                                        break;
+                                    }
                                 }
                             }
                         }
-                    };
-                    let out_name = format_ident!("__out_{}", fname);
-                    let _ = out_name;
-                    quote! {
-                        #krate::MapArmSlot::new(
-                            #key_fn,
-                            |__vp: #krate::borrow::VP<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>, __k| async move {
-                                let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#fty>(()).await);
-                                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                        VariantSegment::Flatten { ty, .. } => {
+                            loop {
+                                let (_i, kind) = field_iter.next().expect("flatten");
+                                if matches!(kind, VariantFieldKind::Flatten { .. }) {
+                                    break;
+                                }
                             }
-                        )
+                            let prior_flat = segments[..seg_i]
+                                .iter()
+                                .filter(|s| matches!(s, VariantSegment::Flatten { .. }))
+                                .count();
+                            let fname = flatten_field_names[prior_flat];
+                            seg_stmts.push(quote! {
+                                let #fname = match <#ty as #krate::MapFieldProvider<'de, __KP2>>
+                                    ::from_outputs(#seg_out)
+                                {
+                                    ::core::option::Option::Some(__v) => __v,
+                                    ::core::option::Option::None => return ::core::option::Option::None,
+                                };
+                            });
+                        }
                     }
+                }
+            }
+
+            // Skip-field defaults (fields never queried against the map at all).
+            let skip_stmts: Vec<TokenStream2> = field_names
+                .iter()
+                .zip(cf.iter())
+                .filter(|(_, c)| c.skip_deserializing)
+                .map(|(fname, c)| {
+                    let default_expr: TokenStream2 = match &c.default {
+                        Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
+                        Some(DefaultAttr::Expr(expr)) => {
+                            quote! { #krate::DefaultWrapper(#expr).value() }
+                        }
+                        None => unreachable!("validated in classify_fields"),
+                    };
+                    quote! { let #fname = #default_expr; }
                 })
                 .collect();
 
-            let dup_wire_names2: Vec<TokenStream2> = de_classified
-                .iter()
-                .enumerate()
-                .flat_map(|(idx, dcf)| {
-                    let wn = &dcf.wire_name;
-                    let mut entries: Vec<TokenStream2> = vec![quote! { (#wn, #idx) }];
-                    for alias in &dcf.aliases {
-                        entries.push(quote! { (#alias, #idx) });
-                    }
-                    entries
-                })
-                .collect();
-
-            let de_out_names: Vec<syn::Ident> = field_names
-                .iter()
-                .map(|n| format_ident!("__out_{}", n))
-                .collect();
-            let output_pat = {
-                let mut pat = quote! { () };
-                for out_name in &de_out_names {
-                    pat = quote! { (#pat, #out_name) };
-                }
-                pat
+            let from_outputs_body_tokens: TokenStream2 = quote! {
+                let #output_pat = __outputs;
+                #( #seg_stmts )*
+                #( #skip_stmts )*
+                ::core::option::Option::Some(#helper_name { #( #field_names, )* })
             };
 
-            let field_finalizers = gen_field_finalizers(&field_names, &de_out_names, &cf, krate);
-
-            let arms_expr = {
-                let mut expr = quote! { #krate::MapArmBase };
-                for slot in &arm_slots {
-                    expr = quote! { (#expr, #slot) };
-                }
-                quote! {
-                    {
-                        let __wn = [#( #dup_wire_names2, )*];
-                        #krate::DetectDuplicates::new(
-                            #expr,
-                            __wn,
-                            move |__kp: <__M2 as #krate::MapAccess<'de>>::KeyProbe, _i: usize| __kp.deserialize_key::<#krate::MatchVals<usize, _>>(__wn),
-                            |__vp: #krate::borrow::VP<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>| __vp.skip(),
-                        )
-                    }
-                }
-            };
-
-            // Collect 'de: 'a bounds for all field types and the map-value bound rooted at __M2.
+            // Collect 'de: 'a bounds and value/provider bounds, per field kind.
+            // This is the where-clause for the new `MapFieldProvider` impl, generic
+            // over `__KP2` instead of tied to `<__M2 as MapAccess<'de>>::KeyProbe`.
             let mut helper_bounds: Vec<syn::WherePredicate> = Vec::new();
-            for fty in &field_types {
-                for lt in borrow_lifetimes(fty, &None) {
-                    helper_bounds.push(syn::parse_quote!('de: #lt));
+            for (kind, fty) in field_kinds.iter().zip(field_types.iter()) {
+                match kind {
+                    VariantFieldKind::Skip => {}
+                    VariantFieldKind::Regular { .. } => {
+                        for lt in borrow_lifetimes(fty, &None) {
+                            helper_bounds.push(syn::parse_quote!('de: #lt));
+                        }
+                        helper_bounds.push(syn::parse_quote!(
+                            #fty: #krate::Deserialize<
+                                'de,
+                                <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                                Extra = ()
+                            >
+                        ));
+                    }
+                    VariantFieldKind::Flatten { ty, borrow } => {
+                        for lt in borrow_lifetimes(ty, borrow) {
+                            helper_bounds.push(syn::parse_quote!('de: #lt));
+                        }
+                        helper_bounds.push(syn::parse_quote!(
+                            #ty: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                        // Generic flatten fields project through `OtherArray`; the trait
+                        // doesn't propagate Copy automatically, so spell it out (no-op for
+                        // concrete flatten types whose OtherArray is `[_; N]`).
+                        helper_bounds.push(syn::parse_quote!(
+                            <<#ty as #krate::MapFieldProvider<'de, __KP2>>::WireNames
+                                as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>:
+                                ::core::marker::Copy
+                        ));
+                    }
                 }
-                helper_bounds.push(syn::parse_quote!(
-                    #fty: #krate::Deserialize<
-                        'de,
-                        <#krate::borrow::VP<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
-                        Extra = ()
-                    >
-                ));
             }
             // Universal Match/Skip impls cover map-key probe bounds — no explicit predicates needed.
+
+            // DeserializeFromMap impl where-clause shrinks to a single MapFieldProvider bound
+            // (mirrors struct_.rs's dfm_impl_gen/dfm_where_clause construction).
+            let dfm_where_bound: syn::WherePredicate = syn::parse_quote!(
+                #helper_name: #krate::MapFieldProvider<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>
+            );
+
+            // DFM body: build arms (DetectDuplicates), iterate, reconstruct via from_outputs.
+            let dfm_arms_expr = quote! {
+                #krate::DetectDuplicates!(
+                    <#helper_name as #krate::MapFieldProvider<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>>::make_arms(),
+                    <#helper_name as #krate::MapFieldProvider<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>>::wire_names(),
+                    <__M2 as #krate::MapAccess<'de>>::KeyProbe,
+                    #krate::borrow::VP<'de, <__M2 as #krate::MapAccess<'de>>::KeyProbe>
+                )
+            };
 
             tokens.extend(quote! {
                 #[allow(non_camel_case_types)]
@@ -505,11 +935,30 @@ fn gen_struct_variant_helpers_borrow(
                     #( #field_names: #field_types, )*
                 }
 
+                impl<'de, __KP2: #krate::MapKeyProbe<'de>> #krate::MapFieldProvider<'de, __KP2> for #helper_name
+                where
+                    #( #helper_bounds, )*
+                {
+                    type Outputs = #outputs_type_tokens;
+                    const ARMS: usize = #arms_const_tokens;
+                    type WireNames = #wire_names_type_tokens;
+                    fn wire_names() -> Self::WireNames {
+                        use #krate::ConcatableArray as _;
+                        #wire_names_expr
+                    }
+                    fn make_arms() -> impl #krate::MapArmStack<'de, __KP2, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                        #make_arms_expr
+                    }
+                    fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                        #from_outputs_body_tokens
+                    }
+                }
+
                 // Shape-specific impl — used by tagged-enum dispatch via
                 // `TagAwareMap` + `deserialize_from_map`.
                 impl<'de, __M2: #krate::MapAccess<'de>> #krate::DeserializeFromMap<'de, __M2> for #helper_name
                 where
-                    #( #helper_bounds, )*
+                    #dfm_where_bound,
                 {
                     type Extra = ();
                     async fn deserialize_from_map(
@@ -517,11 +966,21 @@ fn gen_struct_variant_helpers_borrow(
                         _extra: (),
                     ) -> ::core::result::Result<#krate::Probe<(<__M2 as #krate::MapAccess<'de>>::MapClaim, Self)>, <__M2 as #krate::MapAccess<'de>>::Error>
                     {
-                        let __arms = #arms_expr;
+                        let __arms = #dfm_arms_expr;
                         match __map.iterate(__arms).await? {
-                            #krate::Probe::Hit((__claim, #output_pat)) => {
-                                #( #field_finalizers )*
-                                ::core::result::Result::Ok(#krate::Probe::Hit((__claim, #helper_name { #( #field_names, )* })))
+                            #krate::Probe::Hit((__claim, __outputs)) => {
+                                match <#helper_name as #krate::MapFieldProvider<
+                                    'de,
+                                    <__M2 as #krate::MapAccess<'de>>::KeyProbe,
+                                >>::from_outputs(__outputs)
+                                {
+                                    ::core::option::Option::Some(__v) => {
+                                        ::core::result::Result::Ok(#krate::Probe::Hit((__claim, __v)))
+                                    }
+                                    ::core::option::Option::None => {
+                                        ::core::result::Result::Ok(#krate::Probe::Miss)
+                                    }
+                                }
                             }
                             #krate::Probe::Miss => ::core::result::Result::Ok(#krate::Probe::Miss),
                         }
@@ -790,6 +1249,11 @@ fn expand_enum_external_tagged_borrow(
     let struct_variant_helpers =
         gen_struct_variant_helpers_borrow(classified, krate, container_attrs.rename_all);
 
+    // `MapFieldProvider` impl so this enum can be used as a `#[strede(flatten)]`
+    // field's type — see `gen_enum_map_field_provider_borrow`.
+    let map_field_provider_impl =
+        gen_enum_map_field_provider_borrow(name, classified, krate, container_attrs, orig_generics);
+
     let deserialize_from_enum_body = quote! {
         let __arms = #arms_expr;
         match __e.iterate(__arms).await? {
@@ -832,6 +1296,7 @@ fn expand_enum_external_tagged_borrow(
 
             #tuple_variant_helpers
             #struct_variant_helpers
+            #map_field_provider_impl
 
             impl #enum_impl_generics #krate::DeserializeFromEnum<'de, __E>
                 for #name #ty_generics
@@ -862,6 +1327,944 @@ fn expand_enum_external_tagged_borrow(
             }
         };
     })
+}
+
+/// Emit `MapFieldProvider<'de, __KP2>` for an externally-tagged enum so it can
+/// be used as a `#[strede(flatten)]` field's type.
+///
+/// Externally tagging only ever contributes one key/value pair (the matched
+/// variant's wire name → its payload) no matter how many variants exist, so
+/// this is a single arm: a `MatchVals` key race over every (non-`other`,
+/// non-untagged) variant's wire name + aliases, dispatching by the matched
+/// index to that variant's payload. A unit variant's payload is `()`
+/// (`"VariantName": null` on the wire) — the same "no payload" convention
+/// used for unit structs elsewhere in the derive. `#[strede(other)]` is not
+/// supported through this arm: an `other` variant is simply never a
+/// candidate, so an unmatched key just misses this arm and falls through to
+/// whatever the parent struct's own unknown-field handling does.
+fn gen_enum_map_field_provider_borrow(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    krate: &syn::Path,
+    container_attrs: &crate::common::ContainerAttrs,
+    orig_generics: &syn::Generics,
+) -> TokenStream2 {
+    let (_, ty_generics, _) = orig_generics.split_for_impl();
+
+    // Same candidate set as expand_enum_external_tagged_borrow's arm_slots.
+    let tagged_non_other: Vec<_> = classified
+        .iter()
+        .filter(|cv| !cv.untagged && !cv.other)
+        .collect();
+    let n_cands: usize = tagged_non_other.iter().map(|cv| 1 + cv.aliases.len()).sum();
+
+    // --- impl generics: 'de, __KP2: MapKeyProbe<'de> ---
+    let mut mfp_impl_gen = orig_generics.clone();
+    {
+        let has_de = mfp_impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+        if !has_de {
+            mfp_impl_gen.params.insert(0, syn::parse_quote!('de));
+        }
+        mfp_impl_gen
+            .params
+            .push(syn::parse_quote!(__KP2: #krate::MapKeyProbe<'de>));
+        let wc = mfp_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in orig_generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::Deserialize<
+                        'de,
+                        <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            let has_unit = tagged_non_other
+                .iter()
+                .any(|cv| matches!(cv.kind, VariantKind::Unit));
+            if has_unit {
+                // Unit variant's wire payload is `()` ("VariantName": null).
+                wc.predicates.push(syn::parse_quote!(
+                    (): #krate::Deserialize<
+                        'de,
+                        <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            for cv in &tagged_non_other {
+                let pty: Option<syn::Type> = match &cv.kind {
+                    VariantKind::Newtype(ty) => Some(syn::parse_quote!(#ty)),
+                    VariantKind::Struct(_) => {
+                        let id = format_ident!("__Variant{}", cv.index);
+                        Some(syn::parse_quote!(#id))
+                    }
+                    VariantKind::Tuple(_) => {
+                        let id = format_ident!("__TupleVariant{}", cv.index);
+                        Some(syn::parse_quote!(#id))
+                    }
+                    VariantKind::Unit => None,
+                };
+                if let Some(pty) = pty {
+                    for lt in borrow_lifetimes(&pty, &None) {
+                        wc.predicates.push(syn::parse_quote!('de: #lt));
+                    }
+                    wc.predicates.push(syn::parse_quote!(
+                        #pty: #krate::Deserialize<
+                            'de,
+                            <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                            Extra = ()
+                        >
+                    ));
+                }
+            }
+        }
+    }
+    let (mfp_impl_generics, _, mfp_where_clause) = mfp_impl_gen.split_for_impl();
+
+    // Candidates for the MatchVals key race: (wire_name, local_variant_idx).
+    let match_cands_tokens: Vec<TokenStream2> = tagged_non_other
+        .iter()
+        .enumerate()
+        .flat_map(|(i, cv)| {
+            let mut v = vec![{
+                let wn = &cv.wire_name;
+                quote! { (#wn, #i) }
+            }];
+            for alias in &cv.aliases {
+                v.push(quote! { (#alias, #i) });
+            }
+            v
+        })
+        .collect();
+
+    // wire_names() candidates: every wire name/alias, all at (relative) arm index 0 —
+    // this flatten field only ever contributes one arm, regardless of variant count.
+    let wire_names_tokens: Vec<TokenStream2> = tagged_non_other
+        .iter()
+        .flat_map(|cv| {
+            let mut v = vec![{
+                let wn = &cv.wire_name;
+                quote! { (#wn, 0usize) }
+            }];
+            for alias in &cv.aliases {
+                v.push(quote! { (#alias, 0usize) });
+            }
+            v
+        })
+        .collect();
+
+    let val_arms: Vec<TokenStream2> = tagged_non_other
+        .iter()
+        .enumerate()
+        .map(|(i, cv)| {
+            let vname = &cv.variant.ident;
+            match &cv.kind {
+                VariantKind::Unit => quote! {
+                    #i => {
+                        let (__vc, ()) = #krate::hit!(__vp.deserialize_value::<()>(()).await);
+                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, #name::#vname))))
+                    }
+                },
+                VariantKind::Newtype(ty) => quote! {
+                    #i => {
+                        let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#ty>(()).await);
+                        ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, #name::#vname(__v)))))
+                    }
+                },
+                VariantKind::Struct(fields) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    let field_names: Vec<_> =
+                        fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    quote! {
+                        #i => {
+                            let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#helper_name>(()).await);
+                            ::core::result::Result::Ok(#krate::Probe::Hit((
+                                __vc,
+                                (__k, #name::#vname { #( #field_names: __v.#field_names, )* }),
+                            )))
+                        }
+                    }
+                }
+                VariantKind::Tuple(fields) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    let field_indices: Vec<syn::Index> =
+                        (0..fields.len()).map(syn::Index::from).collect();
+                    quote! {
+                        #i => {
+                            let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#helper_name>(()).await);
+                            ::core::result::Result::Ok(#krate::Probe::Hit((
+                                __vc,
+                                (__k, #name::#vname( #( __v.#field_indices, )* )),
+                            )))
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
+            #mfp_where_clause
+        {
+            // `(MapArmBase, MapArmSlot)`'s real Outputs shape is
+            // `(MapArmBase::Outputs, Option<(K, V)>)` = `((), Option<(K, V)>)` —
+            // one left-nesting level per arm, base contributes `()`.
+            type Outputs = (
+                (),
+                ::core::option::Option<(
+                    #krate::MatchVals<usize, [(&'static str, usize); #n_cands]>,
+                    #name #ty_generics,
+                )>,
+            );
+            const ARMS: usize = 1usize;
+            type WireNames = [(&'static str, usize); #n_cands];
+
+            fn wire_names() -> Self::WireNames {
+                [#( #wire_names_tokens, )*]
+            }
+
+            fn make_arms() -> impl #krate::MapArmStack<'de, __KP2, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                (
+                    #krate::MapArmBase,
+                    #krate::MapArmSlot::new(
+                        |mut __kp: __KP2, _i: usize| __kp.deserialize_key::<
+                            #krate::MatchVals<usize, [(&'static str, usize); #n_cands]>
+                        >([#( #match_cands_tokens, )*]),
+                        |__vp: #krate::borrow::VP<'de, __KP2>,
+                         __k: #krate::MatchVals<usize, [(&'static str, usize); #n_cands]>| async move {
+                            match __k.0 {
+                                #( #val_arms )*
+                                _ => ::core::unreachable!(),
+                            }
+                        },
+                    ),
+                )
+            }
+
+            fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                let ((), __opt) = __outputs;
+                __opt.map(|(_k, __v)| __v)
+            }
+        }
+    }
+}
+
+/// Emit `MapFieldProvider<'de, __KP2>` for an internally-tagged enum so it can
+/// be used as a `#[strede(flatten)]` field's type.
+///
+/// Unlike external tagging (one arm, no ambiguity), internally-tagged
+/// variants may share the same map as the parent struct and the tag key
+/// isn't guaranteed to arrive first, so every non-`other` variant races its
+/// own fields concurrently via the `CandidateArmStack` runtime primitive
+/// (`strede/src/map_arm/{mod,borrow,owned}.rs`) until the tag key resolves,
+/// at which point every other candidate permanently stops racing. Struct
+/// variants reuse their existing `__VariantN` helper's `MapFieldProvider`
+/// impl (already ported to compose nested `#[flatten]` fields via
+/// `StackConcat` — see `gen_struct_variant_helpers_borrow`) unchanged; a
+/// unit variant contributes zero arms (`MapArmBase`) and resolves the
+/// instant the tag selects it; a newtype variant's inner type must itself be
+/// map-shaped (`MapFieldProvider`), the same restriction internally-tagged
+/// enums already impose on their standalone (non-flatten) dispatch. Tuple
+/// variants are rejected here: their standalone dispatch already requires a
+/// map-shaped payload, and no map-shaped tuple helper exists.
+///
+/// `#[strede(other)]` is not supported through this arm (never a flatten
+/// candidate, identical to the externally-tagged precedent above).
+///
+/// Tuple variants and enums mixing tagged with `#[strede(untagged)]`
+/// variants are structurally unsupported (the former: no map-shaped tuple
+/// helper exists; the latter: `CandidateArmStack`'s `NoTag`/untagged support
+/// is deferred — TESTING_GAPS.md item #3(B-2)). Neither is rejected via a
+/// hard `syn::Error` here, because this impl is emitted unconditionally for
+/// *every* internally-tagged enum (mirroring the externally-tagged
+/// precedent) regardless of whether it's ever actually used as a flatten
+/// target — hard-erroring here would break compilation of such an enum's
+/// ordinary standalone derive. Instead, both cases bake an unconditionally
+/// unsatisfiable bound into this impl's where-clause (a tuple variant's
+/// helper type genuinely has no `MapFieldProvider` impl; a mixed-untagged
+/// enum gets `(): FlattenUnsupported`, which nothing implements). Rust does
+/// not eagerly check where-clause satisfiability at impl-definition time, so
+/// the enum's own derive still compiles; only an actual attempt to flatten
+/// such an enum fails, with a "trait bound not satisfied" error surfacing at
+/// the flattening struct's own derive-generated code — i.e. "at the point
+/// flatten is applied", not at this enum's definition.
+fn gen_enum_candidate_map_field_provider_borrow(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    tag_field: &str,
+    krate: &syn::Path,
+    container_attrs: &crate::common::ContainerAttrs,
+    orig_generics: &syn::Generics,
+) -> TokenStream2 {
+    let (_, ty_generics, _) = orig_generics.split_for_impl();
+
+    let has_untagged_mix = classified.iter().any(|cv| cv.untagged);
+
+    let candidates: Vec<(usize, &ClassifiedVariant)> = classified
+        .iter()
+        .filter(|cv| !cv.other)
+        .enumerate()
+        .collect();
+
+    let tag_cands_tokens: Vec<TokenStream2> = candidates
+        .iter()
+        .flat_map(|(i, cv)| {
+            let mut v = vec![{
+                let wn = &cv.wire_name;
+                quote! { (#wn, #i) }
+            }];
+            for alias in &cv.aliases {
+                v.push(quote! { (#alias, #i) });
+            }
+            v
+        })
+        .collect();
+
+    // --- impl generics: 'de, __KP2: MapKeyProbe<'de> ---
+    let mut mfp_impl_gen = orig_generics.clone();
+    {
+        let has_de = mfp_impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+        if !has_de {
+            mfp_impl_gen.params.insert(0, syn::parse_quote!('de));
+        }
+        mfp_impl_gen
+            .params
+            .push(syn::parse_quote!(__KP2: #krate::MapKeyProbe<'de>));
+        let wc = mfp_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in orig_generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::Deserialize<
+                        'de,
+                        <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            if has_untagged_mix {
+                // Never satisfied - see the function doc comment above. Must
+                // bind to `__KP2` (still abstract here), not a concrete type
+                // like `()` - a concrete never-implemented bound is proven
+                // impossible eagerly, breaking this enum's own derive; a
+                // bound on a still-generic parameter defers to the first
+                // actual flatten use site instead.
+                wc.predicates
+                    .push(syn::parse_quote!(__KP2: #krate::FlattenUnsupported));
+            }
+            for (_, cv) in &candidates {
+                match &cv.kind {
+                    VariantKind::Struct(_) => {
+                        let helper_name = format_ident!("__Variant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Newtype(ty) => {
+                        for lt in borrow_lifetimes(ty, &None) {
+                            wc.predicates.push(syn::parse_quote!('de: #lt));
+                        }
+                        wc.predicates.push(syn::parse_quote!(
+                            #ty: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Tuple(_) => {
+                        // No map-shaped tuple helper exists - this bound is
+                        // never satisfiable, same rationale as `FlattenUnsupported`
+                        // above but via the tuple helper's genuinely-absent impl.
+                        let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Unit => {}
+                }
+            }
+        }
+    }
+    let (mfp_impl_generics, _, mfp_where_clause) = mfp_impl_gen.split_for_impl();
+
+    let arms_const_tokens: TokenStream2 = {
+        let terms: Vec<TokenStream2> = candidates
+            .iter()
+            .map(|(_, cv)| match &cv.kind {
+                VariantKind::Unit => quote! { 0usize },
+                VariantKind::Newtype(ty) => {
+                    quote! { <#ty as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+                VariantKind::Struct(_) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    quote! { <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+                VariantKind::Tuple(_) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    quote! { <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+            })
+            .collect();
+        quote! { 1usize #( + #terms )* }
+    };
+
+    let candidate_pieces: Vec<TokenStream2> = candidates
+        .iter()
+        .map(|(i, cv)| {
+            let vname = &cv.variant.ident;
+            match &cv.kind {
+                VariantKind::Unit => quote! {
+                    #i => #krate::MapArmBase => |()| ::core::option::Option::Some(#name::#vname)
+                },
+                VariantKind::Newtype(ty) => quote! {
+                    #i => <#ty as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                        => |__o| <#ty as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o).map(#name::#vname)
+                },
+                VariantKind::Struct(fields) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    let field_names: Vec<_> =
+                        fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    quote! {
+                        #i => <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                            => |__o| <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o)
+                                .map(|__v| #name::#vname { #( #field_names: __v.#field_names, )* })
+                    }
+                }
+                VariantKind::Tuple(fields) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    let field_indices: Vec<syn::Index> =
+                        (0..fields.len()).map(syn::Index::from).collect();
+                    quote! {
+                        #i => <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                            => |__o| <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o)
+                                .map(|__v| #name::#vname( #( __v.#field_indices, )* ))
+                    }
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
+            #mfp_where_clause
+        {
+            type Outputs = ::core::option::Option<#name #ty_generics>;
+            const ARMS: usize = #arms_const_tokens;
+            type WireNames = [(&'static str, usize); 1];
+
+            fn wire_names() -> Self::WireNames {
+                [(#tag_field, 0usize)]
+            }
+
+            fn make_arms() -> impl #krate::MapArmStack<'de, __KP2, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                #krate::CandidateArmStack!(
+                    #krate::candidate_arms! { #( #candidate_pieces, )* },
+                    #tag_field,
+                    [#( #tag_cands_tokens, )*],
+                    __KP2,
+                    #krate::borrow::VP<'de, __KP2>
+                )
+            }
+
+            fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                __outputs
+            }
+        }
+    }
+}
+
+/// Emit `MapFieldProvider<'de, __KP2>` for a purely untagged enum
+/// (`#[strede(untagged)]`, no `tag`) so it can be used as a
+/// `#[strede(flatten)]` field's type.
+///
+/// Unlike internally-tagged, there is no discriminant key at all: every
+/// candidate variant's own fields race directly against the parent's shared
+/// key stream from round one, via the `NoTagCandidateArmStack` runtime
+/// primitive (`strede/src/map_arm/{mod,borrow,owned}.rs`). A candidate is
+/// permanently excluded from the race the first round some *other* live
+/// candidate's arms recognize a key that this candidate's own arms do not -
+/// proof this candidate can't be the real variant. See CLAUDE.md's "Untagged
+/// flatten" section for the full design.
+///
+/// Only struct-shaped and map-shaped-newtype candidates are viable - unlike
+/// internally-tagged, unit variants are *also* rejected here (a unit
+/// candidate contributes zero arms, so it would be trivially "always fully
+/// satisfied" from round zero with no way to select it, absent a tag).
+/// Neither restriction is enforced via a hard `syn::Error`, since this impl
+/// is emitted unconditionally for every purely-untagged enum regardless of
+/// whether it's ever actually flattened (mirroring the tag-based provider's
+/// own precedent): a unit variant anywhere pushes an unconditionally
+/// unsatisfiable `__KP2: FlattenUnsupported` bound (deferring the error to
+/// the first actual flatten use site, not this enum's own definition); a
+/// tuple variant's helper has no `MapFieldProvider` impl at all, so its own
+/// per-variant bound is unconditionally unsatisfiable the same way
+/// internally-tagged's tuple rejection already works.
+fn gen_enum_candidate_map_field_provider_untagged_borrow(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    krate: &syn::Path,
+    container_attrs: &crate::common::ContainerAttrs,
+    orig_generics: &syn::Generics,
+) -> TokenStream2 {
+    let (_, ty_generics, _) = orig_generics.split_for_impl();
+
+    let has_unit = classified
+        .iter()
+        .any(|cv| matches!(cv.kind, VariantKind::Unit));
+
+    let candidates: Vec<(usize, &ClassifiedVariant)> = classified
+        .iter()
+        .filter(|cv| !matches!(cv.kind, VariantKind::Unit))
+        .enumerate()
+        .collect();
+
+    // --- impl generics: 'de, __KP2: MapKeyProbe<'de> ---
+    let mut mfp_impl_gen = orig_generics.clone();
+    {
+        let has_de = mfp_impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+        if !has_de {
+            mfp_impl_gen.params.insert(0, syn::parse_quote!('de));
+        }
+        mfp_impl_gen
+            .params
+            .push(syn::parse_quote!(__KP2: #krate::MapKeyProbe<'de>));
+        let wc = mfp_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in orig_generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::Deserialize<
+                        'de,
+                        <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            if has_unit {
+                // Never satisfied - see the function doc comment above. Must
+                // bind to `__KP2` (still abstract here), not a concrete type
+                // like `()` - see `gen_enum_candidate_map_field_provider_borrow`'s
+                // identical `has_untagged_mix` handling for why.
+                wc.predicates
+                    .push(syn::parse_quote!(__KP2: #krate::FlattenUnsupported));
+            }
+            for (_, cv) in &candidates {
+                match &cv.kind {
+                    VariantKind::Struct(_) => {
+                        let helper_name = format_ident!("__Variant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Newtype(ty) => {
+                        for lt in borrow_lifetimes(ty, &None) {
+                            wc.predicates.push(syn::parse_quote!('de: #lt));
+                        }
+                        wc.predicates.push(syn::parse_quote!(
+                            #ty: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Tuple(_) => {
+                        // No map-shaped tuple helper exists - never
+                        // satisfiable, same trick as the internally-tagged
+                        // provider's own tuple rejection.
+                        let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::MapFieldProvider<'de, __KP2>
+                        ));
+                    }
+                    VariantKind::Unit => unreachable!("Unit excluded from `candidates` above"),
+                }
+            }
+        }
+    }
+    let (mfp_impl_generics, _, mfp_where_clause) = mfp_impl_gen.split_for_impl();
+
+    let arms_const_tokens: TokenStream2 = {
+        let terms: Vec<TokenStream2> = candidates
+            .iter()
+            .map(|(_, cv)| match &cv.kind {
+                VariantKind::Newtype(ty) => {
+                    quote! { <#ty as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+                VariantKind::Struct(_) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    quote! { <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+                VariantKind::Tuple(_) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    quote! { <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::ARMS }
+                }
+                VariantKind::Unit => unreachable!("Unit excluded from `candidates` above"),
+            })
+            .collect();
+        quote! { 0usize #( + #terms )* }
+    };
+
+    let candidate_pieces: Vec<TokenStream2> = candidates
+        .iter()
+        .map(|(i, cv)| {
+            let vname = &cv.variant.ident;
+            match &cv.kind {
+                VariantKind::Newtype(ty) => quote! {
+                    #i => <#ty as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                        => |__o| <#ty as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o).map(#name::#vname)
+                },
+                VariantKind::Struct(fields) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    let field_names: Vec<_> =
+                        fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    quote! {
+                        #i => <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                            => |__o| <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o)
+                                .map(|__v| #name::#vname { #( #field_names: __v.#field_names, )* })
+                    }
+                }
+                VariantKind::Tuple(fields) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    let field_indices: Vec<syn::Index> =
+                        (0..fields.len()).map(syn::Index::from).collect();
+                    quote! {
+                        #i => <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::make_arms()
+                            => |__o| <#helper_name as #krate::MapFieldProvider<'de, __KP2>>::from_outputs(__o)
+                                .map(|__v| #name::#vname( #( __v.#field_indices, )* ))
+                    }
+                }
+                VariantKind::Unit => unreachable!("Unit excluded from `candidates` above"),
+            }
+        })
+        .collect();
+
+    // `candidate_arms!` requires at least one entry - an enum whose every
+    // variant is Unit (already permanently blocked via `has_unit` above)
+    // falls back to a plain `CandidateBase` so the body still type-checks.
+    let candidates_expr = if candidate_pieces.is_empty() {
+        quote! { #krate::CandidateBase }
+    } else {
+        quote! { #krate::candidate_arms! { #( #candidate_pieces, )* } }
+    };
+
+    quote! {
+        impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
+            #mfp_where_clause
+        {
+            type Outputs = ::core::option::Option<#name #ty_generics>;
+            const ARMS: usize = #arms_const_tokens;
+            type WireNames = [(&'static str, usize); 0];
+
+            fn wire_names() -> Self::WireNames {
+                []
+            }
+
+            fn make_arms() -> impl #krate::MapArmStack<'de, __KP2, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                #krate::NoTagCandidateArmStack::new(#candidates_expr)
+            }
+
+            fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                __outputs
+            }
+        }
+    }
+}
+
+/// Generates the `MapFieldProvider<'de, __KP2>` impl for an adjacently-tagged
+/// enum (`#[strede(tag = "t", content = "c")]`) used as a
+/// `#[strede(flatten)]` target.
+///
+/// Unlike internally-tagged's `CandidateArmStack` (whose arm count scales
+/// with every candidate's own field count, since fields are spread into the
+/// shared parent key space), this contributes exactly 2 fixed arms
+/// regardless of variant count: one for `tag_field`, one for `content_field`.
+/// Per-candidate arms sharing the identical `content_field` key would let the
+/// first-declared candidate always win the key race regardless of type (see
+/// `race_keys`'s declaration-order tie-break) - the content arm instead
+/// always races every non-unit candidate's `deserialize_value::<CandidateType>()`
+/// against forked copies of the same value probe, sequentially trying each
+/// in turn (safe in the borrow family only - the whole buffer is already
+/// materialized, no streaming deadlock risk; see `gen_untagged_probe_chain_borrow`
+/// for the same convention). The tag/content cross-check is deferred to
+/// `from_outputs`, mirroring the standalone adjacent-tagged path's own final
+/// `match (opt_tag, opt_content) { ... }` check.
+#[allow(clippy::too_many_arguments)]
+fn gen_enum_candidate_map_field_provider_adjacent_borrow(
+    name: &syn::Ident,
+    classified: &[ClassifiedVariant],
+    tag_field: &str,
+    content_field: &str,
+    krate: &syn::Path,
+    container_attrs: &crate::common::ContainerAttrs,
+    orig_generics: &syn::Generics,
+) -> TokenStream2 {
+    let (_, ty_generics, _) = orig_generics.split_for_impl();
+
+    let has_untagged_mix = classified.iter().any(|cv| cv.untagged);
+
+    let variant_candidates: Vec<(String, usize)> = classified
+        .iter()
+        .filter(|cv| !cv.untagged)
+        .enumerate()
+        .flat_map(|(local_idx, cv)| {
+            let mut pairs = vec![(cv.wire_name.clone(), local_idx)];
+            for alias in &cv.aliases {
+                pairs.push((alias.clone(), local_idx));
+            }
+            pairs
+        })
+        .collect();
+    let tag_cands_entries: Vec<TokenStream2> = variant_candidates
+        .iter()
+        .map(|(wn, idx)| quote! { (#wn, #idx) })
+        .collect();
+    let tag_cands_count = variant_candidates.len();
+
+    let tagged: Vec<(usize, &ClassifiedVariant)> = classified
+        .iter()
+        .filter(|cv| !cv.untagged)
+        .enumerate()
+        .collect();
+    let unit_variants: Vec<_> = tagged
+        .iter()
+        .filter(|(_, cv)| matches!(cv.kind, VariantKind::Unit))
+        .collect();
+    let nonunit_variants: Vec<_> = tagged
+        .iter()
+        .filter(|(_, cv)| !matches!(cv.kind, VariantKind::Unit))
+        .collect();
+
+    // --- impl generics: 'de, __KP2: MapKeyProbe<'de> ---
+    let mut mfp_impl_gen = orig_generics.clone();
+    {
+        let has_de = mfp_impl_gen.lifetimes().any(|l| l.lifetime.ident == "de");
+        if !has_de {
+            mfp_impl_gen.params.insert(0, syn::parse_quote!('de));
+        }
+        mfp_impl_gen
+            .params
+            .push(syn::parse_quote!(__KP2: #krate::MapKeyProbe<'de>));
+        let wc = mfp_impl_gen.make_where_clause();
+        if let Some(preds) = &container_attrs.bound {
+            wc.predicates.extend(preds.iter().cloned());
+        } else {
+            for tp in orig_generics.type_params() {
+                let ident = &tp.ident;
+                wc.predicates.push(syn::parse_quote!(
+                    #ident: #krate::Deserialize<
+                        'de,
+                        <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                        Extra = ()
+                    >
+                ));
+            }
+            if has_untagged_mix {
+                // Never satisfied - same rationale as the internally-tagged
+                // provider's own `has_untagged_mix` handling (see
+                // `gen_enum_candidate_map_field_provider_borrow` above and
+                // CLAUDE.md's flatten section): must bind to the still-abstract
+                // `__KP2`, not a concrete type, so this enum's own derive
+                // still compiles and only an actual flatten attempt surfaces
+                // the error.
+                wc.predicates
+                    .push(syn::parse_quote!(__KP2: #krate::FlattenUnsupported));
+            }
+            for &(_, cv) in &nonunit_variants {
+                match &cv.kind {
+                    VariantKind::Struct(_) => {
+                        let helper_name = format_ident!("__Variant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::Deserialize<
+                                'de,
+                                <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                                Extra = ()
+                            >
+                        ));
+                    }
+                    VariantKind::Tuple(_) => {
+                        let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                        wc.predicates.push(syn::parse_quote!(
+                            #helper_name: #krate::Deserialize<
+                                'de,
+                                <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                                Extra = ()
+                            >
+                        ));
+                    }
+                    VariantKind::Newtype(ty) => {
+                        for lt in borrow_lifetimes(ty, &None) {
+                            wc.predicates.push(syn::parse_quote!('de: #lt));
+                        }
+                        wc.predicates.push(syn::parse_quote!(
+                            #ty: #krate::Deserialize<
+                                'de,
+                                <#krate::borrow::VP<'de, __KP2> as #krate::MapValueProbe<'de>>::ValueSubDeserializer,
+                                Extra = ()
+                            >
+                        ));
+                    }
+                    VariantKind::Unit => {}
+                }
+            }
+        }
+    }
+    let (mfp_impl_generics, _, mfp_where_clause) = mfp_impl_gen.split_for_impl();
+
+    // --- content arm: sequential try-in-order race over non-unit candidates ---
+    let n_nonunit = nonunit_variants.len();
+    let vp_idents: Vec<syn::Ident> = (0..n_nonunit)
+        .map(|i| {
+            if i + 1 == n_nonunit {
+                format_ident!("__vp")
+            } else {
+                format_ident!("__vp_{}", i)
+            }
+        })
+        .collect();
+    let fork_decls: Vec<TokenStream2> = (0..n_nonunit.saturating_sub(1))
+        .map(|i| {
+            let ident = &vp_idents[i];
+            quote! { let mut #ident = __vp.fork(); }
+        })
+        .collect();
+    let content_race_arms: Vec<TokenStream2> = nonunit_variants
+        .iter()
+        .enumerate()
+        .map(|(i, &(local_idx, cv))| {
+            let vname = &cv.variant.ident;
+            let vp_ident = &vp_idents[i];
+            let (de_type, construction) = match &cv.kind {
+                VariantKind::Newtype(ty) => (quote! { #ty }, quote! { #name::#vname(__v) }),
+                VariantKind::Struct(fields) => {
+                    let helper_name = format_ident!("__Variant{}", cv.index);
+                    let field_names: Vec<_> =
+                        fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                    (
+                        quote! { #helper_name },
+                        quote! { #name::#vname { #( #field_names: __v.#field_names, )* } },
+                    )
+                }
+                VariantKind::Tuple(fields) => {
+                    let helper_name = format_ident!("__TupleVariant{}", cv.index);
+                    let field_indices: Vec<syn::Index> =
+                        (0..fields.len()).map(syn::Index::from).collect();
+                    (
+                        quote! { #helper_name },
+                        quote! { #name::#vname( #( __v.#field_indices, )* ) },
+                    )
+                }
+                VariantKind::Unit => unreachable!(),
+            };
+            quote! {
+                match #vp_ident.deserialize_value::<#de_type>(()).await? {
+                    #krate::Probe::Hit((__vc, __v)) => {
+                        return ::core::result::Result::Ok(
+                            #krate::Probe::Hit((__vc, (#krate::Match, (#local_idx, #construction))))
+                        );
+                    }
+                    #krate::Probe::Miss => {}
+                }
+            }
+        })
+        .collect();
+
+    let unit_match_arms: Vec<TokenStream2> = unit_variants
+        .iter()
+        .map(|&(local_idx, cv)| {
+            let vname = &cv.variant.ident;
+            quote! { #local_idx => ::core::option::Option::Some(#name::#vname), }
+        })
+        .collect();
+
+    // `__vp` only needs `mut` when at least one `.fork()` call is emitted
+    // (two or more non-unit candidates); an all-unit enum never touches
+    // `__vp` at all, so it needs an explicit `let _ =` to avoid an
+    // unused-variable warning instead.
+    let vp_mut = if n_nonunit >= 2 {
+        quote! { mut }
+    } else {
+        quote! {}
+    };
+    let unused_vp_guard = if n_nonunit == 0 {
+        quote! { let _ = &__vp; }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
+            #mfp_where_clause
+        {
+            type Outputs = (
+                (
+                    (),
+                    ::core::option::Option<(
+                        #krate::Match,
+                        #krate::MatchVals<usize, [(&'static str, usize); #tag_cands_count]>,
+                    )>,
+                ),
+                ::core::option::Option<(#krate::Match, (usize, #name #ty_generics))>,
+            );
+            const ARMS: usize = 2;
+            type WireNames = [(&'static str, usize); 2];
+
+            fn wire_names() -> Self::WireNames {
+                [(#tag_field, 0usize), (#content_field, 1usize)]
+            }
+
+            fn make_arms() -> impl #krate::MapArmStack<'de, __KP2, Outputs = Self::Outputs, Dynamic = #krate::False> {
+                (
+                    (#krate::MapArmBase,
+                     #krate::MapArmSlot::new(
+                         |mut __kp: __KP2, _i: usize| __kp.deserialize_key::<#krate::Match>(#tag_field),
+                         |__vp: #krate::borrow::VP<'de, __KP2>, __k| async move {
+                             let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<
+                                 #krate::MatchVals<usize, [(&'static str, usize); #tag_cands_count]>
+                             >([#( #tag_cands_entries, )*]).await);
+                             ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                         },
+                     )),
+                    #krate::MapArmSlot::new(
+                        |mut __kp: __KP2, _i: usize| __kp.deserialize_key::<#krate::Match>(#content_field),
+                        move |#vp_mut __vp: #krate::borrow::VP<'de, __KP2>, __k| async move {
+                            let _ = &__k;
+                            #unused_vp_guard
+                            #( #fork_decls )*
+                            #( #content_race_arms )*
+                            ::core::result::Result::Ok(#krate::Probe::Miss)
+                        },
+                    ),
+                )
+            }
+
+            fn from_outputs(__outputs: Self::Outputs) -> ::core::option::Option<Self> {
+                let ((_, __opt_tag), __opt_content) = __outputs;
+                match (__opt_tag, __opt_content) {
+                    (
+                        ::core::option::Option::Some((_, #krate::MatchVals(__tag_idx, _))),
+                        ::core::option::Option::None,
+                    ) => match __tag_idx {
+                        #( #unit_match_arms )*
+                        _ => ::core::option::Option::None,
+                    },
+                    (
+                        ::core::option::Option::Some((_, #krate::MatchVals(__tag_idx, _))),
+                        ::core::option::Option::Some((_, (__content_idx, __v))),
+                    ) => {
+                        if __tag_idx == __content_idx {
+                            ::core::option::Option::Some(__v)
+                        } else {
+                            ::core::option::Option::None
+                        }
+                    }
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    }
 }
 
 /// All untagged — emit two-impl pattern via `deserialize_value_by_shape`.
@@ -1354,6 +2757,21 @@ fn expand_enum_internally_tagged(
         .iter()
         .any(|cv| !cv.untagged && !matches!(cv.kind, VariantKind::Unit));
 
+    // Regenerated in both branches (unconditionally, over the full
+    // `classified` list) so struct/tuple helper types always exist for any
+    // struct/tuple-kind variant - including an untagged non-unit variant
+    // mixed alongside an otherwise all-unit tagged set, which the unit-only
+    // branch below would otherwise reference in the flatten `MapFieldProvider`
+    // impl without ever having defined.
+    let flatten_provider = gen_enum_candidate_map_field_provider_borrow(
+        name,
+        classified,
+        tag_field,
+        krate,
+        container_attrs,
+        orig_generics,
+    );
+
     let (de_call, helpers) = if !has_nonunit {
         let body = expand_borrow_internally_tagged_unit_only(
             name,
@@ -1362,6 +2780,9 @@ fn expand_enum_internally_tagged(
             &variant_candidates,
             krate,
         )?;
+        let struct_helpers =
+            gen_struct_variant_helpers_borrow(classified, krate, container_attrs.rename_all);
+        let tuple_helpers = gen_tuple_variant_helpers_borrow(classified, krate);
         (
             quote! {
                 d.entry(|[__e]| async {
@@ -1369,17 +2790,28 @@ fn expand_enum_internally_tagged(
                     #body
                 }).await
             },
-            quote! {},
+            quote! {
+                #struct_helpers
+                #tuple_helpers
+                #flatten_provider
+            },
         )
     } else {
-        expand_borrow_internally_tagged_with_nonunit(
+        let (body, helpers) = expand_borrow_internally_tagged_with_nonunit(
             name,
             classified,
             tag_field,
             &variant_candidates,
             krate,
             container_attrs,
-        )?
+        )?;
+        (
+            body,
+            quote! {
+                #helpers
+                #flatten_provider
+            },
+        )
     };
 
     // --- Build single Deserialize<'de, __D> impl ---
@@ -1762,6 +3194,21 @@ fn expand_enum_adjacent_tagged_borrow(
         )?
     };
 
+    // Emitted unconditionally (regardless of unit-only vs. with-nonunit
+    // above) so this enum can be used as someone else's `#[strede(flatten)]`
+    // target no matter which dispatch shape its own standalone path takes -
+    // mirrors internally-tagged's identical rationale.
+    let flatten_provider = gen_enum_candidate_map_field_provider_adjacent_borrow(
+        name,
+        classified,
+        tag_field,
+        content_field,
+        krate,
+        container_attrs,
+        orig_generics,
+    );
+    let helpers = quote! { #helpers #flatten_provider };
+
     // --- Build single Deserialize<'de, __D> impl ---
     let mut de_impl_gen = orig_generics.clone();
     insert_de_and_d_borrow(&mut de_impl_gen, krate);
@@ -2043,41 +3490,4 @@ fn expand_borrow_adjacent_tagged_with_nonunit(
     };
 
     Ok((body, helpers))
-}
-
-/// Generate per-field finalization: extract from Option, applying defaults where configured.
-fn gen_field_finalizers(
-    field_names: &[&syn::Ident],
-    acc_names: &[syn::Ident],
-    classified_fields: &[crate::common::ClassifiedField],
-    krate: &syn::Path,
-) -> Vec<TokenStream2> {
-    field_names
-        .iter()
-        .zip(acc_names.iter())
-        .zip(classified_fields.iter())
-        .map(|((fname, acc), cf)| {
-            if cf.skip_deserializing {
-                let default_expr = match &cf.default {
-                    Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
-                    Some(DefaultAttr::Expr(expr)) => {
-                        quote! { #krate::DefaultWrapper(#expr).value() }
-                    }
-                    None => unreachable!("validated in classify_fields"),
-                };
-                return quote! { let #fname = #default_expr; };
-            }
-            let none_branch = match &cf.default {
-                Some(DefaultAttr::Trait) => quote! { ::core::default::Default::default() },
-                Some(DefaultAttr::Expr(expr)) => quote! { #krate::DefaultWrapper(#expr).value() },
-                None => quote! { return ::core::result::Result::Ok(#krate::Probe::Miss) },
-            };
-            quote! {
-                let #fname = match #acc {
-                    ::core::option::Option::Some((_k, __v)) => __v,
-                    ::core::option::Option::None => #none_branch,
-                };
-            }
-        })
-        .collect()
 }

@@ -2,7 +2,7 @@
 //!
 //! Exercises a hand-written `deserialize` function (CBOR text string
 //! `"#rrggbb"` -> `u32`) plugged into a derived struct field.
-
+#![cfg(feature = "alloc")]
 extern crate std;
 mod helpers;
 

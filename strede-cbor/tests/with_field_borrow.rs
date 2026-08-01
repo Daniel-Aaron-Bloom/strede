@@ -1,7 +1,7 @@
 //! Borrow-family `#[strede(with = "module")]` fixture (field level).
 //!
 //! `with` is shorthand for setting `deserialize_with` to `module::deserialize`.
-
+#![cfg(feature = "alloc")]
 extern crate std;
 mod helpers;
 

@@ -18,6 +18,7 @@ jobs:
         with:
           toolchain: "1.89"
       - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --all-features
 
   test:
     name: Test (${{ matrix.rust }})
@@ -32,6 +33,20 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
+      # strede/strede-bench are excluded: both request strede's own default
+      # (std) feature, and Cargo unifies features workspace-wide in a single
+      # invocation, so leaving them in would silently re-enable std/alloc for
+      # every format crate and defeat the point of this job.
+      - name: Test format crates in true no_std/no-alloc isolation
+        run: cargo test --workspace --exclude strede --exclude strede-bench --no-default-features
+      # `--all-features` always turns on `alloc` alongside `arbitrary_precision`,
+      # so the "arbitrary_precision but no alloc" branch in strede-json's
+      # number/mod.rs (NumberOwned falls back to fixed-precision N instead of
+      # allocating a String) is otherwise only ever compile-checked. See
+      # TESTING_GAPS.md item #11.
+      - name: Test strede-json with arbitrary_precision but no alloc
+        run: cargo test -p strede-json --no-default-features --features arbitrary_precision
 
   clippy:
     name: Clippy
@@ -43,6 +58,7 @@ jobs:
           toolchain: "1.89"
           components: clippy
       - run: cargo clippy --workspace --all-targets -- -Dwarnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -Dwarnings
 
   fmt:
     name: Format

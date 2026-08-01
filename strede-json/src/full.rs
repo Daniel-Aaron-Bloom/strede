@@ -226,7 +226,18 @@ pub(crate) fn skip_value(src: &mut &[u8], tok: Token) -> Result<Tokenizer, JsonE
     match tok {
         Token::Simple(SimpleToken::Null | SimpleToken::Bool(_), tok) => Ok(tok),
         Token::Number(mut access) => {
-            while access.next_chunk(src)?.is_some() {}
+            // A JSON number is the only value type with no closing delimiter,
+            // so `src` running out mid-scan is only a real error when the
+            // digit sequence isn't already at a valid stopping point - see
+            // `JsonNumberAccess::next_number_chunk`'s identical handling.
+            loop {
+                match access.next_chunk(src) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(JsonError::UnexpectedEnd) if access.is_terminal() => break,
+                    Err(e) => return Err(e),
+                }
+            }
             Ok(Tokenizer::new())
         }
         Token::Str(mut access) => {
@@ -643,6 +654,17 @@ impl<'de, Enc: NumberEncoding> NumberAccess<Enc> for JsonNumberAccess<'de> {
                 tokenizer: Tokenizer::new(),
                 src: self.src,
             })),
+            // `self.src` is the whole remaining input, already fully in memory -
+            // there is no refill to attempt, so running out of bytes here is
+            // always the genuine end of the stream, never "more data is
+            // coming". A terminal number state at that point is a valid place
+            // to stop; a non-terminal one is a real truncation.
+            Err(JsonError::UnexpectedEnd) if self.access.is_terminal() => {
+                Ok(Chunk::Done(JsonClaim {
+                    tokenizer: Tokenizer::new(),
+                    src: self.src,
+                }))
+            }
             Err(e) => Err(e),
         }
     }
@@ -874,7 +896,7 @@ async fn json_map_iterate<'de, S: MapArmStack<'de, JsonMapKeyProbe<'de>>>(
             None => unreachable!(),
         };
 
-        match arms.race_keys(key_probe).await? {
+        match arms.race_keys::<true>(key_probe).await? {
             Probe::Miss => return Ok(Probe::Miss),
             Probe::Hit((arm_index, key_claim)) => {
                 let value_probe = key_claim.into_value_probe().await?;
@@ -1124,7 +1146,18 @@ macro_rules! impl_deserialize_number_borrowed {
                     match e.token {
                         Token::Number(mut access) => {
                             let mut src = e.src;
-                            while access.next_chunk(&mut src)?.is_some() {}
+                            // See `skip_value`'s identical handling: a number
+                            // is the only value type with no closing
+                            // delimiter, so running out of `src` is only a
+                            // real error when not already at a valid stop.
+                            loop {
+                                match access.next_chunk(&mut src) {
+                                    Ok(Some(_)) => continue,
+                                    Ok(None) => break,
+                                    Err(JsonError::UnexpectedEnd) if access.is_terminal() => break,
+                                    Err(e) => return Err(e),
+                                }
+                            }
                             let consumed = e.start_src.len() - src.len();
                             let raw = core::str::from_utf8(&e.start_src[..consumed])
                                 .map_err(|_| JsonError::InvalidNumber)?;
@@ -1228,7 +1261,7 @@ impl<'de> EnumAccess<'de> for JsonEnumAccess<'de> {
             src: self.src,
             start_src: self.start_src,
         };
-        let (_idx, claim) = hit!(arms.race(vp).await);
+        let (_idx, claim) = hit!(arms.race::<true>(vp).await);
         let outputs = arms.take_outputs();
         Ok(Probe::Hit((claim, outputs)))
     }

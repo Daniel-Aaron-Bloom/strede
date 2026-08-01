@@ -5,6 +5,7 @@
 //! no zero-copy `&str` borrow.
 
 #![recursion_limit = "256"]
+#![cfg(feature = "alloc")]
 
 #[macro_use]
 mod helpers;

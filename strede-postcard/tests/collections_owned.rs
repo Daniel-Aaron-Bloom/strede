@@ -3,24 +3,22 @@
 //! `collections_borrow.rs`; `Vec<&str>` becomes `Vec<String>`.
 
 #![recursion_limit = "256"]
+#![cfg(feature = "alloc")]
 
 #[macro_use]
 mod helpers;
 use helpers::*;
 
-#[cfg(feature = "alloc")]
 use strede_derive::DeserializeOwned;
 use strede_postcard::PostcardError;
 
 // --- Vec<u32> ---
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u32_empty() {
     assert_eq!(parse_owned!(Vec<u32>, &pseq(&[])), Ok(Some(vec![])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u32_single() {
     let elem = varint(42);
@@ -28,7 +26,6 @@ fn vec_u32_single() {
     assert_eq!(parse_owned!(Vec<u32>, &data), Ok(Some(vec![42u32])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u32_multiple() {
     let e1 = varint(1);
@@ -38,7 +35,6 @@ fn vec_u32_multiple() {
     assert_eq!(parse_owned!(Vec<u32>, &data), Ok(Some(vec![1u32, 2, 3])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u32_truncated_errors() {
     // Count says 2 but only 1 element follows.
@@ -52,13 +48,11 @@ fn vec_u32_truncated_errors() {
 
 // --- Vec<String> (owned-family stand-in for Vec<&str>) ---
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_str_empty() {
     assert_eq!(parse_owned!(Vec<String>, &pseq(&[])), Ok(Some(vec![])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_str_values() {
     let s1 = pstr("foo");
@@ -72,27 +66,23 @@ fn vec_str_values() {
 
 // --- Vec<Struct> ---
 
-#[cfg(feature = "alloc")]
 #[derive(Debug, PartialEq, DeserializeOwned)]
 struct Point {
     x: u32,
     y: u32,
 }
 
-#[cfg(feature = "alloc")]
 fn encode_point(x: u64, y: u64) -> Vec<u8> {
     let mut v = varint(x);
     v.extend_from_slice(&varint(y));
     v
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_struct_empty() {
     assert_eq!(parse_owned!(Vec<Point>, &pseq(&[])), Ok(Some(vec![])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_struct_single() {
     let p = encode_point(3, 7);
@@ -103,7 +93,6 @@ fn vec_struct_single() {
     );
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_struct_multiple() {
     let p1 = encode_point(1, 2);
@@ -117,13 +106,11 @@ fn vec_struct_multiple() {
 
 // --- Vec<u8> as bytes (pbytes wire format) ---
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u8_bytes_empty() {
     assert_eq!(parse_owned!(Vec<u8>, &pbytes(&[])), Ok(Some(vec![])));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u8_bytes_values() {
     assert_eq!(
@@ -132,7 +119,6 @@ fn vec_u8_bytes_values() {
     );
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn vec_u8_bytes_high_values() {
     // Values 128-255: the seq path would misparse these (varint != raw byte).
@@ -142,13 +128,11 @@ fn vec_u8_bytes_high_values() {
 
 // --- Option<Vec<u32>> ---
 
-#[cfg(feature = "alloc")]
 #[test]
 fn option_vec_none() {
     assert_eq!(parse_owned!(Option<Vec<u32>>, &pnone()), Ok(Some(None)));
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn option_vec_some_empty() {
     let inner = pseq(&[]);
@@ -159,7 +143,6 @@ fn option_vec_some_empty() {
     );
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn option_vec_some_values() {
     let e1 = varint(10);

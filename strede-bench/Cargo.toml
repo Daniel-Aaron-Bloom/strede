@@ -10,7 +10,7 @@ name = "json"
 harness = false
 
 [dependencies]
-strede = { path = "../strede" }
+strede = { path = "../strede", default-features = false, features = ["std"] }
 strede-json = { path = "../strede-json" }
 strede-derive = { path = "../strede-derive", features = ["alloc"] }
 strede-test-util = { path = "../strede-test-util" }

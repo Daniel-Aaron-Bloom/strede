@@ -525,6 +525,7 @@ pub(super) fn expand_owned(
     let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
         let cf = de_classified[reg_idx];
         let val_type = &de_value_types[reg_idx];
+        let val_conv = &de_value_conversions[reg_idx];
         let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
         for alias in &cf.aliases {
             wire_names.push(alias.as_str());
@@ -563,7 +564,7 @@ pub(super) fn expand_owned(
         let val_fn = quote! {
             |__vp: #krate::owned::VP<__KP>, __k| async move {
                 let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#val_type>(()).await);
-                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #val_conv))))
             }
         };
         quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
@@ -582,7 +583,7 @@ pub(super) fn expand_owned(
                         for r in regs {
                             let cf = de_classified[*r];
                             let kt = key_type_for(cf);
-                            let vt = &de_value_types[*r];
+                            let vt = &de_field_types[*r];
                             t = quote! { (#t, ::core::option::Option<(#kt, #vt)>) };
                         }
                         t
@@ -761,7 +762,6 @@ pub(super) fn expand_owned(
                                 let cf = de_classified[*reg_idx];
                                 let fname = de_field_names[*reg_idx];
                                 let opt_ident = format_ident!("__opt_{}", reg_idx);
-                                let val_conv = &de_value_conversions[*reg_idx];
                                 let none_branch: TokenStream2 = match &cf.default {
                                     Some(DefaultAttr::Trait) => {
                                         quote! { ::core::default::Default::default() }
@@ -775,7 +775,7 @@ pub(super) fn expand_owned(
                                 };
                                 seg_stmts.push(quote! {
                                     let #fname = match #opt_ident {
-                                        ::core::option::Option::Some((_, __v)) => __v #val_conv,
+                                        ::core::option::Option::Some((_, __v)) => __v,
                                         ::core::option::Option::None => #none_branch,
                                     };
                                 });

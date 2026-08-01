@@ -185,7 +185,7 @@ async fn pair_seq_map_iterate<C: RawSlot, S: MapArmStackOwned<PairSeqKeyProbe<C>
     loop {
         let key_probe = key_probe_opt.take().unwrap();
 
-        let (arm_index, key_claim) = match arms.race_keys(key_probe).await? {
+        let (arm_index, key_claim) = match arms.race_keys::<true>(key_probe).await? {
             Probe::Miss => return Ok(Probe::Miss),
             Probe::Hit(x) => x,
         };

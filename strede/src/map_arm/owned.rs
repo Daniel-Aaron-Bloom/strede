@@ -4,9 +4,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::{
-    ArmState, ConcatDispatchProj, ConcatDispatchState, ConcatRaceState, DetectDuplicates, False,
-    MapArmBase, MapArmSlot, SlotDispatchProj, SlotDispatchState, SlotRaceState, StackConcat,
-    TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
+    ArmState, Candidate, CandidateArmStack, CandidateBase, ConcatDispatchProj, ConcatDispatchState,
+    ConcatRaceState, DetectDuplicates, False, MapArmBase, MapArmSlot, NoTagArmRaceState,
+    NoTagCandidateArmStack, NoTagRoundState, SlotDispatchProj, SlotDispatchState, SlotRaceState,
+    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
     WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
 };
 use crate::Probe;
@@ -113,7 +114,24 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
     ///
     /// Default implementation wraps `init_race` + `poll_race_one` in a flat
     /// poll loop. Wrappers that add virtual arms override this.
-    async fn race_keys(&mut self, kp: KP) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
+    ///
+    /// `BIASED` mirrors [`select_probe!`](crate::select_probe)'s `biased`
+    /// mode: when arm `i` resolves `Hit`, arms `0..i` are re-polled once
+    /// before committing to `i`, so a lower-index arm that's also ready
+    /// wins. This matters because an arm only reaches `Hit` by fully
+    /// draining its forked reader, and whichever arm happens to be the one
+    /// that drives the underlying buffer's refill runs synchronously to
+    /// completion in the same poll - it can otherwise "finish" before an
+    /// earlier arm that was mid-`next()` gets a chance to observe the same
+    /// newly-loaded data. Without the re-check, a later-declared arm (e.g.
+    /// `DetectDuplicates`'s virtual dup-check arm, which races the same key
+    /// content as the real field arm) can win a tie it should always lose.
+    /// Callers for whom arm priority never matters (no two arms can validly
+    /// hit on the same data) can pass `BIASED = false` to skip the re-poll.
+    async fn race_keys<const BIASED: bool>(
+        &mut self,
+        kp: KP,
+    ) -> Result<Probe<(usize, KP::KeyClaim)>, KP::Error> {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
@@ -122,7 +140,23 @@ pub trait MapArmStackOwned<KP: MapKeyProbeOwned>: Sized {
             let mut all_miss = true;
             for i in 0..Self::SIZE {
                 match self.poll_race_one(race_state.as_mut(), i, cx) {
-                    Poll::Ready(Ok(Probe::Hit(v))) => return Poll::Ready(Ok(Probe::Hit(v))),
+                    Poll::Ready(Ok(Probe::Hit(v))) => {
+                        if !BIASED {
+                            return Poll::Ready(Ok(Probe::Hit(v)));
+                        }
+                        let mut winner = v;
+                        for j in 0..i {
+                            match self.poll_race_one(race_state.as_mut(), j, cx) {
+                                Poll::Ready(Ok(Probe::Hit(earlier))) => {
+                                    winner = earlier;
+                                    break;
+                                }
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Ready(Ok(Probe::Miss)) | Poll::Pending => {}
+                            }
+                        }
+                        return Poll::Ready(Ok(Probe::Hit(winner)));
+                    }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(Probe::Miss)) => {}
                     Poll::Pending => {
@@ -712,5 +746,593 @@ where
     #[inline(always)]
     fn take_outputs(&mut self) -> Self::Outputs {
         (self.0.take_outputs(), self.1.take_outputs())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CandidateListOwned<KP, EnumOut> - internal recursion for CandidateArmStack
+// ---------------------------------------------------------------------------
+
+/// Owned-family counterpart to [`crate::map_arm::borrow::CandidateList`]. See
+/// there for the `tag_matched` gating rationale.
+pub trait CandidateListOwned<KP: MapKeyProbeOwned, EnumOut>: Sized {
+    const SIZE: usize;
+
+    fn unsatisfied_count(&self, target_index: usize) -> usize;
+    fn open_count(&self, tag_matched: Option<usize>) -> usize;
+
+    type RaceState;
+    fn init_race(&mut self, kp: KP, arm_base: usize, tag_matched: Option<usize>)
+    -> Self::RaceState;
+    #[allow(clippy::type_complexity)]
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+        tag_matched: Option<usize>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>>;
+
+    type DispatchState;
+    fn init_dispatch(&mut self, arm_index: usize, vp: OVP<KP>) -> Self::DispatchState;
+    #[allow(clippy::type_complexity)]
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(OVC<KP>, ())>, KP::Error>>;
+
+    fn build_winner(&mut self, target_index: usize) -> Option<EnumOut>;
+}
+
+impl<KP: MapKeyProbeOwned, EnumOut> CandidateListOwned<KP, EnumOut> for CandidateBase {
+    const SIZE: usize = 0;
+
+    #[inline(always)]
+    fn unsatisfied_count(&self, _target_index: usize) -> usize {
+        unreachable!("target candidate index not found (CandidateBase)")
+    }
+    #[inline(always)]
+    fn open_count(&self, _tag_matched: Option<usize>) -> usize {
+        0
+    }
+
+    type RaceState = ();
+    #[inline(always)]
+    fn init_race(&mut self, _kp: KP, _arm_base: usize, _tag_matched: Option<usize>) {}
+    #[inline(always)]
+    fn poll_race_one(
+        &mut self,
+        _state: Pin<&mut ()>,
+        _arm_index: usize,
+        _cx: &mut Context<'_>,
+        _tag_matched: Option<usize>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        unreachable!("poll_race_one called on CandidateBase (SIZE=0)")
+    }
+
+    type DispatchState = core::convert::Infallible;
+    #[inline(always)]
+    fn init_dispatch(&mut self, _arm_index: usize, _vp: OVP<KP>) -> Self::DispatchState {
+        unreachable!("init_dispatch called on CandidateBase")
+    }
+    #[inline(always)]
+    fn poll_dispatch(
+        &mut self,
+        _state: Pin<&mut Self::DispatchState>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(OVC<KP>, ())>, KP::Error>> {
+        unreachable!("poll_dispatch called on CandidateBase")
+    }
+
+    #[inline(always)]
+    fn build_winner(&mut self, _target_index: usize) -> Option<EnumOut> {
+        unreachable!("build_winner: target index not found among candidates")
+    }
+}
+
+impl<KP, Rest, C, BuildFn, EnumOut> CandidateListOwned<KP, EnumOut>
+    for (Rest, Candidate<C, BuildFn>)
+where
+    KP: MapKeyProbeOwned,
+    Rest: CandidateListOwned<KP, EnumOut>,
+    C: MapArmStackOwned<KP>,
+    BuildFn: FnMut(C::Outputs) -> Option<EnumOut>,
+{
+    const SIZE: usize = Rest::SIZE + C::SIZE;
+
+    #[inline(always)]
+    fn unsatisfied_count(&self, target_index: usize) -> usize {
+        if self.1.index == target_index {
+            self.1.arms.unsatisfied_count()
+        } else {
+            self.0.unsatisfied_count(target_index)
+        }
+    }
+    #[inline(always)]
+    fn open_count(&self, tag_matched: Option<usize>) -> usize {
+        let this_active = tag_matched.is_none_or(|idx| idx == self.1.index);
+        let this = if this_active {
+            self.1.arms.open_count()
+        } else {
+            0
+        };
+        self.0.open_count(tag_matched) + this
+    }
+
+    type RaceState = SlotRaceState<Rest::RaceState, C::RaceState>;
+
+    #[inline(always)]
+    fn init_race(
+        &mut self,
+        mut kp: KP,
+        arm_base: usize,
+        tag_matched: Option<usize>,
+    ) -> Self::RaceState {
+        let rest_kp = kp.fork();
+        let this_active = tag_matched.is_none_or(|idx| idx == self.1.index);
+        let this = if this_active {
+            Some(self.1.arms.init_race(kp, arm_base + Rest::SIZE, 0))
+        } else {
+            None
+        };
+        SlotRaceState {
+            rest: self.0.init_race(rest_kp, arm_base, tag_matched),
+            this,
+        }
+    }
+
+    #[inline(always)]
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+        tag_matched: Option<usize>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let mut projected = state.project();
+        if arm_index < Rest::SIZE {
+            return self
+                .0
+                .poll_race_one(projected.rest, arm_index, cx, tag_matched);
+        }
+        let local_index = arm_index - Rest::SIZE;
+        match projected.this.as_mut().as_pin_mut() {
+            None => Poll::Ready(Ok(Probe::Miss)),
+            Some(this_state) => match self.1.arms.poll_race_one(this_state, local_index, cx) {
+                Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
+                    Poll::Ready(Ok(Probe::Hit((Rest::SIZE + idx, kc))))
+                }
+                other => other,
+            },
+        }
+    }
+
+    type DispatchState = ConcatDispatchState<Rest::DispatchState, C::DispatchState>;
+
+    #[inline(always)]
+    fn init_dispatch(&mut self, arm_index: usize, vp: OVP<KP>) -> Self::DispatchState {
+        if arm_index < Rest::SIZE {
+            ConcatDispatchState::InA(self.0.init_dispatch(arm_index, vp))
+        } else {
+            ConcatDispatchState::InB(self.1.arms.init_dispatch(arm_index - Rest::SIZE, vp))
+        }
+    }
+
+    #[inline(always)]
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(OVC<KP>, ())>, KP::Error>> {
+        match state.project() {
+            ConcatDispatchProj::InA(s) => self.0.poll_dispatch(s, cx),
+            ConcatDispatchProj::InB(s) => self.1.arms.poll_dispatch(s, cx),
+        }
+    }
+
+    #[inline(always)]
+    fn build_winner(&mut self, target_index: usize) -> Option<EnumOut> {
+        if self.1.index == target_index {
+            let outputs = self.1.arms.take_outputs();
+            (self.1.build)(outputs)
+        } else {
+            self.0.build_winner(target_index)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CandidateArmStack impl (owned family)
+// ---------------------------------------------------------------------------
+
+impl<KP, Candidates, EnumOut, W, TagKeyFn, TagKeyFut, TagValFn, TagValFut> MapArmStackOwned<KP>
+    for CandidateArmStack<Candidates, EnumOut, W, TagKeyFn, TagValFn>
+where
+    KP: MapKeyProbeOwned,
+    Candidates: CandidateListOwned<KP, EnumOut>,
+    W: Copy,
+    TagKeyFn: FnMut(KP, usize) -> TagKeyFut,
+    TagKeyFut: Future<Output = Result<Probe<(KP::KeyClaim, crate::impls::Match)>, KP::Error>>,
+    TagValFn: FnMut(OVP<KP>) -> TagValFut,
+    TagValFut:
+        Future<Output = Result<Probe<(OVC<KP>, crate::impls::MatchVals<usize, W>)>, KP::Error>>,
+{
+    const SIZE: usize = Candidates::SIZE + 1;
+    const FIELD_COUNT: usize = 1;
+    type Dynamic = False;
+    type Outputs = Option<EnumOut>;
+
+    #[inline(always)]
+    fn unsatisfied_count(&self) -> usize {
+        match self.tag_matched {
+            None => 1,
+            Some(idx) => self.candidates.unsatisfied_count(idx),
+        }
+    }
+    #[inline(always)]
+    fn open_count(&self) -> usize {
+        match self.tag_matched {
+            None => 1 + self.candidates.open_count(None),
+            Some(idx) => self.candidates.open_count(Some(idx)),
+        }
+    }
+
+    type RaceState = TagRaceState<TagKeyFut, Candidates::RaceState>;
+
+    #[inline(always)]
+    fn init_race(&mut self, mut kp: KP, arm_base: usize, _field_base: usize) -> Self::RaceState {
+        let inner_kp = kp.fork();
+        let tag_fut = if self.tag_matched.is_some() {
+            None
+        } else {
+            Some((self.tag_key_fn)(kp, arm_base))
+        };
+        TagRaceState {
+            tag_fut,
+            inner: self
+                .candidates
+                .init_race(inner_kp, arm_base + 1, self.tag_matched),
+        }
+    }
+
+    #[inline(always)]
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let projected = state.project();
+        if arm_index == 0 {
+            match poll_key_slot(projected.tag_fut, cx) {
+                Poll::Ready(Ok(Probe::Hit((kc, _match)))) => Poll::Ready(Ok(Probe::Hit((0, kc)))),
+                Poll::Ready(Ok(Probe::Miss)) => Poll::Ready(Ok(Probe::Miss)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            match self.candidates.poll_race_one(
+                projected.inner,
+                arm_index - 1,
+                cx,
+                self.tag_matched,
+            ) {
+                Poll::Ready(Ok(Probe::Hit((idx, kc)))) => {
+                    Poll::Ready(Ok(Probe::Hit((idx + 1, kc))))
+                }
+                other => other,
+            }
+        }
+    }
+
+    type DispatchState = TagDispatchState<TagValFut, Candidates::DispatchState>;
+
+    #[inline(always)]
+    fn init_dispatch(&mut self, arm_index: usize, vp: OVP<KP>) -> Self::DispatchState {
+        if arm_index == 0 {
+            TagDispatchState::Tag((self.tag_val_fn)(vp))
+        } else {
+            TagDispatchState::Inner(self.candidates.init_dispatch(arm_index - 1, vp))
+        }
+    }
+
+    #[inline(always)]
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(OVC<KP>, ())>, KP::Error>> {
+        match state.project() {
+            TagDispatchProj::Tag(fut) => fut.poll(cx).map(|r| {
+                r.map(|probe| match probe {
+                    Probe::Hit((vc, crate::impls::MatchVals(idx, _))) => {
+                        self.tag_matched = Some(idx);
+                        Probe::Hit((vc, ()))
+                    }
+                    Probe::Miss => Probe::Miss,
+                })
+            }),
+            TagDispatchProj::Inner(inner_state) => self.candidates.poll_dispatch(inner_state, cx),
+        }
+    }
+
+    #[inline(always)]
+    fn take_outputs(&mut self) -> Self::Outputs {
+        match self.tag_matched {
+            Some(idx) => self.candidates.build_winner(idx),
+            None => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NoTagCandidateListOwned<KP, EnumOut> - untagged enum flatten
+// ---------------------------------------------------------------------------
+
+/// Owned-family counterpart to [`crate::map_arm::borrow::NoTagCandidateList`].
+/// See there for the full algorithm write-up.
+pub trait NoTagCandidateListOwned<KP: MapKeyProbeOwned, EnumOut>: Sized {
+    type RoundState;
+
+    fn init_round(&mut self, kp: KP) -> Self::RoundState;
+
+    /// Indices recorded internally (and later returned by `take_winner`) are
+    /// purely *local* to this whole `NoTagCandidateListOwned`'s own
+    /// `0..SIZE` range - see the borrow-family counterpart's doc comment.
+    fn poll_sweep(
+        &mut self,
+        state: Pin<&mut Self::RoundState>,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, KP::Error>;
+
+    fn take_winner(&mut self, state: Pin<&mut Self::RoundState>) -> Option<(usize, KP::KeyClaim)>;
+
+    fn eliminate(&mut self, any_hit: bool);
+
+    fn first_satisfied_live(&self) -> Option<usize>;
+}
+
+impl<KP: MapKeyProbeOwned, EnumOut> NoTagCandidateListOwned<KP, EnumOut> for CandidateBase {
+    type RoundState = ();
+
+    #[inline(always)]
+    fn init_round(&mut self, _kp: KP) {}
+
+    #[inline(always)]
+    fn poll_sweep(&mut self, _state: Pin<&mut ()>, _cx: &mut Context<'_>) -> Result<bool, KP::Error> {
+        Ok(true)
+    }
+
+    #[inline(always)]
+    fn take_winner(&mut self, _state: Pin<&mut ()>) -> Option<(usize, KP::KeyClaim)> {
+        None
+    }
+
+    #[inline(always)]
+    fn eliminate(&mut self, _any_hit: bool) {}
+
+    #[inline(always)]
+    fn first_satisfied_live(&self) -> Option<usize> {
+        None
+    }
+}
+
+impl<KP, Rest, C, BuildFn, EnumOut> NoTagCandidateListOwned<KP, EnumOut>
+    for (Rest, Candidate<C, BuildFn>)
+where
+    KP: MapKeyProbeOwned,
+    Rest: NoTagCandidateListOwned<KP, EnumOut> + CandidateListOwned<KP, EnumOut>,
+    C: MapArmStackOwned<KP>,
+    BuildFn: FnMut(C::Outputs) -> Option<EnumOut>,
+{
+    type RoundState = NoTagRoundState<Rest::RoundState, C::RaceState, KP::KeyClaim>;
+
+    #[inline(always)]
+    fn init_round(&mut self, mut kp: KP) -> Self::RoundState {
+        let rest_kp = kp.fork();
+        self.1.round_hit = false;
+        let (this, resolved) = if self.1.live {
+            (Some(self.1.arms.init_race(kp, 0, 0)), None)
+        } else {
+            (None, Some(None))
+        };
+        NoTagRoundState {
+            rest: self.0.init_round(rest_kp),
+            this,
+            resolved,
+        }
+    }
+
+    #[inline(always)]
+    fn poll_sweep(
+        &mut self,
+        state: Pin<&mut Self::RoundState>,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, KP::Error> {
+        let mut projected = state.project();
+        let rest_settled = self.0.poll_sweep(projected.rest, cx)?;
+
+        let this_settled = if projected.resolved.is_none() {
+            let this_base = <Rest as CandidateListOwned<KP, EnumOut>>::SIZE;
+            let mut this_pin = projected
+                .this
+                .as_mut()
+                .as_pin_mut()
+                .expect("live, unresolved candidate must have a RaceState");
+            let mut hit: Option<(usize, KP::KeyClaim)> = None;
+            let mut any_pending = false;
+            for i in 0..C::SIZE {
+                match self.1.arms.poll_race_one(this_pin.as_mut(), i, cx) {
+                    Poll::Ready(Ok(Probe::Hit((_local, kc)))) => {
+                        hit = Some((this_base + i, kc));
+                        break;
+                    }
+                    Poll::Ready(Ok(Probe::Miss)) => {}
+                    Poll::Ready(Err(e)) => return Err(e),
+                    Poll::Pending => any_pending = true,
+                }
+            }
+            match hit {
+                Some((idx, kc)) => {
+                    self.1.round_hit = true;
+                    *projected.resolved = Some(Some((idx, kc)));
+                    projected.this.set(None);
+                    true
+                }
+                None if !any_pending => {
+                    *projected.resolved = Some(None);
+                    projected.this.set(None);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+
+        Ok(rest_settled && this_settled)
+    }
+
+    #[inline(always)]
+    fn take_winner(&mut self, state: Pin<&mut Self::RoundState>) -> Option<(usize, KP::KeyClaim)> {
+        let projected = state.project();
+        let rest_winner = self.0.take_winner(projected.rest);
+        if rest_winner.is_some() {
+            return rest_winner;
+        }
+        match projected.resolved.take() {
+            Some(Some((idx, kc))) => Some((idx, kc)),
+            Some(None) => None,
+            None => unreachable!("take_winner called before the round settled"),
+        }
+    }
+
+    #[inline(always)]
+    fn eliminate(&mut self, any_hit: bool) {
+        self.0.eliminate(any_hit);
+        if any_hit && self.1.live && !self.1.round_hit {
+            self.1.live = false;
+        }
+    }
+
+    #[inline(always)]
+    fn first_satisfied_live(&self) -> Option<usize> {
+        if let Some(idx) = self.0.first_satisfied_live() {
+            return Some(idx);
+        }
+        if self.1.live && self.1.arms.unsatisfied_count() == 0 {
+            Some(self.1.index)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NoTagCandidateArmStack impl (owned family)
+// ---------------------------------------------------------------------------
+
+impl<KP, Candidates, EnumOut> MapArmStackOwned<KP> for NoTagCandidateArmStack<Candidates, EnumOut>
+where
+    KP: MapKeyProbeOwned,
+    Candidates: CandidateListOwned<KP, EnumOut> + NoTagCandidateListOwned<KP, EnumOut>,
+{
+    const SIZE: usize = <Candidates as CandidateListOwned<KP, EnumOut>>::SIZE;
+    const FIELD_COUNT: usize = 0;
+    type Dynamic = False;
+    type Outputs = Option<EnumOut>;
+
+    #[inline(always)]
+    fn unsatisfied_count(&self) -> usize {
+        if self.candidates.first_satisfied_live().is_some() {
+            0
+        } else {
+            1
+        }
+    }
+    #[inline(always)]
+    fn open_count(&self) -> usize {
+        1
+    }
+
+    // See `NoTagArmRaceState`'s doc comment: this soft-elimination race must
+    // be driven through `init_race`/`poll_race_one` (the interface every
+    // composition primitive in this module actually calls), not a
+    // `race_keys` override - `StackConcat` (how `#[strede(flatten)]` splices
+    // this in) reaches nested arms this way and never calls a nested
+    // stack's `race_keys()`.
+    type RaceState = NoTagArmRaceState<Candidates::RoundState, KP::KeyClaim>;
+
+    #[inline(always)]
+    fn init_race(&mut self, kp: KP, _arm_base: usize, _field_base: usize) -> Self::RaceState {
+        NoTagArmRaceState {
+            round: self.candidates.init_round(kp),
+            winner_index: None,
+            winner_claim: None,
+            eliminated: false,
+        }
+    }
+
+    fn poll_race_one(
+        &mut self,
+        state: Pin<&mut Self::RaceState>,
+        arm_index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(usize, KP::KeyClaim)>, KP::Error>> {
+        let mut projected = state.project();
+
+        if projected.winner_index.is_none() {
+            match self.candidates.poll_sweep(projected.round.as_mut(), cx) {
+                Ok(true) => match self.candidates.take_winner(projected.round.as_mut()) {
+                    Some((idx, kc)) => {
+                        *projected.winner_index = Some(Some(idx));
+                        *projected.winner_claim = Some(kc);
+                    }
+                    None => *projected.winner_index = Some(None),
+                },
+                Ok(false) => return Poll::Pending,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+
+        if !*projected.eliminated {
+            let any_hit = matches!(projected.winner_index, Some(Some(_)));
+            self.candidates.eliminate(any_hit);
+            *projected.eliminated = true;
+        }
+
+        let is_winner = matches!(projected.winner_index, Some(Some(idx)) if *idx == arm_index);
+        if is_winner {
+            let kc = projected
+                .winner_claim
+                .take()
+                .expect("winning arm_index queried more than once in a single round");
+            Poll::Ready(Ok(Probe::Hit((arm_index, kc))))
+        } else {
+            Poll::Ready(Ok(Probe::Miss))
+        }
+    }
+
+    type DispatchState = <Candidates as CandidateListOwned<KP, EnumOut>>::DispatchState;
+    #[inline(always)]
+    fn init_dispatch(&mut self, arm_index: usize, vp: OVP<KP>) -> Self::DispatchState {
+        self.candidates.init_dispatch(arm_index, vp)
+    }
+    #[inline(always)]
+    fn poll_dispatch(
+        &mut self,
+        state: Pin<&mut Self::DispatchState>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Probe<(OVC<KP>, ())>, KP::Error>> {
+        self.candidates.poll_dispatch(state, cx)
+    }
+
+    #[inline(always)]
+    fn take_outputs(&mut self) -> Self::Outputs {
+        match self.candidates.first_satisfied_live() {
+            Some(idx) => self.candidates.build_winner(idx),
+            None => None,
+        }
     }
 }

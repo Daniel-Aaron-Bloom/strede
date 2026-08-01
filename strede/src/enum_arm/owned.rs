@@ -27,7 +27,15 @@ pub trait EnumArmStackOwned<VP: EnumVariantProbeOwned>: Sized {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Probe<(usize, VP::Claim)>, VP::Error>>;
 
-    async fn race(&mut self, vp: VP) -> Result<Probe<(usize, VP::Claim)>, VP::Error> {
+    /// Race all arms' identify-and-deserialize callbacks against the given
+    /// variant probe.
+    ///
+    /// See [`crate::map_arm::owned::MapArmStackOwned::race_keys`] for why
+    /// `BIASED` exists and what it does.
+    async fn race<const BIASED: bool>(
+        &mut self,
+        vp: VP,
+    ) -> Result<Probe<(usize, VP::Claim)>, VP::Error> {
         if Self::SIZE == 0 {
             return Ok(Probe::Miss);
         }
@@ -36,7 +44,23 @@ pub trait EnumArmStackOwned<VP: EnumVariantProbeOwned>: Sized {
             let mut all_miss = true;
             for i in 0..Self::SIZE {
                 match self.poll_race_one(race_state.as_mut(), i, cx) {
-                    Poll::Ready(Ok(Probe::Hit(v))) => return Poll::Ready(Ok(Probe::Hit(v))),
+                    Poll::Ready(Ok(Probe::Hit(v))) => {
+                        if !BIASED {
+                            return Poll::Ready(Ok(Probe::Hit(v)));
+                        }
+                        let mut winner = v;
+                        for j in 0..i {
+                            match self.poll_race_one(race_state.as_mut(), j, cx) {
+                                Poll::Ready(Ok(Probe::Hit(earlier))) => {
+                                    winner = earlier;
+                                    break;
+                                }
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Ready(Ok(Probe::Miss)) | Poll::Pending => {}
+                            }
+                        }
+                        return Poll::Ready(Ok(Probe::Hit(winner)));
+                    }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(Probe::Miss)) => {}
                     Poll::Pending => {

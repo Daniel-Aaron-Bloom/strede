@@ -8,6 +8,7 @@ use crate::Chunk;
 use crate::Probe;
 use crate::borrow::{Entry, StrAccess};
 use crate::owned::StrAccessOwned;
+use crate::{hit, select_probe};
 
 /// Read all chunks from `chunks` and compare the accumulated string against
 /// `candidates`.  Returns `Hit((claim, idx))` on match, `Miss` on no match or
@@ -97,7 +98,9 @@ pub async fn match_str_chunks_against_owned<SA: StrAccessOwned>(
 
 /// Match a string token in `entry` against `candidates` using both the
 /// zero-copy fast path (`deserialize_str`) and the chunked fallback
-/// (`deserialize_str_chunks`).
+/// (`deserialize_str_chunks`), raced via `select_probe!` (per-handle awaiting
+/// one fork to completion before touching the other is not sound — see
+/// `Entry::fork` in the crate docs).
 ///
 /// Returns `Hit((claim, idx))`, `Miss`, or `Err`.
 pub async fn match_entry_str_against<'de, E: Entry<'de>>(
@@ -105,19 +108,19 @@ pub async fn match_entry_str_against<'de, E: Entry<'de>>(
     candidates: &[(&'static str, usize)],
 ) -> Result<Probe<(E::Claim, usize)>, E::Error> {
     let entry2 = entry.fork();
-
-    if let Probe::Hit((claim, s)) = entry.deserialize_str().await? {
-        for &(name, idx) in candidates {
-            if s == name {
-                return Ok(Probe::Hit((claim, idx)));
+    select_probe! {
+        async move {
+            let (claim, s) = hit!(entry.deserialize_str().await);
+            for &(name, idx) in candidates {
+                if s == name {
+                    return Ok(Probe::Hit((claim, idx)));
+                }
             }
-        }
-        return Ok(Probe::Miss);
+            Ok(Probe::Miss)
+        },
+        async move {
+            let chunks = hit!(entry2.deserialize_str_chunks().await);
+            match_str_chunks_against(chunks, candidates).await
+        },
     }
-
-    let chunks = match entry2.deserialize_str_chunks().await? {
-        Probe::Hit(c) => c,
-        Probe::Miss => return Ok(Probe::Miss),
-    };
-    match_str_chunks_against(chunks, candidates).await
 }

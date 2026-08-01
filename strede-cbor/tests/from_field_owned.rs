@@ -2,7 +2,7 @@
 //!
 //! `count` is `u32` on the wire-facing struct but deserializes as `u16` and
 //! converts via `u32::from(u16)`.
-
+#![cfg(feature = "alloc")]
 extern crate std;
 mod helpers;
 

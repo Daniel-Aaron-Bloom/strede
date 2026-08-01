@@ -3,7 +3,8 @@ use core::future::Future;
 
 use crate::borrow::{Ascii, NumberEncoding};
 pub use crate::map_arm::{
-    ArmState, DetectDuplicates, False, MapArm, MapArmBase, MapArmSlot, NextKey, StackConcat,
+    ArmState, Candidate, CandidateArm, CandidateArmStack, CandidateBase, DetectDuplicates, False,
+    MapArm, MapArmBase, MapArmSlot, NextKey, NoTagCandidateArmStack, StackConcat,
     TagInjectingStack, True, VirtualArmSlot,
 };
 use crate::{Chunk, DeserializeError, Probe};
@@ -401,6 +402,7 @@ pub type SE<D> = <<<D as DeserializerOwned>::Entry as EntryOwned>::Seq as SeqAcc
 
 pub use crate::enum_arm::EnumArmStackOwned;
 pub use crate::map_arm::MapArmStackOwned;
+pub use crate::map_arm::owned::{CandidateListOwned, NoTagCandidateListOwned};
 
 // ===========================================================================
 // Owned-family enum access

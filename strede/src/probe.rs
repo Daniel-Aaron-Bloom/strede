@@ -834,13 +834,36 @@ mod tests {
     use super::*;
     use core::future::Future;
     use core::pin::Pin;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll};
 
     fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
         let w = strede_test_util::noop_waker();
         let mut cx = Context::from_waker(&w);
         f.poll(&mut cx)
+    }
+
+    /// Pending on its first poll (waking the task), Ready on every poll after.
+    /// Lets a test arm force the `select_probe!` future to be polled more than
+    /// once without depending on any real I/O source.
+    struct YieldOnce(bool);
+    impl YieldOnce {
+        fn new() -> Self {
+            Self(false)
+        }
+    }
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            if this.0 {
+                Poll::Ready(())
+            } else {
+                this.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
     }
 
     #[test]
@@ -885,5 +908,111 @@ mod tests {
                 Poll::Pending => {}
             }
         }
+    }
+
+    #[test]
+    fn kill_then_sibling_arm_errors() {
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+
+        struct SetOnDrop;
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let guard = SetOnDrop;
+        // arm 0: kills arm 1, yields once so arm 1's drop lands before arm 0
+        // resumes, then surfaces a fatal data-source error.
+        // arm 1: holds `guard`; would run forever if never killed.
+        let fut = async {
+            crate::select_probe! {
+                async {
+                    kill!(1);
+                    YieldOnce::new().await;
+                    assert!(
+                        DROPPED.load(Ordering::SeqCst),
+                        "arm 1 was not dropped before arm 0's error"
+                    );
+                    Err::<Probe<u32>, &'static str>("data source failed")
+                },
+                async move {
+                    let _guard = guard;
+                    core::future::pending::<Result<Probe<u32>, &'static str>>().await
+                },
+            }
+        };
+        let mut fut = core::pin::pin!(fut);
+        loop {
+            match poll_once(fut.as_mut()) {
+                Poll::Ready(result) => {
+                    assert_eq!(result, Err("data source failed"));
+                    break;
+                }
+                Poll::Pending => {}
+            }
+        }
+    }
+
+    #[test]
+    fn stale_kill_flag_is_not_reprocessed_on_a_later_kill() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountOnDrop;
+        impl Drop for CountOnDrop {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let guard1 = CountOnDrop;
+        let guard3 = CountOnDrop;
+        // A `FlatKillFlags` bit is set permanently by `mark` and never cleared,
+        // so `process_kills` re-examines *every* previously-marked flag each
+        // time it runs, not just the newest one. arm 0 kills arm 1 (processed
+        // when the loop reaches index 1); arm 2 then kills arm 3 later in the
+        // very same top-level poll (processed when the loop reaches index 3)
+        // -- and that second `process_kills` call re-visits arm 1's
+        // already-marked, already-dead flag. This must be a no-op: the guard
+        // must not run again, and `active` must not be decremented a second
+        // time for a slot that's already gone (which would eventually
+        // underflow and panic).
+        let fut = async {
+            crate::select_probe! {
+                async {
+                    kill!(1);
+                    Ok(Probe::Miss)
+                },
+                async move {
+                    let _guard = guard1;
+                    core::future::pending::<Result<Probe<u32>, ()>>().await
+                },
+                async {
+                    kill!(3);
+                    Ok(Probe::Miss)
+                },
+                async move {
+                    let _guard = guard3;
+                    core::future::pending::<Result<Probe<u32>, ()>>().await
+                },
+            }
+        };
+        let mut fut = core::pin::pin!(fut);
+        loop {
+            match poll_once(fut.as_mut()) {
+                Poll::Ready(result) => {
+                    // Every arm missed or was killed: falls through to the
+                    // default `@miss` behavior.
+                    assert_eq!(result, Ok(Probe::Miss));
+                    break;
+                }
+                Poll::Pending => {}
+            }
+        }
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            2,
+            "both killed arms should be dropped exactly once each"
+        );
     }
 }

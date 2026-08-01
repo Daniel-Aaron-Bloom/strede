@@ -187,11 +187,11 @@ fn n_as_u64(n: N) -> Option<u64> {
         N::PosInt(u) => Some(u),
         N::NegInt(_) => None,
         N::Float(f) => {
-            if f >= 0.0 && f.is_finite() && f == f.trunc() && f < (u64::MAX as f64) + 1.0 {
-                Some(f as u64)
-            } else {
-                None
-            }
+            // `f as u64` saturates on NaN/out-of-range (guaranteed since Rust 1.45), so the
+            // round-trip equality check subsumes the finite/range/integrality checks that a
+            // `f.trunc()` comparison would need — and `trunc` isn't available in `core`.
+            let u = f as u64;
+            if f == u as f64 { Some(u) } else { None }
         }
     }
 }
@@ -202,11 +202,8 @@ fn n_as_i64(n: N) -> Option<i64> {
         N::PosInt(u) => i64::try_from(u).ok(),
         N::NegInt(i) => Some(i),
         N::Float(f) => {
-            if f.is_finite() && f == f.trunc() && f >= (i64::MIN as f64) && f < -(i64::MIN as f64) {
-                Some(f as i64)
-            } else {
-                None
-            }
+            let i = f as i64;
+            if f == i as f64 { Some(i) } else { None }
         }
     }
 }
@@ -447,22 +444,30 @@ mod tests {
     fn streaming_owned_int() {
         use crate::chunked::ChunkedJsonDeserializer;
         use strede::shared_buf::SharedBuf;
-        use strede_test_util::block_on;
+        use strede_test_util::block_on_loop_bounded;
 
-        let v = block_on(SharedBuf::with_async(
-            b"42" as &[u8],
-            async move |buf: &mut &[u8]| {
-                *buf = &[];
-            },
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, n) = NumberOwned::deserialize_owned(de, ())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                n
-            },
-        ));
+        // Every one of the 4 racing number contestants (int/neg/float-fast/
+        // float-slow) reaches the buffer boundary together on bare digits
+        // with no trailing terminator, so all 4 forks must wait for each
+        // other via `Handle::next()` - a genuine multi-poll wait, not a
+        // single-shot resolution. `block_on` (single poll) can't observe it.
+        let v = block_on_loop_bounded(
+            SharedBuf::with_async(
+                b"42" as &[u8],
+                async move |buf: &mut &[u8]| {
+                    *buf = &[];
+                },
+                async |shared| {
+                    let de = ChunkedJsonDeserializer::new(shared);
+                    let (_, n) = NumberOwned::deserialize_owned(de, ())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    n
+                },
+            ),
+            32,
+        );
         assert_eq!(v.as_u64(), Some(42));
     }
 
@@ -494,22 +499,27 @@ mod tests {
     fn streaming_owned_negative() {
         use crate::chunked::ChunkedJsonDeserializer;
         use strede::shared_buf::SharedBuf;
-        use strede_test_util::block_on;
+        use strede_test_util::block_on_loop_bounded;
 
-        let v = block_on(SharedBuf::with_async(
-            b"-9223372036854775808" as &[u8],
-            async move |buf: &mut &[u8]| {
-                *buf = &[];
-            },
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                let (_, n) = NumberOwned::deserialize_owned(de, ())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                n
-            },
-        ));
+        // See `streaming_owned_int` - bare digits with no trailing terminator
+        // require a genuine multi-poll wait for all 4 racing contestants.
+        let v = block_on_loop_bounded(
+            SharedBuf::with_async(
+                b"-9223372036854775808" as &[u8],
+                async move |buf: &mut &[u8]| {
+                    *buf = &[];
+                },
+                async |shared| {
+                    let de = ChunkedJsonDeserializer::new(shared);
+                    let (_, n) = NumberOwned::deserialize_owned(de, ())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    n
+                },
+            ),
+            32,
+        );
         assert_eq!(v.as_i64(), Some(i64::MIN));
     }
 
@@ -564,21 +574,27 @@ mod tests {
     fn streaming_parse(s: &str) -> Option<N> {
         use crate::chunked::ChunkedJsonDeserializer;
         use strede::shared_buf::SharedBuf;
+        use strede_test_util::block_on_loop_bounded;
 
+        // See `streaming_owned_int` - bare digits with no trailing terminator
+        // require a genuine multi-poll wait for all 4 racing contestants.
         let bytes = s.as_bytes().to_owned();
-        block_on(SharedBuf::with_async(
-            bytes.as_slice(),
-            async move |buf: &mut &[u8]| {
-                *buf = &[];
-            },
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                match NumberOwned::deserialize_owned(de, ()).await.unwrap() {
-                    Probe::Hit((_, n)) => Some(n.n),
-                    Probe::Miss => None,
-                }
-            },
-        ))
+        block_on_loop_bounded(
+            SharedBuf::with_async(
+                bytes.as_slice(),
+                async move |buf: &mut &[u8]| {
+                    *buf = &[];
+                },
+                async |shared| {
+                    let de = ChunkedJsonDeserializer::new(shared);
+                    match NumberOwned::deserialize_owned(de, ()).await.unwrap() {
+                        Probe::Hit((_, n)) => Some(n.n),
+                        Probe::Miss => None,
+                    }
+                },
+            ),
+            32,
+        )
     }
 
     /// Generate a random JSON number string with a mix of shapes:

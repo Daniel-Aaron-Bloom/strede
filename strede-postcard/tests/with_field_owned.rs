@@ -4,6 +4,7 @@
 //! `module::deserialize_owned`. Mirrors `with_field_borrow.rs`.
 
 #![recursion_limit = "256"]
+#![cfg(feature = "alloc")]
 
 #[macro_use]
 mod helpers;

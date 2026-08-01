@@ -47,6 +47,23 @@ fn parse_hex_digit(b: u8) -> Option<u32> {
     }
 }
 
+/// State saved when a raw (unescaped) multi-byte UTF-8 sequence is split
+/// across buffer boundaries.
+///
+/// The underlying buffer may be wholesale-replaced on each refill (not
+/// grown/appended), so once `next_chunk` decides not to consume a
+/// leading byte it cannot simply "leave it in `src` for next time" - the
+/// byte would be lost when the next buffer arrives. Instead the leading
+/// byte(s) are copied into `buf` here and combined with newly-arrived
+/// bytes on the next call, one at a time, until they form a complete
+/// scalar value (emitted as [`StrChunk::Char`], the same non-zero-copy
+/// path already used for decoded `\`-escapes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PartialUtf8 {
+    buf: [u8; 4],
+    len: u8,
+}
+
 /// Handle for reading chunks of the current JSON string.
 ///
 /// Obtained from [`Token::Str`]. Call [`next_chunk`](Self::next_chunk)
@@ -56,16 +73,24 @@ fn parse_hex_digit(b: u8) -> Option<u32> {
 /// When a buffer boundary falls inside an escape sequence, `next_chunk` saves the
 /// partial state in `self.partial` and returns
 /// `Ok(Some(StrChunk::Slice("")))` - an empty slice that lets the caller feed the
-/// next buffer without ending or erroring the stream.
+/// next buffer without ending or erroring the stream. A buffer boundary falling
+/// inside a raw (unescaped) multi-byte UTF-8 sequence is saved in
+/// `self.partial_utf8` instead, for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StrAccess {
     /// Non-`None` when a buffer boundary split an escape sequence mid-way.
     partial: Option<PartialEscape>,
+    /// Non-`None` when a buffer boundary split a raw multi-byte UTF-8
+    /// sequence mid-way.
+    partial_utf8: Option<PartialUtf8>,
 }
 
 impl StrAccess {
     pub(super) fn start() -> Self {
-        Self { partial: None }
+        Self {
+            partial: None,
+            partial_utf8: None,
+        }
     }
 }
 
@@ -244,6 +269,30 @@ impl StrAccess {
             };
         }
 
+        // Resume a raw multi-byte UTF-8 sequence saved from a previous
+        // buffer split, one new byte at a time.
+        if let Some(mut pu) = self.partial_utf8.take() {
+            while (pu.len as usize) < pu.buf.len() && !src.is_empty() {
+                pu.buf[pu.len as usize] = src[0];
+                pu.len += 1;
+                *src = &src[1..];
+                match core::str::from_utf8(&pu.buf[..pu.len as usize]) {
+                    Ok(s) => return Ok(Some(StrChunk::Char(s.chars().next().unwrap()))),
+                    Err(e) if e.error_len().is_none() => continue,
+                    Err(_) => return Err(JsonError::InvalidUtf8),
+                }
+            }
+            // A full 4-byte UTF-8 sequence that still isn't valid is a
+            // genuine encoding error, not a truncation - and the loop
+            // above always returns before `pu.len` reaches `buf.len()`
+            // in that case (a 4-byte-or-shorter sequence is always
+            // conclusively Ok or a definite Err by then). So reaching
+            // here means `src` ran out again first; keep waiting.
+            debug_assert!(src.is_empty());
+            self.partial_utf8 = Some(pu);
+            return Ok(Some(StrChunk::Slice("")));
+        }
+
         if src.is_empty() {
             return Err(JsonError::UnexpectedEnd);
         }
@@ -288,9 +337,49 @@ impl StrAccess {
             }
         }
 
-        let s = core::str::from_utf8(src).map_err(|_| JsonError::InvalidUtf8)?;
-        *src = &src[src.len()..];
-        Ok(Some(StrChunk::Slice(s)))
+        match core::str::from_utf8(src) {
+            Ok(s) => {
+                *src = &src[src.len()..];
+                Ok(Some(StrChunk::Slice(s)))
+            }
+            Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
+                // The tail of `src` is a multi-byte sequence's leading
+                // byte(s) with no continuation bytes yet - not necessarily
+                // invalid, just not fully arrived. Emit only the
+                // confirmed-valid prefix and leave the partial tail
+                // untouched in `src` (do NOT stash it yet): callers
+                // (`ChunkedJsonStrAccess`/`ChunkedJsonBytesAccess`) return
+                // immediately after a non-empty `Slice` and re-derive the
+                // next `str`/`&[u8]` straight from buffer offsets on their
+                // next call, so the returned length here must exactly
+                // match how far `src` advances. Since no refill has
+                // happened yet, the untouched tail is still sitting at the
+                // same buffer position for that next call to see again -
+                // at which point `valid_up_to() == 0` and the branch below
+                // stashes it before it can be lost to a refill.
+                let valid_len = e.valid_up_to();
+                let s = core::str::from_utf8(&src[..valid_len])
+                    .expect("prefix already validated by Utf8Error::valid_up_to");
+                *src = &src[valid_len..];
+                Ok(Some(StrChunk::Slice(s)))
+            }
+            Err(e) if e.error_len().is_none() => {
+                // `src` is entirely the leading byte(s) of a multi-byte
+                // sequence (no valid prefix at all). The underlying buffer
+                // may be wholesale-replaced (not grown) on the next
+                // refill, so stash the bytes in `partial_utf8` now rather
+                // than leaving them in `src` for a refill to silently lose.
+                let mut buf = [0u8; 4];
+                buf[..src.len()].copy_from_slice(src);
+                self.partial_utf8 = Some(PartialUtf8 {
+                    buf,
+                    len: src.len() as u8,
+                });
+                *src = &src[src.len()..];
+                Ok(Some(StrChunk::Slice("")))
+            }
+            Err(_) => Err(JsonError::InvalidUtf8),
+        }
     }
 }
 

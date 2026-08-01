@@ -3,6 +3,7 @@
 //! Mirrors `from_field_borrow.rs`; `&'de str` becomes `String`.
 
 #![recursion_limit = "256"]
+#![cfg(feature = "alloc")]
 
 #[macro_use]
 mod helpers;

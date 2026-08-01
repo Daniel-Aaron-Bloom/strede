@@ -627,6 +627,7 @@ pub type EVP<'de, D> =
 
 pub use crate::enum_arm::EnumArmStack;
 pub use crate::map_arm::MapArmStack;
+pub use crate::map_arm::borrow::{CandidateList, NoTagCandidateList};
 
 // ---------------------------------------------------------------------------
 // SeqAccess

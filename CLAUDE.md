@@ -536,6 +536,296 @@ wire-name indices via `.map(|(s, i)| (s, i + offset))`. The result is one
 `iterate` call against a unified arm stack — no continuation chain, no
 intermediate cells, no boxed-future workaround.
 
+Enums can also implement `MapFieldProvider`/`MapFieldProviderOwned`, so a
+`#[strede(flatten)]` field's type may itself be an enum:
+
+- **Externally-tagged** enums (default representation): `ARMS = 1` — a
+  single arm races a `MatchVals` key probe over every variant's wire name,
+  dispatching by the matched index to that variant's existing payload path.
+  External tagging only ever splices in one more key/value pair no matter how
+  many variants exist, so this composes with `StackConcat` exactly like a
+  plain struct field.
+- **Internally-tagged** enums (`#[strede(tag = "t")]`): use the
+  `CandidateArmStack` primitive below, since more than one variant's fields
+  could plausibly be present in the shared map before the tag key resolves.
+- **Adjacently-tagged** (`#[strede(tag = "t", content = "c")]`) enums:
+  contribute exactly 2 fixed `MapArmSlot` arms (tag + content) regardless of
+  variant count — no `CandidateArmStack` involved, since content is a single
+  opaque value under one fixed key, not fields spread into the shared map.
+  See "Adjacently-tagged flatten" below.
+- **Untagged** (`#[strede(untagged)]`) enums: use `NoTagCandidateArmStack`,
+  the tag-less counterpart to `CandidateArmStack` — see "Untagged flatten"
+  below. Only supported for a *pure* untagged enum (every variant untagged,
+  no container-level `tag`); an enum mixing tagged and untagged variants
+  cannot be a flatten target at all (no `MapFieldProvider` impl is emitted
+  for that case).
+
+Both cases (internally-tagged flatten with a tuple variant; an internally-
+tagged enum mixing `#[strede(untagged)]` variants) are structurally
+unsupported but are *not* rejected via a hard `syn::Error` in the derive,
+because the `MapFieldProvider` impl is emitted unconditionally for every
+internally-tagged enum regardless of whether it's ever used as a flatten
+target — hard-erroring there would break that enum's ordinary standalone
+derive. Instead, the impl's where-clause carries a deliberately unsatisfiable
+bound (a real trait bound the type genuinely can't satisfy, e.g. `#krate::
+FlattenUnsupported` bound to the impl's own still-abstract `__KP2` type
+parameter, or `TupleVariantHelper: MapFieldProvider<'de, __KP2>` referencing
+a helper type that simply never implements it). Rust doesn't eagerly check
+where-clause satisfiability against an abstract, not-yet-instantiated type
+parameter, so the enum's own derive still compiles; only an actual attempt to
+flatten it forces the bound to resolve, surfacing a normal "trait bound not
+satisfied" error at the flattening struct's own derive-generated code — i.e.
+right at the point flatten is applied, not at the enum's own definition.
+**This unsatisfiable-bound trick only works when bound to a still-abstract
+generic parameter of the impl** (e.g. `__KP2`) — binding it to a fully
+concrete type (e.g. `(): FlattenUnsupported`) makes the predicate provably
+impossible independent of any later substitution, and rustc rejects it
+immediately at the enum's own definition instead of deferring.
+
+### `CandidateArmStack` — enum-as-flatten-target for internally-tagged enums
+
+`CandidateArmStack` (`strede/src/map_arm/{mod,borrow,owned}.rs`) is a
+`MapArmStack`/`MapArmStackOwned` impl representing "N candidate variant arm
+stacks, of which only one is ultimately live, racing against one shared key
+stream until a discriminant arm resolves which one." It composes into a
+`StackConcat` exactly like any other flatten field's `make_arms()` output.
+
+- **`Candidate<C, BuildFn>`** — one variant's own contribution: `index` (this
+  candidate's 0-based position, matching its position in the tag's candidate
+  array), `arms: C` (its own arm stack — `<VariantHelper as
+  MapFieldProvider>::make_arms()` for struct/map-shaped-newtype variants,
+  `MapArmBase` for unit variants), `build: FnMut(C::Outputs) ->
+  Option<EnumOut>` (reconstructs the enum variant once selected). `Candidate`/
+  `CandidateBase`/`CandidateArm` form a `+`-composable left-nested list,
+  mirroring `EnumArmBase`/`EnumArm<S>` — a candidate is a whole sub-arm-stack,
+  not a single key/value slot, so it doesn't fit `MapArmSlot`'s shape.
+- **Elimination is driven entirely by the tag arm's dispatch, not a
+  `race_keys` override.** The tag arm is always global index 0; once its
+  value dispatch resolves (`self.tag_matched = Some(idx)`), every subsequent
+  round's `init_race`/`poll_race_one` for every *other* candidate returns
+  `Miss` without ever creating or polling that candidate's arm futures again
+  — `tag_matched` is checked once per round in `init_race` (skip creating a
+  future for a non-matched candidate) and threaded through `poll_race_one`
+  (skip polling one that's still `Some(this_state)` from a stale round). This
+  is enough for internally-tagged enums specifically because the tag match is
+  authoritative and immediate — unlike untagged flatten's "soft" elimination
+  (needs to know whether some *other* candidate hit in the same round; see
+  "Untagged flatten" below for `NoTagCandidateArmStack`, the tag-less
+  counterpart this drove out).
+- **Correctness detail**: until the tag resolves, *all* live candidates race
+  concurrently against the same key stream, so if two different candidates
+  declare a field with the same wire name, ordinary `BIASED` declaration-order
+  tie-break applies (earlier-declared variant's arm wins) — same as any other
+  arm collision elsewhere in this codebase. This is a known, accepted
+  limitation (no attempt to detect or special-case it), consistent with the
+  already-accepted "no wire-name collision detection" limitation documented
+  under `#[strede(flatten)]` in the attribute reference below.
+- **`take_outputs`** looks up `tag_matched`; if `Some(idx)`, it descends the
+  candidate list to build `EnumOut` from candidate `idx`'s own
+  `take_outputs()` via its `build` closure (which is exactly a variant
+  helper's existing `MapFieldProvider::from_outputs`) — if `tag_matched` is
+  `None` (tag never seen), the whole `CandidateArmStack` reports `None`
+  regardless of what any candidate individually accumulated, since without
+  the tag there's no way to know which variant is legitimately meant.
+- **`wire_names()`** surfaces only the tag field's name (at this stack's own
+  relative arm index 0); a candidate's own (non-discriminant) field names
+  colliding with a struct sibling's field name are **not** detected by the
+  outer `DetectDuplicates` — the same accepted limitation externally-tagged
+  flatten already has (see below), for the same reason (`wire_names()` is a
+  non-const trait method; `const`-evaluating it to build a compile-time
+  duplicate check is rejected on stable Rust regardless of structure).
+
+### Adjacently-tagged flatten — enum-as-flatten-target for `#[strede(tag, content)]`
+
+Unlike internally-tagged flatten, adjacently-tagged flatten does **not** use
+`CandidateArmStack` — content is a single opaque value under one fixed key,
+not fields spread into the shared parent map, so there is no per-candidate
+sub-arm-stack to race. The derive
+(`gen_enum_candidate_map_field_provider_adjacent_{borrow,owned}` in
+`strede-derive/src/{borrow,owned}/enum_.rs`) instead emits exactly **2 fixed
+`MapArmSlot` arms**, regardless of variant count:
+
+- **Tag arm**: matches `tag_field`, dispatches `MatchVals<usize, N>` against
+  the variant-name candidates — identical to internally-tagged's own tag arm.
+- **Content arm**: matches `content_field`. Its value-dispatch closure always
+  races every non-unit candidate's `deserialize_value::<CandidateType>()`
+  against forked copies of the same value probe (`fork()` on
+  `MapValueProbe`/`MapValueProbeOwned`) — borrow family: sequential
+  try-in-order (safe, the whole buffer is already materialized; mirrors
+  `gen_untagged_probe_chain_borrow`); owned family: concurrent
+  `select_probe!(biased; ...)` (required — sequentially awaiting one forked
+  candidate to completion before touching the next can deadlock a streaming
+  source; mirrors `gen_untagged_probe_arms_owned`'s identical caution). First
+  Hit wins (declaration-order tie-break, same accepted policy as everywhere
+  else); unit variants never participate in the race.
+
+**Why not give each candidate its own arm matching the literal content key**
+(mirroring how `CandidateArmStack` gives each candidate its own field arms)?
+Disproved by reading `race_keys`: it picks exactly one winning arm by
+declaration order and dispatches only that one. Since every candidate's key
+closure would be an *identical* `Match(content_field)` predicate — not a
+genuine collision between semantically different fields, the case
+`race_keys`'s tie-break is designed to tolerate — the first-declared
+candidate would always win the key race regardless of which type actually
+fits the wire data. Type disambiguation has to happen at the *value* layer
+(inside one arm's dispatch closure), not the *key* layer.
+
+**No `Cell<Option<usize>>` coordination and no `kill!()`** between the two
+arms is needed for correctness. The content arm doesn't need to know the
+tag's state while racing; the verdict is deferred entirely to
+`from_outputs()`, which receives both arms' plain outputs and cross-checks:
+tag resolved to a unit-variant index with content absent → construct that
+unit variant; tag resolved to a non-unit index with content's winning
+candidate index matching → construct that variant; any mismatch (missing
+tag, content present for a unit tag, content's race winner disagreeing with
+the tag) → `None`. This mirrors the standalone (non-flatten) adjacent-tagged
+path's own final `match (opt_tag, opt_content) { ... }` check, just deferred
+to `from_outputs` instead of an inline `match`. Always-racing (rather than
+gating on tag-resolved state to skip straight to one type when the tag
+arrives first) trades a little redundant work in the common tag-before-content
+wire order for a coordination-free implementation.
+
+One structural **advantage over internally-tagged flatten**: since content is
+always dispatched via `deserialize_value` (a fully opaque delegation to
+`T::deserialize`, never `deserialize_map`), tuple variants and newtype
+variants of *any* type (including primitives) are naturally supported with
+no restriction — unlike internally-tagged flatten, which can never support
+tuple variants (no map-shaped representation once fields are spread into the
+parent). Nested `#[strede(flatten)]` inside a candidate variant also
+composes for free through the same opacity. An adjacently-tagged enum mixing
+`#[strede(untagged)]` variants is excluded from flatten entirely, via the
+same unsatisfiable-bound trick internally-tagged uses for its own
+`has_untagged_mix` case.
+
+### Untagged flatten — enum-as-flatten-target for `#[strede(untagged)]`
+
+The last of TESTING_GAPS.md's flatten/tagging combinations (item #3(B-2)).
+Unlike internally-tagged, there is no discriminant key at all: every
+candidate variant's own fields must race directly against the parent's
+shared key stream from round one, using a *soft* elimination rule instead of
+`CandidateArmStack`'s authoritative tag-match. This is the one case that
+genuinely needs a `race_keys`-shaped override rather than reusing the
+default arm-racing loop unchanged — see `NoTagCandidateArmStack` below.
+
+**Elimination rule.** For a shared key round: fork every still-*live*
+candidate's own remaining arms against the same key.
+
+- If **no** live candidate's arms match: the round is a miss, propagating up
+  exactly like any other unrecognized key (parent's own `allow_unknown_fields`
+  handling, if any, takes over) — nobody is eliminated, since "nobody
+  recognizes this" says nothing about which live candidate is right.
+- If **some but not all** live candidates match: every non-matching live
+  candidate is permanently eliminated (`Candidate::live = false`) — it
+  doesn't declare a field the wire data actually has, so (absent
+  `allow_unknown_fields`) it can't be the real variant. This exactly mirrors
+  what that candidate's own standalone `deserialize_map` would do
+  encountering the same unrecognized key.
+- If **every** live candidate matches (e.g. two candidates share a field
+  name — the same undetected wire-name-collision limitation flatten already
+  has elsewhere): no elimination this round; declaration-order tie-break
+  picks whose arm actually gets the value dispatched. The losing candidate's
+  homonymous field is simply never populated (same accepted trade-off
+  documented for `CandidateArmStack`'s own collisions above) — its
+  `ArmState` is left stuck mid-match forever, so a colliding-but-losing
+  candidate can never subsequently win via `take_outputs`, even if every one
+  of its *other* fields later arrives. This is a real, accepted consequence
+  of racing every live candidate's arms against the same key stream, not
+  specific to untagged flatten.
+- `take_outputs`: the first-declared, still-live candidate whose own
+  `unsatisfied_count() == 0` (fully satisfied); `None` if no candidate
+  qualifies.
+
+**`NoTagCandidateArmStack<Candidates, EnumOut>`** (`strede/src/map_arm/{mod,
+borrow,owned}.rs`) is `CandidateArmStack`'s tag-less counterpart, built from
+the *same* `Candidate<C, BuildFn>`/`candidate_arms!` machinery (`Candidate`
+gained two fields for this: `live: bool`, permanent elimination state; and
+`round_hit: bool`, transient per-round bookkeeping reset every round and
+read once at the end of it). Dispatch (`init_dispatch`/`poll_dispatch`/
+`build_winner`) is reused unchanged from the existing `CandidateList`/
+`CandidateListOwned` trait; only the race itself is new, via a second trait
+implemented on the *same* recursive `(Rest, Candidate<C, BuildFn>)` types:
+`NoTagCandidateList`/`NoTagCandidateListOwned`, providing `init_round`
+(fork + start every live candidate's own arm race), `poll_sweep` (settle
+every live candidate to Hit/Miss this round — never stops early just because
+one candidate resolved, since elimination needs the *whole* round settled
+first), `take_winner` (declaration-order winner extraction), and `eliminate`.
+
+**Critical composition pitfall, found the hard way**: this soft-elimination
+race must be driven through `MapArmStack`/`MapArmStackOwned`'s
+`init_race`/`poll_race_one` — *not* a `race_keys` override. Every
+composition primitive in `map_arm` (`StackConcat`, `TagInjectingStack`,
+`DetectDuplicates`, and `CandidateArmStack` itself) reaches a nested arm
+stack's arms via `init_race`/`poll_race_one` directly; none of them ever
+call a nested stack's `race_keys()`. Since `#[strede(flatten)]` splices a
+field's `make_arms()` into the parent via exactly this `StackConcat` path, an
+earlier draft that overrode `race_keys` instead worked fine in isolation
+(calling `iterate()` directly on the enum alone) but was silently never
+invoked once nested inside a flatten `StackConcat` — the bug only surfaced
+once tested through an actual `#[strede(flatten)]` field, not a standalone
+enum. `init_race`/`poll_race_one` are required trait members regardless of
+how a stack drives its own racing, so `NoTagCandidateArmStack`'s `RaceState`
+(`NoTagArmRaceState`) plugs the whole settle-then-eliminate process into
+`poll_race_one`'s per-arm-index polling contract instead.
+
+**Second pitfall**: `poll_race_one` can be called multiple times per round
+for different requested arm indices — once per index the default
+`race_keys` loop visits before finding a `Hit`, and again for its `BIASED`
+re-check of every *lower* index once one is found (never the winning index
+itself — `race_keys` only re-checks `0..i`, excluding `i`). The first draft
+stored "is the round settled" and "the winner's claim" in one `Option`,
+`.take()`n when the winning index was queried — which reset it back to
+`None`, so the very next call for a *different*, non-winning index (the
+`BIASED` re-check) saw "not yet settled" again and re-drove
+`poll_sweep`/`take_winner` on already-consumed per-candidate state,
+panicking. Fixed by splitting into a *sticky* `winner_index: Option<Option<
+usize>>` (set once, never reset) and a separate `winner_claim: Option<
+KeyClaim>` (taken exactly once, only when the winning index is actually
+queried).
+
+**Restrictions, enforced the same unsatisfiable-bound way as
+internally-tagged's own tuple rejection**: only struct-shaped and
+map-shaped-newtype candidates are viable. Tuple variants are rejected via
+the existing `__TupleVariant{N}: MapFieldProvider` never-satisfied trick.
+Unit variants are *also* rejected here (unlike internally-tagged, where Unit
+is fine) — a unit candidate contributes zero arms, so it would be trivially
+"always fully satisfied" from round zero with nothing to disqualify it,
+which is meaningless without a tag to select it; any Unit variant anywhere
+pushes the existing `__KP2: FlattenUnsupported` bound (enum-wide, not
+per-variant, since there's no per-variant helper type to bind it to).
+Codegen (`gen_enum_candidate_map_field_provider_untagged_{borrow,owned}` in
+`strede-derive/src/{borrow,owned}/enum_.rs`) is wired into the pure-untagged
+dispatch path only (`expand_enum_untagged_only`/
+`expand_owned_enum_untagged_only` — no container-level `tag`, no mix with
+tagged variants); the mixed tagged+untagged path gets no flatten provider at
+all, so attempting to flatten such an enum simply fails with an ordinary
+"`MapFieldProvider` not implemented" error.
+
+**Two unrelated pre-existing bugs surfaced while testing this**, both in the
+*standalone* (non-flatten) untagged dispatch, never previously exercised
+because no existing test put a primitive-typed field inside a struct/tuple
+variant of a purely-untagged enum:
+
+1. The shared where-clause bound-push loop in `expand()`/`expand_owned()`
+   (`strede-derive/src/{borrow,owned}/enum_.rs`) pushed a `Deserialize`
+   bound keyed on each variant's *raw field types* (`all_field_types(data)`)
+   for every untagged variant — correct for `Newtype(ty)` (where `ty` *is*
+   the payload passed to `deserialize_value`), but not for `Struct`/`Tuple`
+   variants, whose actual payload is the `__VariantN`/`__TupleVariantN`
+   *helper type*, never bound at all. Fixed by adding a second loop that
+   binds the helper type itself for those two variant kinds.
+2. The owned-family standalone untagged-only `const _: () = { use ... }`
+   block was missing `MapAccessOwned`/`MapKeyProbeOwned`/`MapValueProbeOwned`
+   from scope (present in every sibling block - mixed-untagged, adjacent,
+   internal - just omitted here), needed once a struct variant's helper
+   calls `.deserialize_value()` internally.
+
+Tests: `strede-json/tests/flatten_untagged_candidate_enum_{borrow,owned}.rs`
+(JSON only for now; cbor/msgpack parity deferred). Covers struct- and
+newtype-candidate disambiguation, extra-field elimination, the
+"unrecognized-by-everyone key doesn't eliminate the sole survivor" case, the
+declaration-order collision tie-break, and (owned) a byte-at-a-time chunked
+test exercising the concurrent settle/eliminate logic without deadlocking.
+
 ### `deserialize_option` — null-or-T probe
 
 `Entry::deserialize_option::<T, Extra>(self, extra)` returns:
@@ -711,6 +1001,24 @@ supported. Unknown keys (not claimed by the outer struct or any flattened type)
 are silently skipped. Both families are supported. Cannot be combined with
 `rename`, `alias`, `default`, `skip_deserializing`, `deserialize_with`,
 `deserialize_owned_with`, `with`, `from`, or `try_from`.
+
+A flattened field's type may be a plain struct, an externally-tagged enum, an
+internally-tagged (`#[strede(tag = "t")]`) enum (see `MapFieldProvider` /
+`CandidateArmStack` above), an adjacently-tagged
+(`#[strede(tag = "t", content = "c")]`) enum (see "Adjacently-tagged flatten"
+above), or a purely untagged (`#[strede(untagged)]`) enum (see "Untagged
+flatten" above — only struct-shaped or map-shaped-newtype variants are
+viable, and a mix of tagged and untagged variants can't be a flatten target
+at all). **Known, accepted limitation**: a struct
+field's wire name colliding with a flattened type's own field name (or, for
+an internally-tagged flatten target, one of its candidate variants' field
+names) is not detected — `MapFieldProvider::wire_names()` is a non-const
+trait method, and const-evaluating it to build a compile-time collision
+check is rejected on stable Rust regardless of structure (confirmed via a
+throwaway smoke test), so the check was dropped entirely rather than
+downgraded to a runtime panic: a real collision simply races for the same
+wire-format key with no diagnostic, and whichever arm wins is underspecified.
+Revisit if this causes a real reported bug.
 
 `#[strede(untagged)]` — on an enum or individual variant. Variants marked
 untagged are deserialized by shape (trying each in declaration order) rather

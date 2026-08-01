@@ -1,6 +1,7 @@
 //! Borrow-family `#[strede(with = "module")]` fixture (field level).
 //!
 //! `with` is shorthand for setting `deserialize_with` to `module::deserialize`.
+#![cfg(feature = "alloc")]
 
 use strede::{Deserializer, Entry, Probe};
 use strede::{hit, or_miss};

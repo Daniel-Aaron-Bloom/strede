@@ -2,6 +2,7 @@
 //!
 //! Exercises a hand-written `deserialize_owned` function (hex color string
 //! `"#rrggbb"` -> `u32`) plugged into a derived struct field.
+#![cfg(feature = "alloc")]
 
 use strede::DeserializeOwned;
 use strede::{
