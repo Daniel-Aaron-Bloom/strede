@@ -1525,7 +1525,7 @@ fn gen_enum_map_field_provider_borrow(
         })
         .collect();
     let self_dup_check = if orig_generics.type_params().next().is_none() {
-        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics, false>::CHECK; }
     } else {
         quote! {}
     };
@@ -1535,7 +1535,7 @@ fn gen_enum_map_field_provider_borrow(
     // unconstrained (E0207): it doesn't appear in `Fields` or `Self`.
     let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
     let fields_impl_tokens = quote! {
-        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+        impl #fields_impl_generics #krate::Fields<false> for #name #ty_generics
             #fields_where_clause
         {
             const NAMES: &'static [&'static str] = &[ #( #variant_name_tokens ),* ];
@@ -1797,7 +1797,7 @@ fn gen_enum_candidate_map_field_provider_borrow(
     // fixed, always-present wire name this enum contributes.
     let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
     let fields_impl_tokens = quote! {
-        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+        impl #fields_impl_generics #krate::Fields<false> for #name #ty_generics
             #fields_where_clause
         {
             const NAMES: &'static [&'static str] = &[ #tag_field ];
@@ -2015,7 +2015,7 @@ fn gen_enum_candidate_map_field_provider_untagged_borrow(
     // as the tagged candidate providers above).
     let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
     let fields_impl_tokens = quote! {
-        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+        impl #fields_impl_generics #krate::Fields<false> for #name #ty_generics
             #fields_where_clause
         {
             const NAMES: &'static [&'static str] = &[];
@@ -2277,12 +2277,12 @@ fn gen_enum_candidate_map_field_provider_adjacent_borrow(
     // the same string.
     let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
     let self_dup_check = if orig_generics.type_params().next().is_none() {
-        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics, false>::CHECK; }
     } else {
         quote! {}
     };
     let fields_impl_tokens = quote! {
-        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+        impl #fields_impl_generics #krate::Fields<false> for #name #ty_generics
             #fields_where_clause
         {
             const NAMES: &'static [&'static str] = &[ #tag_field, #content_field ];

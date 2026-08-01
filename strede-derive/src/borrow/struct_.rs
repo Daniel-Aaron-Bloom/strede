@@ -558,9 +558,9 @@ pub(super) fn expand(
         }
     }
     let own_fields_impl_tokens =
-        crate::common::build_own_fields_impl(krate, &own_marker, &own_names_tokens);
+        crate::common::build_own_fields_impl(krate, &own_marker, &own_names_tokens, false);
     let (fields_checks_unconditional, fields_checks_deferred) =
-        crate::common::build_fields_checks(krate, &fields_participants);
+        crate::common::build_fields_checks(krate, &fields_participants, false);
     let concrete_fields_impl_tokens = if all_flatten_concrete {
         let (own_fields_impl_generics, _, own_fields_where_clause) =
             input.generics.split_for_impl();
@@ -572,6 +572,7 @@ pub(super) fn expand(
             own_fields_where_clause,
             &own_marker,
             &concrete_flatten_types,
+            false,
         )
     } else {
         quote! {}
@@ -1142,7 +1143,7 @@ pub(super) fn expand(
                     crate::common::FlattenTier::BareParam(_)
                 ) {
                     wc.predicates.push(syn::parse_quote!(
-                        #flat_ty: #krate::Fields
+                        #flat_ty: #krate::Fields<false>
                     ));
                 }
             }

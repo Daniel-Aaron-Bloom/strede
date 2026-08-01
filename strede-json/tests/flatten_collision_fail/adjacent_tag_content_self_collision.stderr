@@ -1,15 +1,13 @@
 error[E0080]: evaluation panicked: wire name collision: two fields/variants declare the same wire name
  --> $RUST/core/src/panic.rs
   |
-  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `strede::NoInternalDuplicates::<Message>::CHECK` failed here
+  |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `strede::NoInternalDuplicates::<Message>::CHECK` failed here
   |
  ::: $WORKSPACE/strede/src/impls/fields.rs
   |
-  | /             panic!(
-  | |                 "wire name collision: two fields/variants declare the same wire name"
-  | |             );
-  | |_____________- in this macro invocation
+  |             panic!("wire name collision: two fields/variants declare the same wire name");
+  |             ----------------------------------------------------------------------------- in this macro invocation
 
 note: erroneous constant encountered
  --> tests/flatten_collision_fail/adjacent_tag_content_self_collision.rs:6:10

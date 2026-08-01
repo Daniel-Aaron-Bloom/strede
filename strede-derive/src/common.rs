@@ -985,6 +985,7 @@ pub struct FieldsParticipant {
 pub fn build_fields_checks(
     krate: &syn::Path,
     participants: &[FieldsParticipant],
+    owned: bool,
 ) -> (TokenStream2, TokenStream2) {
     let mut unconditional = TokenStream2::new();
     let mut deferred = TokenStream2::new();
@@ -994,11 +995,11 @@ pub fn build_fields_checks(
             let b = &participants[j].ty_tokens;
             if participants[i].generic || participants[j].generic {
                 deferred.extend(quote! {
-                    let _: () = #krate::Disjoint::<#a, #b>::CHECK;
+                    let _: () = #krate::Disjoint::<#a, #b, #owned>::CHECK;
                 });
             } else {
                 unconditional.extend(quote! {
-                    const _: () = #krate::Disjoint::<#a, #b>::CHECK;
+                    const _: () = #krate::Disjoint::<#a, #b, #owned>::CHECK;
                 });
             }
         }
@@ -1006,31 +1007,37 @@ pub fn build_fields_checks(
     (unconditional, deferred)
 }
 
-/// Build the `impl strede::Fields for #own_marker` block plus its
+/// Build the `impl strede::Fields<OWNED> for #own_marker` block plus its
 /// unconditional no-internal-duplicates check, for a synthesized marker type
 /// representing a container's own literal wire names (fields, tag, or
-/// candidate-variant names — never flatten children).
+/// candidate-variant names — never flatten children). `owned` selects the
+/// `Fields<false>` (borrow, `#[derive(Deserialize)]`) or `Fields<true>`
+/// (owned, `#[derive(DeserializeOwned)]`) instantiation — see `Fields`'s own
+/// docs for why this must differ between the two derives on the same type.
 pub fn build_own_fields_impl(
     krate: &syn::Path,
     own_marker: &syn::Ident,
     own_names_tokens: &[TokenStream2],
+    owned: bool,
 ) -> TokenStream2 {
     quote! {
         #[allow(non_camel_case_types)]
         struct #own_marker;
-        impl #krate::Fields for #own_marker {
+        impl #krate::Fields<#owned> for #own_marker {
             const NAMES: &'static [&'static str] = &[ #( #own_names_tokens ),* ];
         }
-        const _: () = #krate::NoInternalDuplicates::<#own_marker>::CHECK;
+        const _: () = #krate::NoInternalDuplicates::<#own_marker, #owned>::CHECK;
     }
 }
 
-/// Build a full, transitively-unioned `impl strede::Fields for #name #ty_generics`
+/// Build a full, transitively-unioned `impl strede::Fields<OWNED> for #name #ty_generics`
 /// — only valid when every flatten participant is [`FlattenTier::Concrete`]
 /// (checked by the caller; `concrete_flatten_types` must contain only those).
 /// Uses plain non-generic array-length arithmetic per concrete participant,
 /// so it needs no unstable `generic_const_exprs` support: every type named in
-/// `concrete_flatten_types` is concrete relative to this impl.
+/// `concrete_flatten_types` is concrete relative to this impl. `owned` selects
+/// `Fields<false>` vs `Fields<true>`, matching `build_own_fields_impl`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_concrete_fields_impl(
     krate: &syn::Path,
     impl_generics: &syn::ImplGenerics,
@@ -1039,11 +1046,12 @@ pub fn build_concrete_fields_impl(
     where_clause: Option<&syn::WhereClause>,
     own_marker: &syn::Ident,
     concrete_flatten_types: &[TokenStream2],
+    owned: bool,
 ) -> TokenStream2 {
     let copy_loops = concrete_flatten_types.iter().map(|ty| {
         quote! {
             {
-                let __src = <#ty as #krate::Fields>::NAMES;
+                let __src = <#ty as #krate::Fields<#owned>>::NAMES;
                 let mut __j = 0usize;
                 while __j < __src.len() {
                     __arr[__i] = __src[__j];
@@ -1054,10 +1062,10 @@ pub fn build_concrete_fields_impl(
         }
     });
     quote! {
-        impl #impl_generics #krate::Fields for #name #ty_generics #where_clause {
+        impl #impl_generics #krate::Fields<#owned> for #name #ty_generics #where_clause {
             const NAMES: &'static [&'static str] = {
-                const __OWN: &[&str] = <#own_marker as #krate::Fields>::NAMES;
-                const __N: usize = __OWN.len() #( + <#concrete_flatten_types as #krate::Fields>::NAMES.len() )*;
+                const __OWN: &[&str] = <#own_marker as #krate::Fields<#owned>>::NAMES;
+                const __N: usize = __OWN.len() #( + <#concrete_flatten_types as #krate::Fields<#owned>>::NAMES.len() )*;
                 const __ARR: [&str; __N] = {
                     let mut __arr: [&str; __N] = [""; __N];
                     let mut __i = 0usize;

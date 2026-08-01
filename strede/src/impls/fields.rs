@@ -17,7 +17,15 @@ use core::marker::PhantomData;
 
 /// Implemented by every `#[derive(Deserialize)]` / `#[derive(DeserializeOwned)]`
 /// struct and enum. See the module docs for what `NAMES` represents.
-pub trait Fields {
+///
+/// `OWNED` distinguishes the borrow-family impl (`Fields<false>`, emitted by
+/// `#[derive(Deserialize)]`) from the owned-family impl (`Fields<true>`,
+/// emitted by `#[derive(DeserializeOwned)]`). A type deriving both ends up
+/// with two independent impls for two different trait instantiations rather
+/// than one shared `Fields` impl — otherwise both derives would try to
+/// implement the very same `impl Fields for T` and conflict (E0119) whenever
+/// both are applied to the same type.
+pub trait Fields<const OWNED: bool = false> {
     const NAMES: &'static [&'static str];
 }
 
@@ -75,9 +83,9 @@ pub const fn has_duplicates(a: &[&str]) -> bool {
 /// Forces a compile-time "no duplicate names within `T` itself" check —
 /// e.g. two fields on the same struct whose `rename`/`alias` values collide,
 /// independent of any `#[strede(flatten)]` composition.
-pub struct NoInternalDuplicates<T>(PhantomData<T>);
+pub struct NoInternalDuplicates<T, const OWNED: bool = false>(PhantomData<T>);
 
-impl<T: Fields> NoInternalDuplicates<T> {
+impl<T: Fields<OWNED>, const OWNED: bool> NoInternalDuplicates<T, OWNED> {
     pub const CHECK: () = {
         if has_duplicates(T::NAMES) {
             panic!("wire name collision: two fields/variants declare the same wire name");
@@ -100,9 +108,9 @@ impl<T: Fields> NoInternalDuplicates<T> {
 /// body, happens exactly when the container is actually used to deserialize.
 /// A collision then surfaces as a compile error at that concrete
 /// instantiation, not at the (still-abstract) generic definition.
-pub struct Disjoint<A, B>(PhantomData<(A, B)>);
+pub struct Disjoint<A, B, const OWNED: bool = false>(PhantomData<(A, B)>);
 
-impl<A: Fields, B: Fields> Disjoint<A, B> {
+impl<A: Fields<OWNED>, B: Fields<OWNED>, const OWNED: bool> Disjoint<A, B, OWNED> {
     pub const CHECK: () = {
         if slices_overlap(A::NAMES, B::NAMES) {
             panic!(
