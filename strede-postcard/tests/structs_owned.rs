@@ -19,6 +19,7 @@ struct Point {
     y: u32,
 }
 
+#[cfg(feature = "alloc")]
 #[derive(Debug, PartialEq, DeserializeOwned)]
 struct Named {
     id: u32,
@@ -82,6 +83,7 @@ fn point_larger_values() {
     );
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn named_with_str() {
     let mut data = varint(42);
@@ -192,6 +194,7 @@ fn tuple_two() {
     assert_eq!(parse_owned!((u32, u32), &data), Ok(Some((10u32, 20u32))));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn tuple_three() {
     let mut data = varint(1);

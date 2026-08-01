@@ -413,7 +413,20 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedJsonEntry<'s, B, F> {
                 }
                 Ok(None) => break,
                 Err(JsonError::UnexpectedEnd) => {
-                    self.handle = refill(self.handle, &mut self.offset).await?;
+                    // See the equivalent comment in
+                    // `ChunkedJsonNumberAccess::next_number_chunk`: `refill` drops the
+                    // handle on a truly-empty next buffer, but a terminal state at
+                    // genuine end-of-stream is a valid place to stop, and we need the
+                    // handle back either way.
+                    let new_h = self.handle.next().await;
+                    self.offset = 0;
+                    self.handle = new_h;
+                    if self.handle.buf().is_empty() {
+                        if access.is_terminal() {
+                            break;
+                        }
+                        return Err(JsonError::UnexpectedEnd);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -488,7 +501,19 @@ async fn drain_num_chunked<'s, B: Buffer, F: AsyncFnMut(&mut B)>(
             Ok(Some(_)) => {}
             Ok(None) => return Ok(handle),
             Err(JsonError::UnexpectedEnd) => {
-                handle = refill(handle, offset).await?;
+                // See the equivalent comment in `ChunkedJsonNumberAccess::next_number_chunk`:
+                // `refill` drops the handle on a truly-empty next buffer, but
+                // a terminal state at genuine end-of-stream is a valid place
+                // to stop, and we need the handle back either way.
+                let new_h = handle.next().await;
+                *offset = 0;
+                if new_h.buf().is_empty() {
+                    if access.is_terminal() {
+                        return Ok(new_h);
+                    }
+                    return Err(JsonError::UnexpectedEnd);
+                }
+                handle = new_h;
             }
             Err(e) => return Err(e),
         }
@@ -663,8 +688,21 @@ pub(crate) async fn capture_raw_value_chunked<'s, B: Buffer, F: AsyncFnMut(&mut 
                                     out.extend_from_slice(
                                         &handle.buf()[seg_start..handle.buf().len()],
                                     );
-                                    handle = refill(handle, offset).await?;
+                                    // See the equivalent comment in
+                                    // `ChunkedJsonNumberAccess::next_number_chunk`: `refill`
+                                    // drops the handle on a truly-empty next buffer, but a
+                                    // terminal state at genuine end-of-stream is a valid
+                                    // place to stop, and we need the handle back either way.
+                                    let new_h = handle.next().await;
+                                    *offset = 0;
                                     seg_start = 0;
+                                    handle = new_h;
+                                    if handle.buf().is_empty() {
+                                        if access.is_terminal() {
+                                            break;
+                                        }
+                                        return Err(JsonError::UnexpectedEnd);
+                                    }
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -1095,7 +1133,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedJsonEnumAc
             offset: self.offset,
             start_offset: self.start_offset,
         };
-        let (_idx, claim) = hit!(arms.race(vp).await);
+        let (_idx, claim) = hit!(arms.race::<true>(vp).await);
         let outputs = arms.take_outputs();
         Ok(Probe::Hit((claim, outputs)))
     }
@@ -1356,10 +1394,10 @@ mod tests {
     #[test]
     fn skip_deep_nesting_mismatch_alloc() {
         let mut input = Vec::new();
-        input.extend(std::iter::repeat(b'[').take(4096));
+        input.extend(std::iter::repeat_n(b'[', 4096));
         input.push(b'{');
         input.push(b']'); // closes `{` with `]` — mismatch
-        input.extend(std::iter::repeat(b']').take(4096));
+        input.extend(std::iter::repeat_n(b']', 4096));
         assert!(skip_input_owned(input).is_err());
     }
 

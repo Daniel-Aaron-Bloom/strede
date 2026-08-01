@@ -16,7 +16,8 @@ use alloc::vec::Vec;
 use strede::{
     Buffer, Deserialize, DeserializeOwned, Probe,
     borrow::{
-        Deserializer as _, Entry as _, MapAccess as _, MapKeyClaim, MapKeyProbe, MapValueProbe,
+        Deserializer as _, Entry as _, KP as BorrowedKP, MapAccess as _, MapKeyClaim, MapKeyProbe,
+        MapValueProbe, VP as BorrowedVP,
     },
     hit,
     owned::{
@@ -86,8 +87,11 @@ impl<'de> Deserialize<'de, JsonSubDeserializer<'de>> for ValueBorrowed<'de> {
                         Probe<(JsonClaim<'de>, Vec<(Cow<'de, str>, ValueBorrowed<'de>)>)>,
                         JsonError,
                     > = alloc::boxed::Box::pin(map.iterate(CollectObject::new(
-                        |kp| kp.deserialize_key::<Cow<'de, str>>(()),
-                        |vp, k| async move {
+                        |kp: BorrowedKP<'de, JsonSubDeserializer<'de>>| {
+                            kp.deserialize_key::<Cow<'de, str>>(())
+                        },
+                        |vp: BorrowedVP<'de, BorrowedKP<'de, JsonSubDeserializer<'de>>>,
+                         k| async move {
                             let (vc, v) = hit!(vp.deserialize_value::<ValueBorrowed<'de>>(()).await);
                             Ok(Probe::Hit((vc, (k, v))))
                         },
@@ -275,6 +279,7 @@ where
                     Ok(Probe::Hit((c, ValueOwned::String(s))))
                 },
                 async move {
+                    #[allow(clippy::type_complexity)]
                     let r: Result<Probe<(ChunkedJsonClaim<'s, B, F>, Vec<ValueOwned>)>, JsonError> =
                         alloc::boxed::Box::pin(e5.deserialize_seq_into::<Vec<ValueOwned>>(())).await;
                     let (c, v) = hit!(r);
@@ -282,6 +287,7 @@ where
                 },
                 async move {
                     let map = hit!(e6.deserialize_map().await);
+                    #[allow(clippy::type_complexity)]
                     let r: Result<
                         Probe<(ChunkedJsonClaim<'s, B, F>, Vec<(String, ValueOwned)>)>,
                         JsonError,

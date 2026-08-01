@@ -1161,7 +1161,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedMsgpackEnu
             token: self.token,
             offset: self.offset,
         };
-        let (_idx, claim) = hit!(arms.race(vp).await);
+        let (_idx, claim) = hit!(arms.race::<true>(vp).await);
         let outputs = arms.take_outputs();
         Ok(Probe::Hit((claim, outputs)))
     }

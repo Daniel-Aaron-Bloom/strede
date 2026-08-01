@@ -1,0 +1,13 @@
+error[E0080]: evaluation panicked: wire name collision: two fields/variants declare the same wire name
+ --> $WORKSPACE/strede/src/impls/fields.rs
+  |
+  |             panic!("wire name collision: two fields/variants declare the same wire name");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `strede::NoInternalDuplicates::<Message>::CHECK` failed here
+
+note: erroneous constant encountered
+ --> tests/flatten_collision_fail/adjacent_tag_content_self_collision.rs:6:10
+  |
+6 | #[derive(Deserialize)]
+  |          ^^^^^^^^^^^
+  |
+  = note: this note originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)

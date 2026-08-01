@@ -158,3 +158,26 @@ fn unit_variant_in_mixed_enum() {
     let msg = fixstr("Ping");
     assert_eq!(parse!(Event, &msg), Some(Event::Ping));
 }
+
+// ---------------------------------------------------------------------------
+// #[strede(other)]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, DeriveDeserializeOwned)]
+enum WithOther {
+    Known,
+    #[strede(other)]
+    Unknown,
+}
+
+#[test]
+fn other_variant_known() {
+    let msg = fixstr("Known");
+    assert_eq!(parse!(WithOther, &msg), Some(WithOther::Known));
+}
+
+#[test]
+fn other_variant_catches_unknown() {
+    let msg = fixstr("Anything");
+    assert_eq!(parse!(WithOther, &msg), Some(WithOther::Unknown));
+}

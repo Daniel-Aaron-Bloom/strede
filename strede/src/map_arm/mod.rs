@@ -1,4 +1,5 @@
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -218,6 +219,260 @@ impl<'v, S, W, TagKeyFn, TagValFn> TagInjectingStack<'v, S, W, TagKeyFn, TagValF
 /// Arm indices from `A` are `0..A::SIZE`; arm indices from `B` are offset
 /// by `A::SIZE`. Outputs are `(A::Outputs, B::Outputs)`.
 pub struct StackConcat<A, B>(pub A, pub B);
+
+// ---------------------------------------------------------------------------
+// CandidateArmStack infrastructure - internally-tagged enum flatten
+// ---------------------------------------------------------------------------
+//
+// Supports `#[strede(flatten)]` on a field whose type is an internally-tagged
+// enum (`#[strede(tag = "t")]`). Unlike a struct's ordinary flatten
+// composition (one shared arm stack via `StackConcat`), an internally-tagged
+// enum's variants are mutually exclusive: only one variant's fields are
+// actually present on the wire, but which one it is may not be known until
+// the tag key arrives (map key order is not guaranteed). `CandidateArmStack`
+// races every variant's own arm stack concurrently against the parent's
+// shared key stream, and the moment the tag key resolves, permanently
+// excludes every other variant's arms from further racing (and, in the same
+// pass, prevents them from stealing a wire key that a later-declared correct
+// variant also happens to share a field name with - see `CandidateList::poll_race_one`).
+//
+// `NoTag` (untagged enums, soft cross-candidate elimination) and adjacently-
+// tagged support are deliberately out of scope for this primitive - see
+// TESTING_GAPS.md item #3(B-2).
+
+/// One candidate variant's own arm stack, participating in a
+/// [`crate::map_arm::borrow::CandidateArmStack`] /
+/// [`crate::map_arm::owned::CandidateArmStackOwned`].
+///
+/// `index` is this candidate's 0-based position among all candidates, in
+/// declaration order - it must match the position used to build the tag's
+/// `tag_candidates` array, since the tag arm identifies a winning candidate
+/// by this same index.
+///
+/// `C`: the candidate's own arm stack (e.g. `<VariantHelper as
+/// MapFieldProvider<'de, KP>>::make_arms()` for a struct/newtype variant, or
+/// `MapArmBase` for a unit variant - a unit variant has no fields of its own,
+/// it exists purely to be selected once the tag matches).
+///
+/// `BuildFn: FnMut(C::Outputs) -> Option<EnumOut>`: reconstructs the
+/// containing enum's variant from this candidate's outputs once the tag has
+/// selected it. Returns `None` if a required field was absent (mirrors
+/// [`crate::MapFieldProvider::from_outputs`]). Called at most once per
+/// `iterate()` call, only for the tag-selected candidate.
+pub struct Candidate<C, BuildFn> {
+    pub index: usize,
+    pub arms: C,
+    pub build: BuildFn,
+    /// Only meaningful to [`crate::map_arm::borrow::NoTagCandidateList`] /
+    /// [`crate::map_arm::owned::NoTagCandidateListOwned`] (untagged-enum
+    /// flatten's soft-elimination race). The tag-based `CandidateList` /
+    /// `CandidateListOwned` impls never read or write this field - elimination
+    /// there is driven entirely by `tag_matched`, not per-candidate liveness.
+    pub live: bool,
+    /// Transient, only meaningful to `NoTagCandidateList`/`NoTagCandidateListOwned`:
+    /// did this candidate's own arms hit *this round*? Recomputed at the start
+    /// of every round (`NoTagCandidateList::init_round`) before being read by
+    /// the elimination pass at the end of that same round - never carries
+    /// meaning across rounds.
+    pub round_hit: bool,
+}
+
+impl<C, BuildFn> Candidate<C, BuildFn> {
+    pub fn new(index: usize, arms: C, build: BuildFn) -> Self {
+        Self {
+            index,
+            arms,
+            build,
+            live: true,
+            round_hit: false,
+        }
+    }
+}
+
+/// Base of the candidate list. Left-nested with `+` via
+/// `Add<CandidateArm<Candidate<C, BuildFn>>>`, mirroring [`crate::EnumArmBase`].
+pub struct CandidateBase;
+
+/// Wrapper that marks a [`Candidate`] as one entry in a candidate list.
+///
+/// Used with `+` on [`CandidateBase`]:
+/// `CandidateBase + CandidateArm(cand0) + CandidateArm(cand1) + ...`
+pub struct CandidateArm<S>(pub S);
+
+impl<C, BuildFn> core::ops::Add<CandidateArm<Candidate<C, BuildFn>>> for CandidateBase {
+    type Output = (CandidateBase, Candidate<C, BuildFn>);
+    fn add(self, rhs: CandidateArm<Candidate<C, BuildFn>>) -> Self::Output {
+        (self, rhs.0)
+    }
+}
+
+impl<Rest, S, C, BuildFn> core::ops::Add<CandidateArm<Candidate<C, BuildFn>>> for (Rest, S) {
+    type Output = ((Rest, S), Candidate<C, BuildFn>);
+    fn add(self, rhs: CandidateArm<Candidate<C, BuildFn>>) -> Self::Output {
+        (self, rhs.0)
+    }
+}
+
+/// Wraps a candidate list to add the shared discriminant (tag) arm.
+///
+/// Tag arm is always global index 0; candidate arms occupy `1..SIZE`. Once
+/// the tag matches candidate `idx`, every other candidate's arms permanently
+/// stop racing (see `CandidateList::poll_race_one`/`init_race`'s
+/// `tag_matched` gating) and `take_outputs` builds `EnumOut` from candidate
+/// `idx` alone.
+pub struct CandidateArmStack<Candidates, EnumOut, W, TagKeyFn, TagValFn> {
+    pub candidates: Candidates,
+    pub tag_field: &'static str,
+    pub tag_candidates: W,
+    pub tag_key_fn: TagKeyFn,
+    pub tag_val_fn: TagValFn,
+    pub tag_matched: Option<usize>,
+    // Ties `EnumOut` to the concrete type so `MapArmStack`/`MapArmStackOwned`'s
+    // `Outputs = Option<EnumOut>` impl is a well-formed, coherence-checkable
+    // type parameter (it otherwise appears only in the `Candidates:
+    // CandidateList<'de, KP, EnumOut>` where-bound, which alone doesn't
+    // constrain an impl's generic parameters).
+    _enum_out: PhantomData<fn() -> EnumOut>,
+}
+
+impl<Candidates, EnumOut, W, TagKeyFn, TagValFn>
+    CandidateArmStack<Candidates, EnumOut, W, TagKeyFn, TagValFn>
+{
+    pub fn new(
+        tag_field: &'static str,
+        tag_candidates: W,
+        tag_key_fn: TagKeyFn,
+        tag_val_fn: TagValFn,
+        candidates: Candidates,
+    ) -> Self {
+        Self {
+            candidates,
+            tag_field,
+            tag_candidates,
+            tag_key_fn,
+            tag_val_fn,
+            tag_matched: None,
+            _enum_out: PhantomData,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NoTagCandidateArmStack - untagged enum flatten
+// ---------------------------------------------------------------------------
+//
+// Supports `#[strede(flatten)]` on a field whose type is a purely untagged
+// enum (`#[strede(untagged)]`, no `tag`). There is no discriminant key at
+// all, so every live candidate's own arm stack races directly against the
+// parent's shared key stream from round one. A candidate is permanently
+// eliminated (`Candidate::live = false`) the first round some *other* live
+// candidate hits a key that this candidate's own arms do not recognize -
+// proof this candidate can't be the real variant, mirroring exactly what its
+// own standalone `deserialize_map` would do encountering the same
+// unrecognized key. See `crate::map_arm::borrow::NoTagCandidateList` /
+// `crate::map_arm::owned::NoTagCandidateListOwned` for the round-settling
+// algorithm, and CLAUDE.md's "Untagged flatten" section for the full design
+// write-up (why this is the one case that genuinely needs a `race_keys`
+// override, unlike `CandidateArmStack` above).
+
+/// Untagged counterpart to [`CandidateArmStack`] - no tag field, no tag
+/// candidates, no tag key/value closures. `Candidates` must implement both
+/// [`crate::map_arm::borrow::CandidateList`] / [`crate::map_arm::owned::CandidateListOwned`]
+/// (dispatch, reused unchanged from the tag-based primitive) and
+/// [`crate::map_arm::borrow::NoTagCandidateList`] /
+/// [`crate::map_arm::owned::NoTagCandidateListOwned`] (the new round-settling
+/// race, used in place of the default `race_keys`).
+pub struct NoTagCandidateArmStack<Candidates, EnumOut> {
+    pub candidates: Candidates,
+    // See `CandidateArmStack::_enum_out` - same rationale.
+    _enum_out: PhantomData<fn() -> EnumOut>,
+}
+
+impl<Candidates, EnumOut> NoTagCandidateArmStack<Candidates, EnumOut> {
+    pub fn new(candidates: Candidates) -> Self {
+        Self {
+            candidates,
+            _enum_out: PhantomData,
+        }
+    }
+}
+
+/// Pinned per-round state for `(Rest, Candidate<C, BuildFn>)`'s
+/// `NoTagCandidateList` / `NoTagCandidateListOwned` impl.
+///
+/// `this` holds the live candidate's own in-progress race state, cleared to
+/// `None` the instant it resolves (mirroring [`poll_key_slot`]'s own
+/// one-shot-then-clear discipline - a resolved arm must never be polled
+/// again, since re-polling an already-consumed slot silently reads back
+/// `Miss`, which would corrupt the round's soft-elimination decision).
+/// `resolved` records this round's outcome once settled: `None` while still
+/// racing, `Some(None)` once every one of the candidate's own local arms has
+/// missed, `Some(Some((global_arm_index, claim)))` once a local arm has hit.
+/// A candidate that isn't live at `init_round` time starts pre-resolved to
+/// `Some(None)` (contributes nothing, races nothing) and is never touched
+/// again until the next round.
+#[pin_project]
+pub struct NoTagRoundState<RestState, CRaceState, KeyClaim> {
+    #[pin]
+    pub rest: RestState,
+    #[pin]
+    pub this: Option<CRaceState>,
+    pub resolved: Option<Option<(usize, KeyClaim)>>,
+}
+
+/// Top-level `RaceState` for [`NoTagCandidateArmStack`]'s `MapArmStack` /
+/// `MapArmStackOwned` impl.
+///
+/// Composition primitives elsewhere in this module (`StackConcat`,
+/// `TagInjectingStack`, `DetectDuplicates`, and `CandidateArmStack` itself)
+/// all reach a nested arm stack's arms via `init_race`/`poll_race_one`
+/// directly - none of them call a nested stack's `race_keys()`. Since
+/// `#[strede(flatten)]` splices a field's `make_arms()` into the parent via
+/// exactly this `StackConcat` path, `NoTagCandidateArmStack` must expose its
+/// soft-elimination race through `init_race`/`poll_race_one` too, not a
+/// `race_keys` override (an earlier draft of this primitive made that
+/// mistake - it worked in isolation, calling `iterate()` directly, but was
+/// silently never invoked once nested inside a flatten `StackConcat`).
+///
+/// `poll_race_one` may be called many times per round for different
+/// requested arm indices - once per index the outer `race_keys` loop visits
+/// before finding a `Hit`, and again for the `BIASED` re-check of every
+/// lower index once one is found (all indices *other* than the winner's own,
+/// which `race_keys` never re-queries once found). `winner_index` is
+/// deliberately *sticky*: once the round settles it is never reset back to
+/// `None`, even after `winner_claim` has been taken - otherwise a later call
+/// for a *different, non-winning* index would see "not yet settled" again
+/// and re-drive `poll_sweep`/`take_winner` on per-candidate state that's
+/// already been consumed (an earlier draft of this stack conflated "settled"
+/// with "claim not yet taken" into one `Option`, taking it on the winning
+/// call - the very next `BIASED`-recheck call for an earlier index then saw
+/// "unsettled" again and panicked trying to re-sweep an already-resolved,
+/// already-cleared candidate). `eliminated` similarly guards the one-time
+/// elimination pass.
+///
+/// Indices stored here are purely *local* to this stack's own `0..SIZE`
+/// range, matching `CandidateList`/`CandidateListOwned`'s existing
+/// convention (see e.g. `StackConcat::poll_race_one`, which adds its own
+/// `A::SIZE` offset on the way back up) - `arm_index` as received by
+/// `poll_race_one` is likewise already local, since the caller subtracts its
+/// own offset before calling in. Neither this stack nor its `arm_base`
+/// parameter (required by the `MapArmStack`/`MapArmStackOwned` trait
+/// signature, but otherwise unused here - untagged candidates never support
+/// positional dispatch) ever needs to add or subtract that offset itself.
+#[pin_project]
+pub struct NoTagArmRaceState<RoundState, KeyClaim> {
+    #[pin]
+    pub round: RoundState,
+    /// `None` until the round has fully settled; `Some(winning_index)`
+    /// afterward, where `winning_index` is itself `None` when nobody hit
+    /// this round. Sticky - never reset once `Some`.
+    pub winner_index: Option<Option<usize>>,
+    /// The winner's claim, present until the winning index is actually
+    /// queried (taken exactly once at that point). `None` before the round
+    /// settles, if there was no winner, or after the claim's been taken.
+    pub winner_claim: Option<KeyClaim>,
+    pub eliminated: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Pin-projection helpers - shared between both arm-stack impls
@@ -513,6 +768,69 @@ macro_rules! TagInjectingStackOwned {
             $tag_value,
             move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
             move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
+        )
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// candidate_arms! and CandidateArmStack! / CandidateArmStackOwned! macros
+// ---------------------------------------------------------------------------
+
+/// Build a left-nested candidate list from a flat list of `index => arms => build` triples.
+///
+/// `index` must match this candidate's position in the `tag_candidates` array
+/// passed to [`CandidateArmStack!`]/[`CandidateArmStackOwned!`].
+///
+/// ```rust,ignore
+/// let candidates = candidate_arms! {
+///     0 => <CircleHelper as MapFieldProvider<'de, _>>::make_arms() => |o| CircleHelper::from_outputs(o).map(Shape::Circle),
+///     1 => MapArmBase => |()| Some(Shape::Ping),
+/// };
+/// ```
+#[macro_export]
+macro_rules! candidate_arms {
+    ($($index:expr => $arms:expr => $build:expr),+ $(,)?) => {
+        $crate::CandidateBase
+            $(+ $crate::CandidateArm($crate::Candidate::new($index, $arms, $build)))+
+    };
+}
+
+/// Constructs a [`CandidateArmStack`] with typed key/value tag closures (borrow family).
+///
+/// `CandidateArmStack!(candidates, tag_field, tag_candidates, KP, VP)`
+#[macro_export]
+macro_rules! CandidateArmStack {
+    ($candidates:expr, $tag_field:expr, $tag_candidates:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbe as _;
+        use $crate::MapValueProbe as _;
+        let __tf = $tag_field;
+        let __tc = $tag_candidates;
+        $crate::CandidateArmStack::new(
+            __tf,
+            __tc,
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
+            move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
+            $candidates,
+        )
+    }};
+}
+
+/// Constructs a [`CandidateArmStack`] with typed key/value tag closures (owned family).
+///
+/// `CandidateArmStackOwned!(candidates, tag_field, tag_candidates, KP, VP)`
+#[macro_export]
+macro_rules! CandidateArmStackOwned {
+    ($candidates:expr, $tag_field:expr, $tag_candidates:expr, $kp:ty, $vp:ty) => {{
+        use $crate::MapKeyProbeOwned as _;
+        use $crate::MapValueProbeOwned as _;
+        let __tf = $tag_field;
+        let __tc = $tag_candidates;
+        $crate::CandidateArmStack::new(
+            __tf,
+            __tc,
+            move |kp: $kp, _i: usize| kp.deserialize_key::<$crate::Match>(__tf),
+            move |vp: $vp| vp.deserialize_value::<$crate::MatchVals<usize, _>>(__tc),
+            $candidates,
         )
     }};
 }

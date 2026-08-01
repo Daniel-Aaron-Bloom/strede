@@ -2,7 +2,7 @@
 //!
 //! `with` is shorthand for setting `deserialize_owned_with` to
 //! `module::deserialize_owned`.
-
+#![cfg(feature = "alloc")]
 extern crate std;
 mod helpers;
 

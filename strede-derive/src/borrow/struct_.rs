@@ -503,6 +503,81 @@ pub(super) fn expand(
         .map(|((n, t), cf)| (n as &syn::Ident, *t, cf.flatten, &cf.borrow))
         .collect();
 
+    // ---- compile-time flatten wire-name collision detection ----------------
+    // See strede::Fields / strede::Disjoint. Every flatten field is classified
+    // relative to this container's own generic type parameters: `Concrete`
+    // (its wire names are knowable right now), `BareParam` (the field's type
+    // literally *is* one of this container's type parameters — the check is
+    // deferred to whenever the container is monomorphized with a concrete
+    // substitution), or `Unprovable` (mentions a container param without being
+    // a bare occurrence of it, e.g. `Box<T>` — no sensible bound to add, so
+    // the pair is left unchecked, same as before this feature existed).
+    let container_type_params: Vec<syn::Ident> = input
+        .generics
+        .type_params()
+        .map(|tp| tp.ident.clone())
+        .collect();
+    let own_names_tokens: Vec<TokenStream2> = de_classified
+        .iter()
+        .flat_map(|cf| {
+            let primary = &cf.wire_name;
+            let mut v = vec![quote! { #primary }];
+            for a in &cf.aliases {
+                v.push(quote! { #a });
+            }
+            v
+        })
+        .collect();
+    let own_marker = format_ident!("__StredeOwnFields");
+    let mut fields_participants: Vec<crate::common::FieldsParticipant> =
+        vec![crate::common::FieldsParticipant {
+            ty_tokens: quote! { #own_marker },
+            generic: false,
+        }];
+    let mut concrete_flatten_types: Vec<TokenStream2> = vec![];
+    let mut all_flatten_concrete = true;
+    for (_, ty, _, _) in &flatten_fields {
+        match crate::common::classify_flatten_tier(ty, &container_type_params) {
+            crate::common::FlattenTier::Concrete => {
+                concrete_flatten_types.push(quote! { #ty });
+                fields_participants.push(crate::common::FieldsParticipant {
+                    ty_tokens: quote! { #ty },
+                    generic: false,
+                });
+            }
+            crate::common::FlattenTier::BareParam(param) => {
+                all_flatten_concrete = false;
+                fields_participants.push(crate::common::FieldsParticipant {
+                    ty_tokens: quote! { #param },
+                    generic: true,
+                });
+            }
+            crate::common::FlattenTier::Unprovable => {
+                all_flatten_concrete = false;
+            }
+        }
+    }
+    let own_fields_impl_tokens =
+        crate::common::build_own_fields_impl(krate, &own_marker, &own_names_tokens, false);
+    let (fields_checks_unconditional, fields_checks_deferred) =
+        crate::common::build_fields_checks(krate, &fields_participants, false);
+    let concrete_fields_impl_tokens = if all_flatten_concrete {
+        let (own_fields_impl_generics, _, own_fields_where_clause) =
+            input.generics.split_for_impl();
+        crate::common::build_concrete_fields_impl(
+            krate,
+            &own_fields_impl_generics,
+            name,
+            &ty_generics,
+            own_fields_where_clause,
+            &own_marker,
+            &concrete_flatten_types,
+            false,
+        )
+    } else {
+        quote! {}
+    };
+
     // For deserialize_with / from / try_from.
     let de_value_types: Vec<TokenStream2> = de_field_names
         .iter()
@@ -650,6 +725,7 @@ pub(super) fn expand(
     let build_arm_slot = |reg_idx: usize| -> TokenStream2 {
         let cf = de_classified[reg_idx];
         let val_type = &de_value_types[reg_idx];
+        let val_conv = &de_value_conversions[reg_idx];
         let mut wire_names: Vec<&str> = vec![cf.wire_name.as_str()];
         for alias in &cf.aliases {
             wire_names.push(alias.as_str());
@@ -688,7 +764,7 @@ pub(super) fn expand(
         let val_fn = quote! {
             |__vp: #krate::borrow::VP<'de, __KP>, __k| async move {
                 let (__vc, __v) = #krate::hit!(__vp.deserialize_value::<#val_type>(()).await);
-                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v))))
+                ::core::result::Result::Ok(#krate::Probe::Hit((__vc, (__k, __v #val_conv))))
             }
         };
         quote! { #krate::MapArmSlot::new(#key_fn, #val_fn) }
@@ -707,7 +783,7 @@ pub(super) fn expand(
                         for r in regs {
                             let cf = de_classified[*r];
                             let kt = key_type_for(cf);
-                            let vt = &de_value_types[*r];
+                            let vt = &de_field_types[*r];
                             t = quote! { (#t, ::core::option::Option<(#kt, #vt)>) };
                         }
                         t
@@ -902,7 +978,6 @@ pub(super) fn expand(
                                 let cf = de_classified[*reg_idx];
                                 let fname = de_field_names[*reg_idx];
                                 let opt_ident = format_ident!("__opt_{}", reg_idx);
-                                let val_conv = &de_value_conversions[*reg_idx];
                                 let none_branch: TokenStream2 = match &cf.default {
                                     Some(DefaultAttr::Trait) => {
                                         quote! { ::core::default::Default::default() }
@@ -916,7 +991,7 @@ pub(super) fn expand(
                                 };
                                 seg_stmts.push(quote! {
                                     let #fname = match #opt_ident {
-                                        ::core::option::Option::Some((_, __v)) => __v #val_conv,
+                                        ::core::option::Option::Some((_, __v)) => __v,
                                         ::core::option::Option::None => #none_branch,
                                     };
                                 });
@@ -1060,6 +1135,17 @@ pub(super) fn expand(
                         as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>:
                         ::core::marker::Copy
                 ));
+                // A bare-generic-param flatten field needs `Fields` in scope so the
+                // deferred collision check (spliced into `wire_names()`'s body below)
+                // type-checks; see `classify_flatten_tier`/`FlattenTier::BareParam`.
+                if matches!(
+                    crate::common::classify_flatten_tier(flat_ty, &container_type_params),
+                    crate::common::FlattenTier::BareParam(_)
+                ) {
+                    wc.predicates.push(syn::parse_quote!(
+                        #flat_ty: #krate::Fields<false>
+                    ));
+                }
             }
         }
     }
@@ -1179,6 +1265,12 @@ pub(super) fn expand(
 
             #dfs_impl
 
+            #own_fields_impl_tokens
+
+            #concrete_fields_impl_tokens
+
+            #fields_checks_unconditional
+
             impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP> for #name #ty_generics
                 #mfp_where_clause
             {
@@ -1186,6 +1278,7 @@ pub(super) fn expand(
                 const ARMS: usize = #arms_const_tokens;
                 type WireNames = #wire_names_type_tokens;
                 fn wire_names() -> Self::WireNames {
+                    #fields_checks_deferred
                     #wire_names_body_tokens
                 }
                 fn make_arms() -> impl #krate::MapArmStack<'de, __KP, Outputs = Self::Outputs, Dynamic = #krate::False> {

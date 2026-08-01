@@ -643,7 +643,7 @@ async fn iterate_dynamic<'de, S: MapArmStack<'de, PostcardMapKeyProbe<'de>>>(
             dynamic: true,
         };
 
-        let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+        let (arm_index, key_claim) = match arms.race_keys::<true>(kp).await? {
             Probe::Hit(x) => x,
             Probe::Miss => return Ok(Probe::Miss),
         };
@@ -680,7 +680,7 @@ async fn iterate_static<'de, S: MapArmStack<'de, PostcardMapKeyProbe<'de>>>(
             dynamic: false,
         };
 
-        let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+        let (arm_index, key_claim) = match arms.race_keys::<true>(kp).await? {
             Probe::Hit(x) => x,
             Probe::Miss => return Ok(Probe::Miss),
         };
@@ -807,7 +807,7 @@ impl<'de> EnumAccess<'de> for PostcardEnumAccess<'de> {
             discriminant: self.discriminant,
             src: self.src,
         };
-        let (_idx, claim) = hit!(arms.race(vp).await);
+        let (_idx, claim) = hit!(arms.race::<true>(vp).await);
         let outputs = arms.take_outputs();
         Ok(Probe::Hit((claim, outputs)))
     }

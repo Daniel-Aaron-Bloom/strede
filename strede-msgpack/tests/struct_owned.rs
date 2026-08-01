@@ -42,6 +42,7 @@ struct Unit;
 #[derive(Debug, PartialEq, DeriveDeserializeOwned)]
 struct Wrapper(u32);
 
+#[cfg(feature = "alloc")]
 #[derive(Debug, PartialEq, DeriveDeserializeOwned)]
 struct Named {
     id: u32,
@@ -100,6 +101,7 @@ fn point_missing_field_misses() {
     assert_eq!(parse!(Point, &msg), None);
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn named_struct_with_string() {
     let id_key = fixstr("id");

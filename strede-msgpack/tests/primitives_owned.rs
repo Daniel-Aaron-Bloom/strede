@@ -149,17 +149,20 @@ fn integer_coerced_to_float() {
 
 // --- strings (owned → String) ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn fixstr_empty() {
     assert_eq!(parse!(String, &[0xa0]), Some(String::new()));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn fixstr_hello() {
     let bytes = fixstr("hello");
     assert_eq!(parse!(String, &bytes), Some("hello".into()));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn str8_format() {
     let s = "x".repeat(50);
@@ -168,6 +171,7 @@ fn str8_format() {
     assert_eq!(parse!(String, &bytes), Some(s.clone()));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn str_misses_non_string() {
     assert_eq!(parse!(String, &[42]), None);

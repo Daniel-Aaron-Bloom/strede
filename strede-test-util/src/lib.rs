@@ -35,6 +35,32 @@ pub fn block_on_loop<F: core::future::Future>(f: F) -> F::Output {
     }
 }
 
+/// Like [`block_on_loop`], but panics after `max_polls` polls instead of
+/// spinning forever.
+///
+/// The owned family's forked-handle contract (CLAUDE.md's "parallel scanning
+/// and deadlock hazard") deadlocks the underlying buffer if a caller awaits
+/// one forked handle to completion instead of racing all of them. Tests that
+/// stage input incrementally are exactly the ones that can trip this, and
+/// `block_on_loop`'s unbounded spin would just hang the test process with no
+/// diagnostic. Use this instead so a regression fails fast with a clear
+/// message.
+pub fn block_on_loop_bounded<F: core::future::Future>(f: F, max_polls: usize) -> F::Output {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = core::pin::pin!(f);
+    for _ in 0..max_polls {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+    }
+    panic!(
+        "future did not resolve within {max_polls} polls - likely a deadlock \
+         (a forked handle was awaited to completion instead of raced concurrently)"
+    );
+}
+
 /// A waker backed by a `Cell<Option<RawAction>>`.  When woken it takes
 /// the stored action and calls it.  The action is a type-erased `FnOnce()`
 /// stored as a raw pointer + caller pair, sidestepping `'static` bounds.

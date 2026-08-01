@@ -2,6 +2,7 @@
 //!
 //! Exercises a hand-written `deserialize` function (hex color string
 //! `"#rrggbb"` -> `u32`) plugged into a derived struct field.
+#![cfg(feature = "alloc")]
 
 use strede::{Deserializer, Entry, Probe};
 use strede::{hit, or_miss};

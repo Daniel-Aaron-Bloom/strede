@@ -89,6 +89,7 @@ fn i128_two_varints_split_across_chunks() {
 
 // --- string length-varint split from its payload ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_length_varint_split_from_payload() {
     // A string long enough that its length varint needs 2 bytes (>127),
@@ -146,6 +147,7 @@ fn seq_count_varint_split_across_chunks() {
 
 // --- map count varint split across chunks (requires alloc's HashMap) ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn map_count_varint_split_for_hashmap() {
     use std::collections::HashMap;

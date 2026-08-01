@@ -228,7 +228,23 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding> NumberAccessOwne
                     }));
                 }
                 Err(JsonError::UnexpectedEnd) => {
-                    self.handle = refill(self.handle, &mut self.offset).await?;
+                    // Don't use the shared `refill` helper here: it drops the
+                    // handle on a truly-empty next buffer, but a terminal
+                    // number state at genuine end-of-stream is a valid place
+                    // to stop, and we need the handle back to build the claim.
+                    let new_h = self.handle.next().await;
+                    self.offset = 0;
+                    if new_h.buf().is_empty() {
+                        if self.access.is_terminal() {
+                            return Ok(Chunk::Done(ChunkedJsonClaim {
+                                tokenizer: Tokenizer::new(),
+                                offset: self.offset,
+                                handle: new_h,
+                            }));
+                        }
+                        return Err(JsonError::UnexpectedEnd);
+                    }
+                    self.handle = new_h;
                 }
                 Err(e) => return Err(e),
             }
@@ -502,20 +518,21 @@ where
 
     loop {
         // Race all arms' key callbacks against this round's key probe.
-        let value_claim: ChunkedJsonClaim<'s, B, F> = match arms.race_keys(key_probe).await? {
-            Probe::Hit((arm_index, key_claim)) => {
-                // A known arm matched. Convert key claim → value probe.
-                let vp: ChunkedJsonValueProbe<'s, B, F> = key_claim.into_value_probe().await?;
-                match arms.dispatch_value(arm_index, vp).await? {
-                    Probe::Hit((vc, ())) => vc,
-                    Probe::Miss => return Ok(Probe::Miss),
+        let value_claim: ChunkedJsonClaim<'s, B, F> =
+            match arms.race_keys::<true>(key_probe).await? {
+                Probe::Hit((arm_index, key_claim)) => {
+                    // A known arm matched. Convert key claim → value probe.
+                    let vp: ChunkedJsonValueProbe<'s, B, F> = key_claim.into_value_probe().await?;
+                    match arms.dispatch_value(arm_index, vp).await? {
+                        Probe::Hit((vc, ())) => vc,
+                        Probe::Miss => return Ok(Probe::Miss),
+                    }
                 }
-            }
-            Probe::Miss => {
-                // No arm matched this key - whole map is a Miss.
-                return Ok(Probe::Miss);
-            }
-        };
+                Probe::Miss => {
+                    // No arm matched this key - whole map is a Miss.
+                    return Ok(Probe::Miss);
+                }
+            };
 
         // Advance to next key or end of map.
         match value_claim

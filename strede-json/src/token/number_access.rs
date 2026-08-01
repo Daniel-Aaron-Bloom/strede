@@ -42,6 +42,10 @@ impl NumberState {
 /// Obtained from [`Token::Number`]. Call [`next_chunk`](Self::next_chunk)
 /// repeatedly until it returns `Ok(None)`, which signals that the number is
 /// complete. After that, use [`Tokenizer::new`] to continue parsing the stream.
+///
+/// `next_chunk` never infers completion from a merely-empty chunk buffer -
+/// only a non-digit terminator byte or the caller confirming (via refill)
+/// that the stream has truly ended can end the number. See [`is_terminal`](Self::is_terminal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NumberAccess {
     state: NumberState,
@@ -53,15 +57,28 @@ impl NumberAccess {
             state: NumberState::Start,
         }
     }
+
+    /// Whether the digit sequence consumed so far is a valid place to stop.
+    ///
+    /// Only meaningful after a refill has confirmed no more bytes exist
+    /// anywhere in the stream - `next_chunk` never uses this to decide
+    /// completion on its own, since an empty chunk buffer doesn't mean the
+    /// stream itself has ended.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
 }
 
 impl NumberAccess {
     /// Yield the next chunk of the current JSON number.
     ///
     /// - `Ok(Some(chunk))` - more number content; zero-copy slice of the source.
-    /// - `Ok(None)` - number finished. Use [`Tokenizer::new`] to continue.
+    /// - `Ok(None)` - a non-digit terminator byte was found. Use [`Tokenizer::new`] to continue.
     /// - `Err(InvalidNumber)` - grammar violation.
-    /// - `Err(UnexpectedEnd)` - stream ended inside an incomplete number.
+    /// - `Err(UnexpectedEnd)` - this chunk is exhausted; refill and retry. This
+    ///   is returned even when [`is_terminal`](Self::is_terminal) is already
+    ///   true - only the caller, by attempting a refill and finding the
+    ///   stream truly empty, can confirm the number is actually complete.
     pub(crate) fn next_chunk<'a>(
         &mut self,
         src: &mut &'a [u8],
@@ -71,14 +88,12 @@ impl NumberAccess {
             return Ok(None);
         }
 
-        // Buffer empty - terminal states end the number cleanly; non-terminal
-        // states mean the stream was truncated mid-number.
+        // Buffer empty - this chunk is exhausted, but that doesn't mean the
+        // stream itself has ended (more digits may arrive on refill). Always
+        // ask the caller to refill; only a refill that comes back truly
+        // empty can confirm the number is actually over (see `is_terminal`).
         if src.is_empty() {
-            return if self.state.is_terminal() {
-                Ok(None)
-            } else {
-                Err(JsonError::UnexpectedEnd)
-            };
+            return Err(JsonError::UnexpectedEnd);
         }
 
         let mut cur_state = self.state;
@@ -358,13 +373,23 @@ mod tests {
 
     // --- number at exact buffer boundary (terminal state, no terminator byte) ---
 
+    /// An empty buffer at a terminal state is *ambiguous* to `next_chunk`
+    /// alone: it can't tell "this chunk ran out, more may be coming" from
+    /// "the stream truly ended here". So it always asks for a refill
+    /// (`UnexpectedEnd`) rather than guessing `None` - only a caller that
+    /// has confirmed a refill yields nothing further should treat
+    /// `is_terminal()` as "the number is actually complete".
     #[test]
     fn number_at_eof_terminal_state() -> Result<(), JsonError> {
         let mut src1: &[u8] = b"42";
         let mut access = NumberAccess::start();
         assert_eq!(access.next_chunk(&mut src1)?, Some("42"));
         let mut empty: &[u8] = b"";
-        assert_eq!(access.next_chunk(&mut empty)?, None);
+        assert_eq!(
+            access.next_chunk(&mut empty).unwrap_err(),
+            JsonError::UnexpectedEnd
+        );
+        assert!(access.is_terminal());
         Ok(())
     }
 }

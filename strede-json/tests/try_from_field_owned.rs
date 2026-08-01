@@ -2,6 +2,7 @@
 //!
 //! `port` is `u16` on the wire-facing struct but deserializes as `i32` and
 //! converts via `u16::try_from(i32)`, missing (not erroring) on failure.
+#![cfg(feature = "alloc")]
 
 use strede::{DeserializeOwned, Probe, SharedBuf};
 use strede_derive::DeserializeOwned as DeriveDeserializeOwned;

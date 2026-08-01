@@ -74,10 +74,11 @@ pub use shared_buf::{Buffer, Handle, SharedBuf};
 
 // -- borrow family --
 pub use borrow::{
-    Ascii, BigEndian, BytesAccess, Deserialize, DeserializeFromEnum, DeserializeFromMap,
-    DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack, EnumVariantProbe,
-    LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe, MapValueClaim, MapValueProbe,
-    NumberAccess, NumberEncoding, SeqAccess, SeqEntry, StrAccess,
+    Ascii, BigEndian, BytesAccess, CandidateList, Deserialize, DeserializeFromEnum,
+    DeserializeFromMap, DeserializeFromSeq, Deserializer, Entry, EnumAccess, EnumArmStack,
+    EnumVariantProbe, LittleEndian, MapAccess, MapArmStack, MapKeyClaim, MapKeyProbe,
+    MapValueClaim, MapValueProbe, NoTagCandidateList, NumberAccess, NumberEncoding, SeqAccess,
+    SeqEntry, StrAccess,
 };
 
 // -- default expression helper --
@@ -109,6 +110,23 @@ impl<T, F: FnOnce() -> T> DefaultWrapper<F> {
     }
 }
 
+/// Marker trait with no implementations anywhere, used by derive-generated
+/// code to make a `MapFieldProvider`/`MapFieldProviderOwned` impl's
+/// where-clause unconditionally unsatisfiable for enum shapes that cannot
+/// participate in `#[strede(flatten)]` (e.g. an internally-tagged enum mixing
+/// `#[strede(untagged)]` variants).
+///
+/// Must be applied to one of the impl's own (still-abstract) generic type
+/// parameters — e.g. `__KP2: FlattenUnsupported` — never to a fully concrete
+/// type like `()`. Rust's trait solver can prove a *concrete* predicate with
+/// no implementations is impossible without waiting for monomorphization,
+/// which rejects the enum's own derive outright; a predicate on a still-generic
+/// parameter can't be proven impossible until something actually substitutes
+/// a concrete type for it, which only happens when the enum is used as a
+/// flatten target — exactly the deferred failure this trait exists for.
+#[doc(hidden)]
+pub trait FlattenUnsupported {}
+
 /// Left-nest a comma-separated list of patterns under a given base pattern.
 ///
 /// `__left_nest_pat!(base, a, b, c)` expands to `((base, a), b), c)`.
@@ -135,8 +153,9 @@ pub use impls::string_enum::{
     match_entry_str_against, match_str_chunks_against, match_str_chunks_against_owned,
 };
 pub use impls::{
-    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, PairSeqKeyProbe, PairSeqMapAccess,
-    PairSeqValueProbe, PairStep, RawSlot, Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse,
+    Disjoint, Fields, MapFieldProvider, MapFieldProviderOwned, Match, MatchVals,
+    NoInternalDuplicates, PairSeqKeyProbe, PairSeqMapAccess, PairSeqValueProbe, PairStep, RawSlot,
+    Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse, has_duplicates, slices_overlap, str_eq,
 };
 
 // -- enum arm building blocks --
@@ -144,12 +163,13 @@ pub use enum_arm::{EnumArm, EnumArmBase, EnumArmSlot, EnumArmStackOwned};
 
 // -- owned family --
 pub use owned::{
-    ArmState, BytesAccessOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned,
-    DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, DetectDuplicates, EntryOwned,
-    EnumAccessOwned, EnumVariantProbeOwned, False, MapAccessOwned, MapArm, MapArmBase, MapArmSlot,
-    MapArmStackOwned, MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned,
-    NextKey, NumberAccessOwned, SeqAccessOwned, SeqEntryOwned, StackConcat, StrAccessOwned,
-    TagInjectingStack, True, VirtualArmSlot,
+    ArmState, BytesAccessOwned, Candidate, CandidateArm, CandidateArmStack, CandidateBase,
+    CandidateListOwned, DeserializeFromEnumOwned, DeserializeFromMapOwned, DeserializeFromSeqOwned,
+    DeserializeOwned, DeserializerOwned, DetectDuplicates, EntryOwned, EnumAccessOwned,
+    EnumVariantProbeOwned, False, MapAccessOwned, MapArm, MapArmBase, MapArmSlot, MapArmStackOwned,
+    MapKeyClaimOwned, MapKeyProbeOwned, MapValueClaimOwned, MapValueProbeOwned, NextKey,
+    NoTagCandidateArmStack, NoTagCandidateListOwned, NumberAccessOwned, SeqAccessOwned,
+    SeqEntryOwned, StackConcat, StrAccessOwned, TagInjectingStack, True, VirtualArmSlot,
 };
 
 #[cfg(feature = "alloc")]

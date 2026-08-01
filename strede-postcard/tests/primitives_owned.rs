@@ -277,11 +277,13 @@ fn char_invalid_codepoint_misses() {
 
 // --- String (owned-family stand-in for &str) ---
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_empty() {
     assert_eq!(parse_owned!(String, &pstr("")), Ok(Some(String::new())));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_hello() {
     assert_eq!(
@@ -290,6 +292,7 @@ fn string_hello() {
     );
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_unicode() {
     assert_eq!(
@@ -298,6 +301,7 @@ fn string_unicode() {
     );
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_truncated_errors() {
     // length says 5 but only 2 bytes follow
@@ -309,6 +313,7 @@ fn string_truncated_errors() {
     );
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn string_invalid_utf8_errors() {
     let mut data = varint(2);
@@ -351,6 +356,7 @@ fn option_some_u32() {
     assert_eq!(parse_owned!(Option<u32>, &data), Ok(Some(Some(42u32))));
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn option_some_str() {
     let mut data = psome(&[]);

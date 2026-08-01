@@ -2,6 +2,7 @@
 //!
 //! `with` is shorthand for setting `deserialize_owned_with` to
 //! `module::deserialize_owned`.
+#![cfg(feature = "alloc")]
 
 use strede::{
     Chunk, DeserializeOwned, DeserializerOwned, EntryOwned, Probe, SharedBuf, StrAccessOwned,

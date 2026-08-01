@@ -10,7 +10,7 @@ name = "json"
 harness = false
 
 [dependencies]
-strede = { path = "../strede" }
+strede = { path = "../strede", default-features = false, features = ["std"] }
 strede-json = { path = "../strede-json" }
 strede-derive = { path = "../strede-derive", features = ["alloc"] }
 strede-test-util = { path = "../strede-test-util" }
@@ -18,4 +18,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }

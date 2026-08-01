@@ -514,7 +514,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedPostcardMap
                 dynamic: false,
             };
 
-            let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+            let (arm_index, key_claim) = match arms.race_keys::<true>(kp).await? {
                 Probe::Hit(x) => x,
                 Probe::Miss => return Ok(Probe::Miss),
             };
@@ -550,7 +550,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> MapAccessOwned for ChunkedPostcardMap
                 dynamic: true,
             };
 
-            let (arm_index, key_claim) = match arms.race_keys(kp).await? {
+            let (arm_index, key_claim) = match arms.race_keys::<true>(kp).await? {
                 Probe::Hit(x) => x,
                 Probe::Miss => return Ok(Probe::Miss),
             };
@@ -601,7 +601,7 @@ impl<'s, B: Buffer, F: AsyncFnMut(&mut B)> EnumAccessOwned for ChunkedPostcardEn
             offset: self.offset,
             discriminant: self.discriminant,
         };
-        let (_idx, claim) = hit!(arms.race(vp).await);
+        let (_idx, claim) = hit!(arms.race::<true>(vp).await);
         let outputs = arms.take_outputs();
         Ok(Probe::Hit((claim, outputs)))
     }
