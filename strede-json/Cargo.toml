@@ -23,3 +23,4 @@ alloc = ["strede/alloc"]
 strede-derive = { path = "../strede-derive", version = "=0.2.2", features = ["alloc"], default-features = false }
 strede-test-util = { path = "../strede-test-util" }
 trybuild = "1"
+rustversion = "1"

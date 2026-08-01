@@ -1,15 +1,10 @@
 error[E0080]: evaluation panicked: wire name collision: two `#[strede(flatten)]` participants declare the same wire name
- --> $RUST/core/src/panic.rs
-  |
-  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `strede::Disjoint::<_::__StredeOwnFields, Colliding>::CHECK` failed here
-  |
- ::: $WORKSPACE/strede/src/impls/fields.rs
+ --> $WORKSPACE/strede/src/impls/fields.rs
   |
   | /             panic!(
   | |                 "wire name collision: two `#[strede(flatten)]` participants declare the same wire name"
   | |             );
-  | |_____________- in this macro invocation
+  | |_____________^ evaluation of `strede::Disjoint::<_::__StredeOwnFields, Colliding>::CHECK` failed here
 
 note: erroneous constant encountered
   --> tests/flatten_collision_fail/generic_flatten_collision.rs:12:10
@@ -19,7 +14,7 @@ note: erroneous constant encountered
    |
    = note: this note originates in the derive macro `Deserialize` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-note: the above error was encountered while instantiating `fn _::<impl MapFieldProvider<'_, JsonMapKeyProbe<'_>> for Wrapper<Colliding>>::wire_names`
+note: the above error was encountered while instantiating `fn _::<impl strede::MapFieldProvider<'_, strede_json::JsonMapKeyProbe<'_>> for Wrapper<Colliding>>::wire_names`
   --> tests/flatten_collision_fail/generic_flatten_collision.rs:12:10
    |
 12 | #[derive(Deserialize)]

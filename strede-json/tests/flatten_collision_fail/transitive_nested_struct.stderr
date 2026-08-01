@@ -1,15 +1,10 @@
 error[E0080]: evaluation panicked: wire name collision: two `#[strede(flatten)]` participants declare the same wire name
- --> $RUST/core/src/panic.rs
-  |
-  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `strede::Disjoint::<_::__StredeOwnFields, Mid>::CHECK` failed here
-  |
- ::: $WORKSPACE/strede/src/impls/fields.rs
+ --> $WORKSPACE/strede/src/impls/fields.rs
   |
   | /             panic!(
   | |                 "wire name collision: two `#[strede(flatten)]` participants declare the same wire name"
   | |             );
-  | |_____________- in this macro invocation
+  | |_____________^ evaluation of `strede::Disjoint::<_::__StredeOwnFields, Mid>::CHECK` failed here
 
 note: erroneous constant encountered
   --> tests/flatten_collision_fail/transitive_nested_struct.rs:18:10
