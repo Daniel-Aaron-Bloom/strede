@@ -121,11 +121,7 @@ fn flatten_untagged_struct_candidate() {
 
 #[test]
 fn flatten_untagged_struct_candidate_sibling_interleaved() {
-    let c: Canvas = parse!(
-        Canvas,
-        br#"{"width": 3, "name": "c3", "height": 4}"#
-    )
-    .unwrap();
+    let c: Canvas = parse!(Canvas, br#"{"width": 3, "name": "c3", "height": 4}"#).unwrap();
     assert_eq!(
         c,
         Canvas {

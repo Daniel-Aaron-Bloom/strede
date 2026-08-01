@@ -29,22 +29,25 @@ enum MaybeU8 {
 macro_rules! parse {
     ($ty:ty, $input:expr) => {{
         let input: &[u8] = $input;
-        block_on_loop_bounded(SharedBuf::with_async(
-            input,
-            async |buf: &mut &[u8]| {
-                *buf = &[];
-            },
-            async |shared| {
-                let de = ChunkedJsonDeserializer::new(shared);
-                match <$ty as DeserializeOwned<_>>::deserialize_owned(de, ())
-                    .await
-                    .unwrap()
-                {
-                    Probe::Hit((_, v)) => Some(v),
-                    Probe::Miss => None,
-                }
-            },
-        ), 20_000)
+        block_on_loop_bounded(
+            SharedBuf::with_async(
+                input,
+                async |buf: &mut &[u8]| {
+                    *buf = &[];
+                },
+                async |shared| {
+                    let de = ChunkedJsonDeserializer::new(shared);
+                    match <$ty as DeserializeOwned<_>>::deserialize_owned(de, ())
+                        .await
+                        .unwrap()
+                    {
+                        Probe::Hit((_, v)) => Some(v),
+                        Probe::Miss => None,
+                    }
+                },
+            ),
+            20_000,
+        )
     }};
 }
 

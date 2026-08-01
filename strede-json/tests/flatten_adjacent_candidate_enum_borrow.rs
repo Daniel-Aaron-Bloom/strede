@@ -93,10 +93,9 @@ fn flatten_adjacent_unit_variant_tag_before_sibling() {
 
 #[test]
 fn flatten_adjacent_struct_variant_tag_before_content() {
-    let e: Envelope = parse(
-        r#"{"tenant": ["a"], "type": "Request", "data": {"id": "1", "method": "GET"}}"#,
-    )
-    .unwrap();
+    let e: Envelope =
+        parse(r#"{"tenant": ["a"], "type": "Request", "data": {"id": "1", "method": "GET"}}"#)
+            .unwrap();
     assert_eq!(
         e,
         Envelope {
@@ -115,10 +114,9 @@ fn flatten_adjacent_struct_variant_content_before_tag() {
     // the wire, forcing the content arm to race every non-unit candidate
     // type before the tag is even seen, then `from_outputs` cross-checks the
     // race winner against the later-resolved tag.
-    let e: Envelope = parse(
-        r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Request"}"#,
-    )
-    .unwrap();
+    let e: Envelope =
+        parse(r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Request"}"#)
+            .unwrap();
     assert_eq!(
         e,
         Envelope {
@@ -135,10 +133,9 @@ fn flatten_adjacent_struct_variant_content_before_tag() {
 fn flatten_adjacent_sibling_before_both() {
     // Three-way interleave: parent's own sibling field arrives first, then
     // content, then tag.
-    let e: Envelope = parse(
-        r#"{"data": {"id": "1", "method": "GET"}, "tenant": ["a"], "type": "Request"}"#,
-    )
-    .unwrap();
+    let e: Envelope =
+        parse(r#"{"data": {"id": "1", "method": "GET"}, "tenant": ["a"], "type": "Request"}"#)
+            .unwrap();
     assert_eq!(
         e,
         Envelope {
@@ -203,9 +200,7 @@ fn flatten_adjacent_missing_nested_flatten_field_misses() {
 
 #[test]
 fn flatten_adjacent_missing_tag_misses() {
-    let v: Option<Envelope> = parse(
-        r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}}"#,
-    );
+    let v: Option<Envelope> = parse(r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}}"#);
     assert!(v.is_none());
 }
 
@@ -220,9 +215,8 @@ fn flatten_adjacent_content_present_for_unit_tag_misses() {
     // `type` names a unit variant, but a `data` key is also present - an
     // explicit behavioral choice (not silently ignored): the mismatch
     // between the unit tag and the present content is rejected.
-    let v: Option<Envelope> = parse(
-        r#"{"tenant": ["a"], "type": "Ping", "data": {"id": "1", "method": "GET"}}"#,
-    );
+    let v: Option<Envelope> =
+        parse(r#"{"tenant": ["a"], "type": "Ping", "data": {"id": "1", "method": "GET"}}"#);
     assert!(v.is_none());
 }
 
@@ -239,10 +233,9 @@ fn flatten_adjacent_multi_candidate_shape_ambiguity_tag_agrees() {
     // declaration order wins (the same accepted tie-break policy used
     // everywhere else in this codebase) - `Request` is declared first. Here
     // the tag agrees with that speculative winner.
-    let e: Envelope = parse(
-        r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Request"}"#,
-    )
-    .unwrap();
+    let e: Envelope =
+        parse(r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Request"}"#)
+            .unwrap();
     assert_eq!(
         e,
         Envelope {
@@ -261,8 +254,7 @@ fn flatten_adjacent_multi_candidate_shape_ambiguity_tag_disagrees() {
     // still speculatively resolves to `Request` (declaration order), and
     // `from_outputs` must catch the disagreement rather than silently
     // keeping the wrong parse.
-    let v: Option<Envelope> = parse(
-        r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Alt"}"#,
-    );
+    let v: Option<Envelope> =
+        parse(r#"{"tenant": ["a"], "data": {"id": "1", "method": "GET"}, "type": "Alt"}"#);
     assert!(v.is_none());
 }

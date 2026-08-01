@@ -901,7 +901,42 @@ fn gen_enum_map_field_provider_owned(
         })
         .collect();
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the borrow family's identically-named block in
+    // strede-derive/src/borrow/enum_.rs::gen_enum_map_field_provider_borrow.
+    let variant_name_tokens: Vec<TokenStream2> = tagged_non_other
+        .iter()
+        .flat_map(|cv| {
+            let mut v = vec![{
+                let wn = &cv.wire_name;
+                quote! { #wn }
+            }];
+            for alias in &cv.aliases {
+                v.push(quote! { #alias });
+            }
+            v
+        })
+        .collect();
+    let self_dup_check = if orig_generics.type_params().next().is_none() {
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+    } else {
+        quote! {}
+    };
+    // Fresh, plain generics (no __KP2) — see the borrow-family comment for why
+    // reusing `mfp_impl_generics` here would leave `__KP2` unconstrained (E0207).
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #( #variant_name_tokens ),* ];
+        }
+        #self_dup_check
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -1102,7 +1137,21 @@ fn gen_enum_candidate_map_field_provider_owned(
         })
         .collect();
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the borrow family's identically-named block in
+    // strede-derive/src/borrow/enum_.rs::gen_enum_candidate_map_field_provider_borrow.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #tag_field ];
+        }
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -1279,7 +1328,21 @@ fn gen_enum_candidate_map_field_provider_untagged_owned(
         quote! { #krate::candidate_arms! { #( #candidate_pieces, )* } }
     };
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the borrow family's identically-named block in
+    // strede-derive/src/borrow/enum_.rs::gen_enum_candidate_map_field_provider_untagged_borrow.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[];
+        }
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -1513,7 +1576,27 @@ fn gen_enum_candidate_map_field_provider_adjacent_owned(
         }
     };
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the borrow family's identically-named block in
+    // strede-derive/src/borrow/enum_.rs::gen_enum_candidate_map_field_provider_adjacent_borrow.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let self_dup_check = if orig_generics.type_params().next().is_none() {
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+    } else {
+        quote! {}
+    };
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #tag_field, #content_field ];
+        }
+        #self_dup_check
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP2> for #name #ty_generics
             #mfp_where_clause
         {

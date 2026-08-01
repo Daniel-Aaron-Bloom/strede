@@ -1,4 +1,6 @@
 use convert_case::{Case, Casing};
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
 use syn::{Fields, Token};
 
 // ---------------------------------------------------------------------------
@@ -934,6 +936,231 @@ fn collect_lifetimes_recursive(ty: &syn::Type, out: &mut Vec<syn::Lifetime>) {
         syn::Type::Slice(s) => collect_lifetimes_recursive(&s.elem, out),
         syn::Type::Paren(p) => collect_lifetimes_recursive(&p.elem, out),
         syn::Type::Group(g) => collect_lifetimes_recursive(&g.elem, out),
+        _ => {}
+    }
+}
+
+/// How a `#[strede(flatten)]` field's type relates to the container's own
+/// generic type parameters, for compile-time wire-name-collision checking
+/// (see `strede::Fields` / `strede::Disjoint`).
+pub enum FlattenTier {
+    /// Type doesn't mention any container type parameter — its `Fields::NAMES`
+    /// is knowable directly, right now, at derive-expansion time.
+    Concrete,
+    /// Type *is* (exactly) one of the container's own type parameters. Its
+    /// `Fields::NAMES` isn't known here, but a `T: Fields` bound lets the
+    /// check be deferred to whenever the container is actually monomorphized
+    /// with a concrete substitution for `T`.
+    BareParam(syn::Ident),
+    /// Type mentions a container type parameter but isn't a bare occurrence
+    /// of it (e.g. `Box<T>`, `Vec<T>`) — there's no sensible `Fields` bound to
+    /// add for a wrapper like this, so the pair can't be checked at all.
+    /// Same (unchecked) behavior as before this feature existed.
+    Unprovable,
+}
+
+/// One participant in a struct/enum's flatten wire-name-collision-check
+/// scope: either the container's own direct fields/tag/candidates (a
+/// synthesized marker type), or a `#[strede(flatten)]` field's own type.
+pub struct FieldsParticipant {
+    /// Tokens for a type implementing `strede::Fields` (or, for `generic`
+    /// participants, a still-abstract type parameter bound to `Fields`).
+    pub ty_tokens: TokenStream2,
+    /// `true` for a [`FlattenTier::BareParam`] participant: the check
+    /// against it must be deferred (embedded in a real, later-monomorphized
+    /// fn body) rather than asserted unconditionally at derive-expansion time.
+    pub generic: bool,
+}
+
+/// Build every pairwise disjointness check among `participants` (typically:
+/// index 0 is the container's own fields, the rest are flatten fields).
+///
+/// Returns `(unconditional, deferred)`:
+/// - `unconditional`: `const _: () = ...;` items, fired immediately and
+///   unconditionally wherever spliced in — used for pairs where both sides
+///   are concrete at derive-expansion time.
+/// - `deferred`: `let _: () = ...;` statements to splice into a real,
+///   already-generic function body (e.g. `wire_names()`) so the check fires
+///   once a still-abstract participant is actually monomorphized.
+pub fn build_fields_checks(
+    krate: &syn::Path,
+    participants: &[FieldsParticipant],
+) -> (TokenStream2, TokenStream2) {
+    let mut unconditional = TokenStream2::new();
+    let mut deferred = TokenStream2::new();
+    for i in 0..participants.len() {
+        for j in (i + 1)..participants.len() {
+            let a = &participants[i].ty_tokens;
+            let b = &participants[j].ty_tokens;
+            if participants[i].generic || participants[j].generic {
+                deferred.extend(quote! {
+                    let _: () = #krate::Disjoint::<#a, #b>::CHECK;
+                });
+            } else {
+                unconditional.extend(quote! {
+                    const _: () = #krate::Disjoint::<#a, #b>::CHECK;
+                });
+            }
+        }
+    }
+    (unconditional, deferred)
+}
+
+/// Build the `impl strede::Fields for #own_marker` block plus its
+/// unconditional no-internal-duplicates check, for a synthesized marker type
+/// representing a container's own literal wire names (fields, tag, or
+/// candidate-variant names — never flatten children).
+pub fn build_own_fields_impl(
+    krate: &syn::Path,
+    own_marker: &syn::Ident,
+    own_names_tokens: &[TokenStream2],
+) -> TokenStream2 {
+    quote! {
+        #[allow(non_camel_case_types)]
+        struct #own_marker;
+        impl #krate::Fields for #own_marker {
+            const NAMES: &'static [&'static str] = &[ #( #own_names_tokens ),* ];
+        }
+        const _: () = #krate::NoInternalDuplicates::<#own_marker>::CHECK;
+    }
+}
+
+/// Build a full, transitively-unioned `impl strede::Fields for #name #ty_generics`
+/// — only valid when every flatten participant is [`FlattenTier::Concrete`]
+/// (checked by the caller; `concrete_flatten_types` must contain only those).
+/// Uses plain non-generic array-length arithmetic per concrete participant,
+/// so it needs no unstable `generic_const_exprs` support: every type named in
+/// `concrete_flatten_types` is concrete relative to this impl.
+pub fn build_concrete_fields_impl(
+    krate: &syn::Path,
+    impl_generics: &syn::ImplGenerics,
+    name: &syn::Ident,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+    own_marker: &syn::Ident,
+    concrete_flatten_types: &[TokenStream2],
+) -> TokenStream2 {
+    let copy_loops = concrete_flatten_types.iter().map(|ty| {
+        quote! {
+            {
+                let __src = <#ty as #krate::Fields>::NAMES;
+                let mut __j = 0usize;
+                while __j < __src.len() {
+                    __arr[__i] = __src[__j];
+                    __i += 1;
+                    __j += 1;
+                }
+            }
+        }
+    });
+    quote! {
+        impl #impl_generics #krate::Fields for #name #ty_generics #where_clause {
+            const NAMES: &'static [&'static str] = {
+                const __OWN: &[&str] = <#own_marker as #krate::Fields>::NAMES;
+                const __N: usize = __OWN.len() #( + <#concrete_flatten_types as #krate::Fields>::NAMES.len() )*;
+                const __ARR: [&str; __N] = {
+                    let mut __arr: [&str; __N] = [""; __N];
+                    let mut __i = 0usize;
+                    while __i < __OWN.len() {
+                        __arr[__i] = __OWN[__i];
+                        __i += 1;
+                    }
+                    #( #copy_loops )*
+                    __arr
+                };
+                &__ARR
+            };
+        }
+    }
+}
+
+/// Classify a `#[strede(flatten)]` field's type against the container's own
+/// generic type parameters. See [`FlattenTier`] for what each case means.
+pub fn classify_flatten_tier(ty: &syn::Type, params: &[syn::Ident]) -> FlattenTier {
+    if let syn::Type::Path(p) = ty
+        && p.qself.is_none()
+        && p.path.leading_colon.is_none()
+        && p.path.segments.len() == 1
+    {
+        let seg = &p.path.segments[0];
+        if matches!(seg.arguments, syn::PathArguments::None)
+            && let Some(param) = params.iter().find(|ident| **ident == seg.ident)
+        {
+            return FlattenTier::BareParam(param.clone());
+        }
+    }
+    if type_mentions_param(ty, params) {
+        FlattenTier::Unprovable
+    } else {
+        FlattenTier::Concrete
+    }
+}
+
+/// Does `ty` mention any of `params` anywhere in its type tree (including
+/// nested generics, e.g. `Vec<T>`, `Option<Box<T>>`)?
+///
+/// Used to classify a `#[strede(flatten)]` field's type as "concrete at
+/// derive-expansion time" (can build a compile-time wire-name set for it) vs.
+/// "still abstract" (the field's type is, or depends on, one of the
+/// container's own generic type parameters — its wire names cannot be known
+/// until the container itself is monomorphized with a concrete substitution).
+pub fn type_mentions_param(ty: &syn::Type, params: &[syn::Ident]) -> bool {
+    let mut found = false;
+    walk_type_idents(ty, &mut |ident| {
+        if params.iter().any(|p| p == ident) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn walk_type_idents(ty: &syn::Type, f: &mut impl FnMut(&syn::Ident)) {
+    match ty {
+        syn::Type::Path(p) => {
+            if let Some(qself) = &p.qself {
+                walk_type_idents(&qself.ty, f);
+            }
+            // A bare single-segment path (e.g. `T`) is the common case for a
+            // container's own type parameter appearing directly as a field type.
+            if p.qself.is_none()
+                && p.path.leading_colon.is_none()
+                && let Some(seg) = p.path.segments.last()
+                && p.path.segments.len() == 1
+            {
+                f(&seg.ident);
+            }
+            for seg in &p.path.segments {
+                match &seg.arguments {
+                    syn::PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            if let syn::GenericArgument::Type(t) = arg {
+                                walk_type_idents(t, f);
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(args) => {
+                        for t in &args.inputs {
+                            walk_type_idents(t, f);
+                        }
+                        if let syn::ReturnType::Type(_, t) = &args.output {
+                            walk_type_idents(t, f);
+                        }
+                    }
+                    syn::PathArguments::None => {}
+                }
+            }
+        }
+        syn::Type::Reference(r) => walk_type_idents(&r.elem, f),
+        syn::Type::Tuple(t) => {
+            for elem in &t.elems {
+                walk_type_idents(elem, f);
+            }
+        }
+        syn::Type::Array(a) => walk_type_idents(&a.elem, f),
+        syn::Type::Slice(s) => walk_type_idents(&s.elem, f),
+        syn::Type::Paren(p) => walk_type_idents(&p.elem, f),
+        syn::Type::Group(g) => walk_type_idents(&g.elem, f),
+        syn::Type::Ptr(p) => walk_type_idents(&p.elem, f),
         _ => {}
     }
 }

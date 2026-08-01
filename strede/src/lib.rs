@@ -153,8 +153,9 @@ pub use impls::string_enum::{
     match_entry_str_against, match_str_chunks_against, match_str_chunks_against_owned,
 };
 pub use impls::{
-    MapFieldProvider, MapFieldProviderOwned, Match, MatchVals, PairSeqKeyProbe, PairSeqMapAccess,
-    PairSeqValueProbe, PairStep, RawSlot, Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse,
+    Disjoint, Fields, MapFieldProvider, MapFieldProviderOwned, Match, MatchVals,
+    NoInternalDuplicates, PairSeqKeyProbe, PairSeqMapAccess, PairSeqValueProbe, PairStep, RawSlot,
+    Skip, TagAwareMap, TagAwareMapOwned, UnwrapOrElse, has_duplicates, slices_overlap, str_eq,
 };
 
 // -- enum arm building blocks --

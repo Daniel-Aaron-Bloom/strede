@@ -1507,7 +1507,45 @@ fn gen_enum_map_field_provider_borrow(
         })
         .collect();
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // An externally-tagged enum's *only* contribution when flattened is its
+    // variant names (+ aliases) — the matched variant's own inner fields live
+    // one map level deeper (a separate, nested map), never surfacing here.
+    let variant_name_tokens: Vec<TokenStream2> = tagged_non_other
+        .iter()
+        .flat_map(|cv| {
+            let mut v = vec![{
+                let wn = &cv.wire_name;
+                quote! { #wn }
+            }];
+            for alias in &cv.aliases {
+                v.push(quote! { #alias });
+            }
+            v
+        })
+        .collect();
+    let self_dup_check = if orig_generics.type_params().next().is_none() {
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+    } else {
+        quote! {}
+    };
+    // Fresh, plain generics (no __KP2) — NAMES is pure string literal data,
+    // independent of the map-key-probe machinery the MapFieldProvider impl
+    // above needs. Reusing `mfp_impl_generics` here would leave `__KP2`
+    // unconstrained (E0207): it doesn't appear in `Fields` or `Self`.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #( #variant_name_tokens ),* ];
+        }
+        #self_dup_check
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -1748,7 +1786,27 @@ fn gen_enum_candidate_map_field_provider_borrow(
         })
         .collect();
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the existing runtime `WireNames`/`wire_names()` precedent just
+    // above (`[(&'static str, usize); 1]`, tag field only): candidate variant
+    // fields are *not* recursed into, exactly like `DetectDuplicates` already
+    // doesn't check across candidate boundaries (candidates race the same key
+    // stream and are disambiguated by the tag, not by wire-name uniqueness —
+    // see the accepted declaration-order tie-break behavior documented on
+    // `CandidateArmStack`). Only the tag field name itself is a genuinely
+    // fixed, always-present wire name this enum contributes.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #tag_field ];
+        }
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -1950,7 +2008,23 @@ fn gen_enum_candidate_map_field_provider_untagged_borrow(
         quote! { #krate::candidate_arms! { #( #candidate_pieces, )* } }
     };
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // An untagged enum has no discriminant key at all — nothing is a fixed
+    // wire name here, mirroring the runtime `WireNames = [(); 0]` precedent
+    // directly below (candidate fields are not recursed into, same rationale
+    // as the tagged candidate providers above).
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[];
+        }
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
             #mfp_where_clause
         {
@@ -2194,7 +2268,31 @@ fn gen_enum_candidate_map_field_provider_adjacent_borrow(
         quote! {}
     };
 
+    // ---- compile-time wire-name collision detection (see strede::Fields) ---
+    // Mirrors the runtime `WireNames` precedent below (`[tag, content]`, no
+    // candidate recursion) — see `gen_enum_candidate_map_field_provider_borrow`'s
+    // identical rationale. `content_field` is always opaque (never merged),
+    // and `tag_field` is the only genuinely fixed wire name; a self-dup check
+    // is meaningful here since a misconfigured container could set the two to
+    // the same string.
+    let (fields_impl_generics, _, fields_where_clause) = orig_generics.split_for_impl();
+    let self_dup_check = if orig_generics.type_params().next().is_none() {
+        quote! { const _: () = #krate::NoInternalDuplicates::<#name #ty_generics>::CHECK; }
+    } else {
+        quote! {}
+    };
+    let fields_impl_tokens = quote! {
+        impl #fields_impl_generics #krate::Fields for #name #ty_generics
+            #fields_where_clause
+        {
+            const NAMES: &'static [&'static str] = &[ #tag_field, #content_field ];
+        }
+        #self_dup_check
+    };
+
     quote! {
+        #fields_impl_tokens
+
         impl #mfp_impl_generics #krate::MapFieldProvider<'de, __KP2> for #name #ty_generics
             #mfp_where_clause
         {

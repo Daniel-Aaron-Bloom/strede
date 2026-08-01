@@ -10,11 +10,12 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "alloc")]
+use crate::borrow::BytesAccess;
 use crate::{
     Chunk, Probe,
     borrow::{
-        BytesAccess, Deserialize, DeserializeFromSeq, Deserializer, Entry, SeqAccess, SeqEntry,
-        StrAccess,
+        Deserialize, DeserializeFromSeq, Deserializer, Entry, SeqAccess, SeqEntry, StrAccess,
     },
     owned::{
         DeserializeFromSeqOwned, DeserializeOwned, DeserializerOwned, EntryOwned, SeqAccessOwned,
@@ -23,15 +24,18 @@ use crate::{
 };
 use core::marker::PhantomData;
 
+mod fields;
 mod flat_source;
 mod maps;
 mod pair_seq_map;
 mod sequences;
 pub mod string_enum;
+#[cfg(feature = "alloc")]
 mod strings;
 mod tag_flatten;
 mod utility;
 
+pub use fields::{Disjoint, Fields, NoInternalDuplicates, has_duplicates, slices_overlap, str_eq};
 pub use flat_source::{MapFieldProvider, MapFieldProviderOwned};
 pub use pair_seq_map::{PairSeqKeyProbe, PairSeqMapAccess, PairSeqValueProbe, PairStep, RawSlot};
 pub use tag_flatten::{TagAwareMap, TagAwareMapOwned};

@@ -7,8 +7,8 @@ use super::{
     ArmState, Candidate, CandidateArmStack, CandidateBase, ConcatDispatchProj, ConcatDispatchState,
     ConcatRaceState, DetectDuplicates, False, MapArmBase, MapArmSlot, NoTagArmRaceState,
     NoTagCandidateArmStack, NoTagRoundState, SlotDispatchProj, SlotDispatchState, SlotRaceState,
-    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
-    WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
+    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState,
+    VirtualArmSlot, WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
 };
 use crate::Probe;
 use crate::borrow::{MapKeyProbe, VC as BVC, VP as BVP};
@@ -1071,7 +1071,11 @@ impl<'de, KP: MapKeyProbe<'de>, EnumOut> NoTagCandidateList<'de, KP, EnumOut> fo
     fn init_round(&mut self, _kp: KP) {}
 
     #[inline(always)]
-    fn poll_sweep(&mut self, _state: Pin<&mut ()>, _cx: &mut Context<'_>) -> Result<bool, KP::Error> {
+    fn poll_sweep(
+        &mut self,
+        _state: Pin<&mut ()>,
+        _cx: &mut Context<'_>,
+    ) -> Result<bool, KP::Error> {
         Ok(true)
     }
 
@@ -1204,7 +1208,8 @@ where
 // NoTagCandidateArmStack impl (borrow family)
 // ---------------------------------------------------------------------------
 
-impl<'de, KP, Candidates, EnumOut> MapArmStack<'de, KP> for NoTagCandidateArmStack<Candidates, EnumOut>
+impl<'de, KP, Candidates, EnumOut> MapArmStack<'de, KP>
+    for NoTagCandidateArmStack<Candidates, EnumOut>
 where
     KP: MapKeyProbe<'de>,
     Candidates: CandidateList<'de, KP, EnumOut> + NoTagCandidateList<'de, KP, EnumOut>,

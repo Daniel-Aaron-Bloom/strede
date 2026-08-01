@@ -7,8 +7,8 @@ use super::{
     ArmState, Candidate, CandidateArmStack, CandidateBase, ConcatDispatchProj, ConcatDispatchState,
     ConcatRaceState, DetectDuplicates, False, MapArmBase, MapArmSlot, NoTagArmRaceState,
     NoTagCandidateArmStack, NoTagRoundState, SlotDispatchProj, SlotDispatchState, SlotRaceState,
-    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState, VirtualArmSlot,
-    WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
+    StackConcat, TagDispatchProj, TagDispatchState, TagInjectingStack, TagRaceState,
+    VirtualArmSlot, WrapperDispatchProj, WrapperDispatchState, WrapperRaceState, poll_key_slot,
 };
 use crate::Probe;
 use crate::owned::{MapKeyProbeOwned, VC as OVC, VP as OVP};
@@ -1100,7 +1100,11 @@ impl<KP: MapKeyProbeOwned, EnumOut> NoTagCandidateListOwned<KP, EnumOut> for Can
     fn init_round(&mut self, _kp: KP) {}
 
     #[inline(always)]
-    fn poll_sweep(&mut self, _state: Pin<&mut ()>, _cx: &mut Context<'_>) -> Result<bool, KP::Error> {
+    fn poll_sweep(
+        &mut self,
+        _state: Pin<&mut ()>,
+        _cx: &mut Context<'_>,
+    ) -> Result<bool, KP::Error> {
         Ok(true)
     }
 

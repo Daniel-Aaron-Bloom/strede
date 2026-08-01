@@ -173,6 +173,7 @@ mod systemtime_impls {
 // implementation parameterized over a MapCollect<K, V> collection type.
 // -------------------------------------------------------------------------
 
+#[cfg(feature = "alloc")]
 mod collect_map {
     use super::*;
     use crate::borrow::{MapKeyProbe, VC, VP};

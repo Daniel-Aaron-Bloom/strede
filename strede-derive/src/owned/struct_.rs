@@ -404,6 +404,74 @@ pub(super) fn expand_owned(
         .iter()
         .filter(|cf| !cf.skip_deserializing && cf.flatten == crate::common::FlattenMode::None)
         .collect();
+
+    // ---- compile-time flatten wire-name collision detection ----------------
+    // See strede::Fields / strede::Disjoint. Mirrors the borrow family's
+    // identically-named block in strede-derive/src/borrow/struct_.rs.
+    let container_type_params: Vec<syn::Ident> = input
+        .generics
+        .type_params()
+        .map(|tp| tp.ident.clone())
+        .collect();
+    let own_names_tokens: Vec<TokenStream2> = de_classified
+        .iter()
+        .flat_map(|cf| {
+            let primary = &cf.wire_name;
+            let mut v = vec![quote! { #primary }];
+            for a in &cf.aliases {
+                v.push(quote! { #a });
+            }
+            v
+        })
+        .collect();
+    let own_marker = format_ident!("__StredeOwnFields");
+    let mut fields_participants: Vec<crate::common::FieldsParticipant> =
+        vec![crate::common::FieldsParticipant {
+            ty_tokens: quote! { #own_marker },
+            generic: false,
+        }];
+    let mut concrete_flatten_types: Vec<TokenStream2> = vec![];
+    let mut all_flatten_concrete = true;
+    for (_, ty, _) in &flatten_fields {
+        match crate::common::classify_flatten_tier(ty, &container_type_params) {
+            crate::common::FlattenTier::Concrete => {
+                concrete_flatten_types.push(quote! { #ty });
+                fields_participants.push(crate::common::FieldsParticipant {
+                    ty_tokens: quote! { #ty },
+                    generic: false,
+                });
+            }
+            crate::common::FlattenTier::BareParam(param) => {
+                all_flatten_concrete = false;
+                fields_participants.push(crate::common::FieldsParticipant {
+                    ty_tokens: quote! { #param },
+                    generic: true,
+                });
+            }
+            crate::common::FlattenTier::Unprovable => {
+                all_flatten_concrete = false;
+            }
+        }
+    }
+    let own_fields_impl_tokens =
+        crate::common::build_own_fields_impl(krate, &own_marker, &own_names_tokens);
+    let (fields_checks_unconditional, fields_checks_deferred) =
+        crate::common::build_fields_checks(krate, &fields_participants);
+    let concrete_fields_impl_tokens = if all_flatten_concrete {
+        let (own_fields_impl_generics, _, own_fields_where_clause) =
+            input.generics.split_for_impl();
+        crate::common::build_concrete_fields_impl(
+            krate,
+            &own_fields_impl_generics,
+            name,
+            &ty_generics,
+            own_fields_where_clause,
+            &own_marker,
+            &concrete_flatten_types,
+        )
+    } else {
+        quote! {}
+    };
     let de_value_types: Vec<TokenStream2> = de_field_names
         .iter()
         .zip(de_classified.iter())
@@ -899,6 +967,17 @@ pub(super) fn expand_owned(
                         as #krate::ConcatableArray>::OtherArray<(&'static str, usize)>:
                         ::core::marker::Copy
                 ));
+                // A bare-generic-param flatten field needs `Fields` in scope so the
+                // deferred collision check (spliced into `wire_names()`'s body below)
+                // type-checks; see `classify_flatten_tier`/`FlattenTier::BareParam`.
+                if matches!(
+                    crate::common::classify_flatten_tier(flat_ty, &container_type_params),
+                    crate::common::FlattenTier::BareParam(_)
+                ) {
+                    wc.predicates.push(syn::parse_quote!(
+                        #flat_ty: #krate::Fields
+                    ));
+                }
             }
         }
     }
@@ -1013,6 +1092,12 @@ pub(super) fn expand_owned(
 
             #dfs_impl
 
+            #own_fields_impl_tokens
+
+            #concrete_fields_impl_tokens
+
+            #fields_checks_unconditional
+
             impl #mfp_impl_generics #krate::MapFieldProviderOwned<__KP> for #name #ty_generics
                 #mfp_where_clause
             {
@@ -1020,6 +1105,7 @@ pub(super) fn expand_owned(
                 const ARMS: usize = #arms_const_tokens;
                 type WireNames = #wire_names_type_tokens;
                 fn wire_names() -> Self::WireNames {
+                    #fields_checks_deferred
                     #wire_names_body_tokens
                 }
                 fn make_arms() -> impl #krate::MapArmStackOwned<__KP, Outputs = Self::Outputs, Dynamic = #krate::False> {
