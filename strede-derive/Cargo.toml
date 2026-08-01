@@ -18,7 +18,7 @@ proc-macro = true
 alloc = []
 
 [dependencies]
-syn  = { version = "2", features = ["full"] }
+syn  = { version = "3.0.3", default-features = false, features = ["derive", "parsing", "printing", "clone-impls", "proc-macro"] }
 quote = "1"
 proc-macro2 = "1"
 convert_case = "0.11"

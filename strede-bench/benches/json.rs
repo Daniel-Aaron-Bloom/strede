@@ -1,7 +1,8 @@
 #![recursion_limit = "512"]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use serde::Deserialize as SerdeDeserialize;
+use std::hint::black_box;
 use strede::Probe;
 use strede::{DeserializeOwned, SharedBuf};
 use strede_json::{JsonDeserializer, chunked::ChunkedJsonDeserializer};

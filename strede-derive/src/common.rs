@@ -1147,8 +1147,8 @@ fn walk_type_idents(ty: &syn::Type, f: &mut impl FnMut(&syn::Ident)) {
                         }
                     }
                     syn::PathArguments::Parenthesized(args) => {
-                        for t in &args.inputs {
-                            walk_type_idents(t, f);
+                        for arg in &args.inputs {
+                            walk_type_idents(&arg.ty, f);
                         }
                         if let syn::ReturnType::Type(_, t) = &args.output {
                             walk_type_idents(t, f);
