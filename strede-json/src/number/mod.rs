@@ -19,8 +19,6 @@ use strede::Ascii;
 use strede::Chunk;
 #[cfg(not(feature = "arbitrary_precision"))]
 use strede::borrow::{Deserialize, Deserializer, Entry};
-#[cfg(feature = "arbitrary_precision")]
-use strede::owned::NumberAccessOwned;
 use strede::owned::{DeserializeOwned, DeserializerOwned, EntryOwned};
 #[cfg(not(all(feature = "arbitrary_precision", feature = "alloc")))]
 use strede::select_probe;
@@ -292,6 +290,7 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
         }
         #[cfg(all(feature = "arbitrary_precision", feature = "alloc"))]
         {
+            use strede::NumberAccessOwned;
             d.entry(|[e]| async {
                 let mut chunks = hit!(e.deserialize_number_chunks::<Ascii>().await);
                 let mut raw = alloc::string::String::new();
