@@ -135,7 +135,10 @@ pub(crate) async fn decode_i128<'s, B: Buffer, F: AsyncFnMut(&mut B), C: Bincode
         Ok((handle, C::Order::read_u128(b) as i128))
     } else {
         let (handle, raw) = decode_varint_u128::<_, _, C::Order>(handle, offset, 254).await?;
-        Ok((handle, zigzag_decode(raw.expect("254 permits every prefix"))))
+        Ok((
+            handle,
+            zigzag_decode(raw.expect("254 permits every prefix")),
+        ))
     }
 }
 

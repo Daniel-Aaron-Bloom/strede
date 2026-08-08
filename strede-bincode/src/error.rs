@@ -33,7 +33,10 @@ impl fmt::Display for BincodeError {
             Self::ExpectedEnd => write!(f, "trailing bytes after top-level value"),
             Self::DuplicateField(name) => write!(f, "duplicate field `{name}`"),
             Self::InvalidVarint => write!(f, "invalid varint prefix byte"),
-            Self::NonCanonicalVarint => write!(f, "non-canonical varint: prefix wider than the decoded value needs"),
+            Self::NonCanonicalVarint => write!(
+                f,
+                "non-canonical varint: prefix wider than the decoded value needs"
+            ),
             Self::CannotSkip => write!(f, "cannot skip a value: bincode is schema-driven"),
         }
     }

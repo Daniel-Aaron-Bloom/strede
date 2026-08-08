@@ -30,17 +30,26 @@ macro_rules! numeric_tests_for_config {
 
             #[test]
             fn u16_roundtrip() {
-                assert_eq!(parse_owned!(u16, $cfg, &E.u16(u16::MAX)), Ok(Some(u16::MAX)));
+                assert_eq!(
+                    parse_owned!(u16, $cfg, &E.u16(u16::MAX)),
+                    Ok(Some(u16::MAX))
+                );
             }
 
             #[test]
             fn u32_roundtrip() {
-                assert_eq!(parse_owned!(u32, $cfg, &E.u32(u32::MAX)), Ok(Some(u32::MAX)));
+                assert_eq!(
+                    parse_owned!(u32, $cfg, &E.u32(u32::MAX)),
+                    Ok(Some(u32::MAX))
+                );
             }
 
             #[test]
             fn u64_roundtrip() {
-                assert_eq!(parse_owned!(u64, $cfg, &E.u64(u64::MAX)), Ok(Some(u64::MAX)));
+                assert_eq!(
+                    parse_owned!(u64, $cfg, &E.u64(u64::MAX)),
+                    Ok(Some(u64::MAX))
+                );
             }
 
             #[test]
@@ -53,12 +62,18 @@ macro_rules! numeric_tests_for_config {
 
             #[test]
             fn i16_roundtrip() {
-                assert_eq!(parse_owned!(i16, $cfg, &E.i16(i16::MIN)), Ok(Some(i16::MIN)));
+                assert_eq!(
+                    parse_owned!(i16, $cfg, &E.i16(i16::MIN)),
+                    Ok(Some(i16::MIN))
+                );
             }
 
             #[test]
             fn i64_roundtrip() {
-                assert_eq!(parse_owned!(i64, $cfg, &E.i64(i64::MIN)), Ok(Some(i64::MIN)));
+                assert_eq!(
+                    parse_owned!(i64, $cfg, &E.i64(i64::MIN)),
+                    Ok(Some(i64::MIN))
+                );
             }
 
             #[test]
@@ -92,7 +107,10 @@ fn unit_trailing_bytes_errors() {
 
 #[test]
 fn bool_false() {
-    assert_eq!(parse_owned!(bool, Standard, &E.bool(false)), Ok(Some(false)));
+    assert_eq!(
+        parse_owned!(bool, Standard, &E.bool(false)),
+        Ok(Some(false))
+    );
 }
 
 #[test]
@@ -227,7 +245,10 @@ fn bytes_values() {
 
 #[test]
 fn option_none() {
-    assert_eq!(parse_owned!(Option<u32>, Standard, &E.none()), Ok(Some(None)));
+    assert_eq!(
+        parse_owned!(Option<u32>, Standard, &E.none()),
+        Ok(Some(None))
+    );
 }
 
 #[test]

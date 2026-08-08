@@ -122,7 +122,9 @@ pub struct ChunkedBincodeMapKeyProbe<'s, C: BincodeConfig, B: Buffer, F: AsyncFn
     pub(crate) _cfg: PhantomData<C>,
 }
 
-impl<'s, C: BincodeConfig, B: Buffer, F: AsyncFnMut(&mut B)> ChunkedBincodeMapKeyProbe<'s, C, B, F> {
+impl<'s, C: BincodeConfig, B: Buffer, F: AsyncFnMut(&mut B)>
+    ChunkedBincodeMapKeyProbe<'s, C, B, F>
+{
     #[inline(always)]
     fn clone(&mut self) -> Self {
         Self {
@@ -269,8 +271,7 @@ where
 {
     if seq.remaining == 0 {
         return Ok(Probe::Hit(Chunk::Done(ChunkedBincodeClaim::new(
-            seq.handle,
-            seq.offset,
+            seq.handle, seq.offset,
         ))));
     }
     seq.remaining -= 1;

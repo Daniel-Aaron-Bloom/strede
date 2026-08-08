@@ -290,6 +290,7 @@ impl<D: DeserializerOwned> DeserializeOwned<D> for NumberOwned {
         }
         #[cfg(all(feature = "arbitrary_precision", feature = "alloc"))]
         {
+            use strede::NumberAccessOwned;
             d.entry(|[e]| async {
                 let mut chunks = hit!(e.deserialize_number_chunks::<Ascii>().await);
                 let mut raw = alloc::string::String::new();

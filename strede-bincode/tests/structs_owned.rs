@@ -49,7 +49,10 @@ struct Nested {
 
 #[test]
 fn unit_struct_zero_bytes() {
-    assert_eq!(parse_owned!(UnitStruct, Standard, &[]), Ok(Some(UnitStruct)));
+    assert_eq!(
+        parse_owned!(UnitStruct, Standard, &[]),
+        Ok(Some(UnitStruct))
+    );
 }
 
 #[test]
@@ -107,10 +110,7 @@ fn newtype_u32() {
 fn pair_two_fields() {
     let mut data = E.u32(10);
     data.extend_from_slice(&E.u32(20));
-    assert_eq!(
-        parse_owned!(Pair, Standard, &data),
-        Ok(Some(Pair(10, 20)))
-    );
+    assert_eq!(parse_owned!(Pair, Standard, &data), Ok(Some(Pair(10, 20))));
 }
 
 // --- Flatten ---

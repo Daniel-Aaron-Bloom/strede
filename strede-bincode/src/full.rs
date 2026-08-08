@@ -56,7 +56,9 @@ pub struct BincodeClaim<'de, C: BincodeConfig> {
 
 impl<'de, C: BincodeConfig> core::fmt::Debug for BincodeClaim<'de, C> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("BincodeClaim").field("src", &self.src).finish()
+        f.debug_struct("BincodeClaim")
+            .field("src", &self.src)
+            .finish()
     }
 }
 

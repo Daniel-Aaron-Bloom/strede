@@ -469,7 +469,10 @@ impl<'s, C: BincodeConfig, B: Buffer, F: AsyncFnMut(&mut B), Enc: NumberEncoding
         f: impl FnOnce(&Enc::Data) -> R,
     ) -> Result<Chunk<(Self, R), Self::Claim>, Self::Error> {
         if self.done {
-            return Ok(Chunk::Done(ChunkedBincodeClaim::new(self.handle, self.offset)));
+            return Ok(Chunk::Done(ChunkedBincodeClaim::new(
+                self.handle,
+                self.offset,
+            )));
         }
         // `Enc::NAME == <C::Order as NumberEncoding>::NAME` was already
         // checked in `deserialize_number_chunks`.

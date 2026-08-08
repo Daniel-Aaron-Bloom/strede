@@ -100,10 +100,7 @@ macro_rules! varint_boundary_tests_for_config {
 
             #[test]
             fn u16_out_of_range_misses() {
-                assert_eq!(
-                    parse::<u16, $cfg>(&E.u32(u16::MAX as u32 + 1)),
-                    Ok(None)
-                );
+                assert_eq!(parse::<u16, $cfg>(&E.u32(u16::MAX as u32 + 1)), Ok(None));
             }
 
             #[test]
@@ -122,10 +119,7 @@ macro_rules! varint_boundary_tests_for_config {
 
             #[test]
             fn u32_out_of_range_misses() {
-                assert_eq!(
-                    parse::<u32, $cfg>(&E.u64(u32::MAX as u64 + 1)),
-                    Ok(None)
-                );
+                assert_eq!(parse::<u32, $cfg>(&E.u64(u32::MAX as u64 + 1)), Ok(None));
             }
 
             // --- Non-canonical varint rejection (real bincode2 parity) ---
@@ -173,7 +167,6 @@ macro_rules! varint_boundary_tests_for_config {
                 let data = E.varint_with_prefix(254, 100);
                 assert_eq!(parse::<u128, $cfg>(&data), Ok(Some(100)));
             }
-
         }
     };
 }
@@ -340,10 +333,7 @@ fn option_none() {
 #[test]
 fn option_some_u32() {
     let data = E.some(&E.u32(42));
-    assert_eq!(
-        parse::<Option<u32>, Standard>(&data),
-        Ok(Some(Some(42u32)))
-    );
+    assert_eq!(parse::<Option<u32>, Standard>(&data), Ok(Some(Some(42u32))));
 }
 
 #[test]
@@ -381,8 +371,5 @@ fn skip_is_unsupported() {
 fn trailing_bytes_errors() {
     let mut data = E.u32(42);
     data.push(0x00);
-    assert_eq!(
-        parse_err::<u32, Standard>(&data),
-        BincodeError::ExpectedEnd
-    );
+    assert_eq!(parse_err::<u32, Standard>(&data), BincodeError::ExpectedEnd);
 }

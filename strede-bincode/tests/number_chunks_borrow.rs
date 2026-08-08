@@ -74,7 +74,10 @@ fn four_byte_tail_excludes_prefix() {
     let v: u32 = 100_000;
     let bytes = E.u32(v);
     assert_eq!(bytes[0], 252);
-    assert_eq!(collect_le::<Standard>(&bytes), Some(v.to_le_bytes().to_vec()));
+    assert_eq!(
+        collect_le::<Standard>(&bytes),
+        Some(v.to_le_bytes().to_vec())
+    );
 }
 
 #[test]
@@ -82,7 +85,10 @@ fn eight_byte_tail_excludes_prefix() {
     let v: u64 = u32::MAX as u64 + 1;
     let bytes = E.u64(v);
     assert_eq!(bytes[0], 253);
-    assert_eq!(collect_le::<Standard>(&bytes), Some(v.to_le_bytes().to_vec()));
+    assert_eq!(
+        collect_le::<Standard>(&bytes),
+        Some(v.to_le_bytes().to_vec())
+    );
 }
 
 #[test]
@@ -90,7 +96,10 @@ fn sixteen_byte_tail_excludes_prefix() {
     let v: u128 = u64::MAX as u128 + 1;
     let bytes = E.u128(v);
     assert_eq!(bytes[0], 254);
-    assert_eq!(collect_le::<Standard>(&bytes), Some(v.to_le_bytes().to_vec()));
+    assert_eq!(
+        collect_le::<Standard>(&bytes),
+        Some(v.to_le_bytes().to_vec())
+    );
 }
 
 #[test]

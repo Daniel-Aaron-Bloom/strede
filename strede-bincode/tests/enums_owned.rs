@@ -81,10 +81,7 @@ fn tagged_b() {
 
 #[test]
 fn unknown_discriminant_misses() {
-    assert_eq!(
-        parse_owned!(Tagged, Standard, &E.discriminant(3)),
-        Ok(None)
-    );
+    assert_eq!(parse_owned!(Tagged, Standard, &E.discriminant(3)), Ok(None));
 }
 
 #[test]
