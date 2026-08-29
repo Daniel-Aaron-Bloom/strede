@@ -86,6 +86,29 @@ struct DeepNested {
     tree: Level2,
 }
 
+/// A 15-field struct — matches the field count that triggered the
+/// #[inline(always)] -> #[inline] build-time fix, to measure any runtime cost.
+#[derive(
+    Debug, PartialEq, strede_derive::Deserialize, strede_derive::DeserializeOwned, SerdeDeserialize,
+)]
+struct Wide15 {
+    f0: u64,
+    f1: u64,
+    f2: u64,
+    f3: u64,
+    f4: u64,
+    f5: u64,
+    f6: u64,
+    f7: u64,
+    f8: u64,
+    f9: u64,
+    f10: u64,
+    f11: u64,
+    f12: u64,
+    f13: u64,
+    f14: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Benchmark inputs (static byte slices — no allocation at benchmark time)
 // ---------------------------------------------------------------------------
@@ -100,6 +123,9 @@ static LOG_JSON_REORDERED: &[u8] =
 
 static RECT_JSON: &[u8] =
     br#"{"top_left": {"x": 0, "y": 0}, "bottom_right": {"x": 1920, "y": 1080}}"#;
+
+static WIDE15_JSON: &[u8] = br#"{"f0":0,"f1":1,"f2":2,"f3":3,"f4":4,"f5":5,"f6":6,"f7":7,"f8":8,"f9":9,"f10":10,"f11":11,"f12":12,"f13":13,"f14":14}"#;
+static WIDE15_JSON_REORDERED: &[u8] = br#"{"f14":14,"f7":7,"f0":0,"f9":9,"f2":2,"f11":11,"f4":4,"f13":13,"f6":6,"f1":1,"f8":8,"f3":3,"f10":10,"f5":5,"f12":12}"#;
 
 static DEEP_JSON: &[u8] = br#"{
     "label": 7,
@@ -236,11 +262,35 @@ fn bench_deep_nested(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_wide15(c: &mut Criterion) {
+    let mut g = c.benchmark_group("wide15");
+    g.bench_function("strede/borrow/in-order", |b| {
+        b.iter(|| strede_borrow!(Wide15, WIDE15_JSON))
+    });
+    g.bench_function("strede/borrow/reordered", |b| {
+        b.iter(|| strede_borrow!(Wide15, WIDE15_JSON_REORDERED))
+    });
+    g.bench_function("strede/owned/in-order", |b| {
+        b.iter(|| strede_owned!(Wide15, WIDE15_JSON))
+    });
+    g.bench_function("strede/owned/reordered", |b| {
+        b.iter(|| strede_owned!(Wide15, WIDE15_JSON_REORDERED))
+    });
+    g.bench_function("serde_json/in-order", |b| {
+        b.iter(|| serde!(Wide15, WIDE15_JSON))
+    });
+    g.bench_function("serde_json/reordered", |b| {
+        b.iter(|| serde!(Wide15, WIDE15_JSON_REORDERED))
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_point,
     bench_log_entry,
     bench_rect,
-    bench_deep_nested
+    bench_deep_nested,
+    bench_wide15
 );
 criterion_main!(benches);

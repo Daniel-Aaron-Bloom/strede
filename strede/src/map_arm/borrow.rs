@@ -141,20 +141,20 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
     type Dynamic = False;
     type Outputs = ();
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         0
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         0
     }
 
     type RaceState = ();
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, _kp: KP, _arm_base: usize, _field_base: usize) {}
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         _state: Pin<&mut ()>,
@@ -166,11 +166,11 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
 
     type DispatchState = core::convert::Infallible;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, _arm_index: usize, _vp: BVP<'de, KP>) -> Self::DispatchState {
         unreachable!("init_dispatch called on MapArmBase")
     }
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         _state: Pin<&mut Self::DispatchState>,
@@ -179,7 +179,7 @@ impl<'de, KP: MapKeyProbe<'de>> MapArmStack<'de, KP> for MapArmBase {
         unreachable!("poll_dispatch called on MapArmBase")
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) {}
 }
 
@@ -200,18 +200,18 @@ where
     type Dynamic = Rest::Dynamic;
     type Outputs = (Rest::Outputs, Option<(K, V)>);
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count() + if self.1.state.is_done() { 0 } else { 1 }
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         self.0.open_count() + if self.1.state.is_done() { 0 } else { 1 }
     }
 
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = if self.1.state.is_done() {
@@ -225,7 +225,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -250,7 +250,7 @@ where
 
     type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             let k = match core::mem::replace(&mut self.1.state, ArmState::Empty) {
@@ -263,7 +263,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -283,7 +283,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         let out = match mem::replace(&mut self.1.state, ArmState::Empty) {
             ArmState::Done(k, v) => Some((k, v)),
@@ -310,18 +310,18 @@ where
     type Dynamic = Rest::Dynamic;
     type Outputs = Rest::Outputs;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count()
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         self.0.open_count() + 1
     }
 
     type RaceState = SlotRaceState<Rest::RaceState, KeyFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let rest_kp = kp.fork();
         let this_fut = (self.1.key_fn)(kp, arm_base + Self::SIZE - 1);
@@ -331,7 +331,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -356,7 +356,7 @@ where
 
     type DispatchState = SlotDispatchState<Rest::DispatchState, ValFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             let k = self
@@ -370,7 +370,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -382,7 +382,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.0.take_outputs()
     }
@@ -412,18 +412,18 @@ where
     type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         self.inner.unsatisfied_count()
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         self.inner.open_count() + 1
     }
 
     type RaceState = WrapperRaceState<S::RaceState, KeyFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let dup_kp = kp.fork();
         let dup_fut = (self.key_fn)(dup_kp, arm_base + Self::SIZE - 1);
@@ -433,7 +433,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -458,7 +458,7 @@ where
 
     type DispatchState = WrapperDispatchState<S::DispatchState, SkipFut>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index == Self::SIZE - 1 {
             WrapperDispatchState::Virtual((self.skip_fn)(vp))
@@ -467,7 +467,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -484,7 +484,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.inner.take_outputs()
     }
@@ -509,18 +509,18 @@ where
     type Dynamic = S::Dynamic;
     type Outputs = S::Outputs;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         self.inner.unsatisfied_count()
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         self.inner.open_count() + 1
     }
 
     type RaceState = TagRaceState<TagKeyFut, S::RaceState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let inner_kp = kp.fork();
         // Tag arm is always at global index 0; arm_base is irrelevant for it
@@ -532,7 +532,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -559,7 +559,7 @@ where
 
     type DispatchState = TagDispatchState<TagValFut, S::DispatchState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index == 0 {
             TagDispatchState::Tag((self.tag_val_fn)(vp))
@@ -568,7 +568,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -588,7 +588,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         self.inner.take_outputs()
     }
@@ -610,18 +610,18 @@ where
     type Dynamic = A::Dynamic;
     type Outputs = (A::Outputs, B::Outputs);
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         self.0.unsatisfied_count() + self.1.unsatisfied_count()
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         self.0.open_count() + self.1.open_count()
     }
 
     type RaceState = ConcatRaceState<A::RaceState, B::RaceState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, field_base: usize) -> Self::RaceState {
         let b_kp = kp.fork();
         ConcatRaceState {
@@ -632,7 +632,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -654,7 +654,7 @@ where
 
     type DispatchState = ConcatDispatchState<A::DispatchState, B::DispatchState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index < A::SIZE {
             ConcatDispatchState::InA(self.0.init_dispatch(arm_index, vp))
@@ -663,7 +663,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -675,7 +675,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         (self.0.take_outputs(), self.1.take_outputs())
     }
@@ -733,19 +733,19 @@ pub trait CandidateList<'de, KP: MapKeyProbe<'de>, EnumOut>: Sized {
 impl<'de, KP: MapKeyProbe<'de>, EnumOut> CandidateList<'de, KP, EnumOut> for CandidateBase {
     const SIZE: usize = 0;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self, _target_index: usize) -> usize {
         unreachable!("target candidate index not found (CandidateBase)")
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self, _tag_matched: Option<usize>) -> usize {
         0
     }
 
     type RaceState = ();
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, _kp: KP, _arm_base: usize, _tag_matched: Option<usize>) {}
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         _state: Pin<&mut ()>,
@@ -757,11 +757,11 @@ impl<'de, KP: MapKeyProbe<'de>, EnumOut> CandidateList<'de, KP, EnumOut> for Can
     }
 
     type DispatchState = core::convert::Infallible;
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, _arm_index: usize, _vp: BVP<'de, KP>) -> Self::DispatchState {
         unreachable!("init_dispatch called on CandidateBase")
     }
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         _state: Pin<&mut Self::DispatchState>,
@@ -770,7 +770,7 @@ impl<'de, KP: MapKeyProbe<'de>, EnumOut> CandidateList<'de, KP, EnumOut> for Can
         unreachable!("poll_dispatch called on CandidateBase")
     }
 
-    #[inline(always)]
+    #[inline]
     fn build_winner(&mut self, _target_index: usize) -> Option<EnumOut> {
         unreachable!("build_winner: target index not found among candidates")
     }
@@ -786,7 +786,7 @@ where
 {
     const SIZE: usize = Rest::SIZE + C::SIZE;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self, target_index: usize) -> usize {
         if self.1.index == target_index {
             self.1.arms.unsatisfied_count()
@@ -794,7 +794,7 @@ where
             self.0.unsatisfied_count(target_index)
         }
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self, tag_matched: Option<usize>) -> usize {
         let this_active = tag_matched.is_none_or(|idx| idx == self.1.index);
         let this = if this_active {
@@ -807,7 +807,7 @@ where
 
     type RaceState = SlotRaceState<Rest::RaceState, C::RaceState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(
         &mut self,
         mut kp: KP,
@@ -827,7 +827,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -855,7 +855,7 @@ where
 
     type DispatchState = ConcatDispatchState<Rest::DispatchState, C::DispatchState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index < Rest::SIZE {
             ConcatDispatchState::InA(self.0.init_dispatch(arm_index, vp))
@@ -864,7 +864,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -876,7 +876,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn build_winner(&mut self, target_index: usize) -> Option<EnumOut> {
         if self.1.index == target_index {
             let outputs = self.1.arms.take_outputs();
@@ -909,14 +909,14 @@ where
     type Dynamic = False;
     type Outputs = Option<EnumOut>;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         match self.tag_matched {
             None => 1,
             Some(idx) => self.candidates.unsatisfied_count(idx),
         }
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         match self.tag_matched {
             None => 1 + self.candidates.open_count(None),
@@ -926,7 +926,7 @@ where
 
     type RaceState = TagRaceState<TagKeyFut, Candidates::RaceState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, mut kp: KP, arm_base: usize, _field_base: usize) -> Self::RaceState {
         let tag_fut = if self.tag_matched.is_some() {
             None
@@ -941,7 +941,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_race_one(
         &mut self,
         state: Pin<&mut Self::RaceState>,
@@ -973,7 +973,7 @@ where
 
     type DispatchState = TagDispatchState<TagValFut, Candidates::DispatchState>;
 
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         if arm_index == 0 {
             TagDispatchState::Tag((self.tag_val_fn)(vp))
@@ -982,7 +982,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -1002,7 +1002,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         match self.tag_matched {
             Some(idx) => self.candidates.build_winner(idx),
@@ -1067,10 +1067,10 @@ pub trait NoTagCandidateList<'de, KP: MapKeyProbe<'de>, EnumOut>: Sized {
 impl<'de, KP: MapKeyProbe<'de>, EnumOut> NoTagCandidateList<'de, KP, EnumOut> for CandidateBase {
     type RoundState = ();
 
-    #[inline(always)]
+    #[inline]
     fn init_round(&mut self, _kp: KP) {}
 
-    #[inline(always)]
+    #[inline]
     fn poll_sweep(
         &mut self,
         _state: Pin<&mut ()>,
@@ -1079,15 +1079,15 @@ impl<'de, KP: MapKeyProbe<'de>, EnumOut> NoTagCandidateList<'de, KP, EnumOut> fo
         Ok(true)
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_winner(&mut self, _state: Pin<&mut ()>) -> Option<(usize, KP::KeyClaim)> {
         None
     }
 
-    #[inline(always)]
+    #[inline]
     fn eliminate(&mut self, _any_hit: bool) {}
 
-    #[inline(always)]
+    #[inline]
     fn first_satisfied_live(&self) -> Option<usize> {
         None
     }
@@ -1103,7 +1103,7 @@ where
 {
     type RoundState = NoTagRoundState<Rest::RoundState, C::RaceState, KP::KeyClaim>;
 
-    #[inline(always)]
+    #[inline]
     fn init_round(&mut self, mut kp: KP) -> Self::RoundState {
         let rest_kp = kp.fork();
         self.1.round_hit = false;
@@ -1119,7 +1119,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn poll_sweep(
         &mut self,
         state: Pin<&mut Self::RoundState>,
@@ -1169,7 +1169,7 @@ where
         Ok(rest_settled && this_settled)
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_winner(&mut self, state: Pin<&mut Self::RoundState>) -> Option<(usize, KP::KeyClaim)> {
         let projected = state.project();
         let rest_winner = self.0.take_winner(projected.rest);
@@ -1183,7 +1183,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn eliminate(&mut self, any_hit: bool) {
         self.0.eliminate(any_hit);
         if any_hit && self.1.live && !self.1.round_hit {
@@ -1191,7 +1191,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn first_satisfied_live(&self) -> Option<usize> {
         if let Some(idx) = self.0.first_satisfied_live() {
             return Some(idx);
@@ -1219,7 +1219,7 @@ where
     type Dynamic = False;
     type Outputs = Option<EnumOut>;
 
-    #[inline(always)]
+    #[inline]
     fn unsatisfied_count(&self) -> usize {
         if self.candidates.first_satisfied_live().is_some() {
             0
@@ -1227,7 +1227,7 @@ where
             1
         }
     }
-    #[inline(always)]
+    #[inline]
     fn open_count(&self) -> usize {
         1
     }
@@ -1240,7 +1240,7 @@ where
     // stack's `race_keys()`.
     type RaceState = NoTagArmRaceState<Candidates::RoundState, KP::KeyClaim>;
 
-    #[inline(always)]
+    #[inline]
     fn init_race(&mut self, kp: KP, _arm_base: usize, _field_base: usize) -> Self::RaceState {
         NoTagArmRaceState {
             round: self.candidates.init_round(kp),
@@ -1291,11 +1291,11 @@ where
     }
 
     type DispatchState = <Candidates as CandidateList<'de, KP, EnumOut>>::DispatchState;
-    #[inline(always)]
+    #[inline]
     fn init_dispatch(&mut self, arm_index: usize, vp: BVP<'de, KP>) -> Self::DispatchState {
         self.candidates.init_dispatch(arm_index, vp)
     }
-    #[inline(always)]
+    #[inline]
     fn poll_dispatch(
         &mut self,
         state: Pin<&mut Self::DispatchState>,
@@ -1304,7 +1304,7 @@ where
         self.candidates.poll_dispatch(state, cx)
     }
 
-    #[inline(always)]
+    #[inline]
     fn take_outputs(&mut self) -> Self::Outputs {
         match self.candidates.first_satisfied_live() {
             Some(idx) => self.candidates.build_winner(idx),
